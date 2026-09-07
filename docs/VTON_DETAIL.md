@@ -82,6 +82,13 @@ warmup begins.
 
 ## Verification
 
+Verified on 2026-09-07: 78 local tests plus 7 subtests passed, including BF16
+backward and paired/swap validation. The uploaded code passed two real-data
+512x384 CPU optimizer updates with pretrained SD-VAE/DINO, nonzero fine
+query/key/value/output gradients, frozen VAE parameters, and exact decoder
+output parity. Step-19000 XL checkpoint audit: all 388 existing model tensors
+match; 27 refiner tensors are new. No full-XL GPU training was started.
+
 ```bash
 OMP_NUM_THREADS=2 CUDA_VISIBLE_DEVICES='' python -m pytest tests/test_vton.py tests/test_vton_supervision.py tests/test_vton_detail.py -q
 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES='' python scripts/verify_vton_detail.py \
