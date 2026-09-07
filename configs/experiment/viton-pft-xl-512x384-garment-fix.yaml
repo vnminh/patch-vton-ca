@@ -1,0 +1,32 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384
+  - override /data: vitonhd512x384-garment
+  - _self_
+
+name: vton/pft-xl-512x384-garment-fix
+
+trainer:
+  params:
+    # Matches the active run. No trainable parameters or optimizer groups change.
+    ema_rate: 0.0
+    garment_supervision_only: true
+    garment_token_min_coverage: 0.8
+    # DINO reliability: allow a return within 1.5 PERSON tokens, not exact mutual NN.
+    correspondence_cycle_tolerance: 1.5
+    correspondence_mutual: false
+    # Retain pure-noise supervision and also refine details at 0.3 <= t <= 0.95.
+    detail_pure_noise_only: false
+    detail_min_time: 0.3
+    detail_max_time: 0.95
+    # Small fixed panels cannot estimate FID; report paired garment errors instead.
+    compute_validation_metrics: false
+    compute_garment_validation_metrics: true
+    max_validation_previews: 20
+
+train_params:
+  limit_val_batches: 20
+  val_check_interval: 500
+
+checkpoint_params:
+  save_top_k: 2

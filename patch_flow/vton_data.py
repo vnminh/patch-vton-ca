@@ -1,6 +1,7 @@
 import os
 import random
 
+import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
@@ -57,6 +58,7 @@ class VTONHDDataset(Dataset):
         scale_limit=0.2,
         paired=True,
         preview_sample_id=None,
+        garment_parse_labels=None,
     ):
         self.root = os.path.abspath(root)
         self.split = split
@@ -73,11 +75,17 @@ class VTONHDDataset(Dataset):
         if not 0.0 <= self.scale_limit < 1.0:
             raise ValueError("scale_limit must be in [0, 1)")
         self.paired = bool(paired)
+        self.garment_parse_labels = None if garment_parse_labels is None else tuple(int(x) for x in garment_parse_labels)
+        if self.garment_parse_labels is not None and not self.garment_parse_labels:
+            raise ValueError("garment_parse_labels must contain at least one clothing label")
         split_root = os.path.join(self.root, split)
         self.image_dir = os.path.join(split_root, "image")
         self.garment_dir = os.path.join(split_root, "cloth")
         self.agnostic_mask_dir = os.path.join(split_root, "agnostic-mask")
         self.garment_mask_dir = os.path.join(split_root, "cloth-mask")
+        self.person_parse_dir = os.path.join(split_root, "image-parse-v3")
+        if self.garment_parse_labels is not None and not os.path.isdir(self.person_parse_dir):
+            raise FileNotFoundError(f"Garment supervision requires parsing labels: {self.person_parse_dir}")
         pair_list = pair_list or os.path.join(self.root, f"{split}_pairs.txt")
         if not os.path.isfile(pair_list):
             raise FileNotFoundError(f"Pair list not found: {pair_list}")
@@ -153,15 +161,32 @@ class VTONHDDataset(Dataset):
         garment = self._load_rgb(_resolve_file(self.garment_dir, garment_name))
         agnostic_mask = self._load_mask(_resolve_file(self.agnostic_mask_dir, person_name, mask=True))
         garment_mask = self._load_mask(_resolve_file(self.garment_mask_dir, garment_name, mask=True))
+        person_garment_mask = None
+        if self.garment_parse_labels is not None:
+            # Preserve palette indices: L conversion gives brightness, not labels.
+            parse_path = os.path.join(self.person_parse_dir, os.path.splitext(person_name)[0] + ".png")
+            with Image.open(parse_path) as parse:
+                labels = np.asarray(parse)
+                if labels.ndim != 2:
+                    raise ValueError(f"Expected indexed semantic labels in {parse_path}")
+                binary = np.isin(labels, self.garment_parse_labels).astype(np.uint8) * 255
+            person_garment_mask = _letterbox(
+                Image.fromarray(binary), self.image_size, 0, Image.Resampling.NEAREST
+            )
         flipped = self.random_flip and random.random() < 0.5
         if flipped:
             person = TF.hflip(person)
             garment = TF.hflip(garment)
             agnostic_mask = TF.hflip(agnostic_mask)
             garment_mask = TF.hflip(garment_mask)
+            if person_garment_mask is not None:
+                person_garment_mask = TF.hflip(person_garment_mask)
 
+        person_transform = self._sample_shift_scale()
+        if person_garment_mask is not None:
+            _, person_garment_mask = self._apply_shift_scale(person, person_garment_mask, person_transform)
         person, agnostic_mask = self._apply_shift_scale(
-            person, agnostic_mask, self._sample_shift_scale()
+            person, agnostic_mask, person_transform
         )
         garment, garment_mask = self._apply_shift_scale(
             garment, garment_mask, self._sample_shift_scale()
@@ -183,6 +208,54 @@ class VTONHDDataset(Dataset):
             "person_name": person_name,
             "garment_name": garment_name,
         }
+        if person_garment_mask is not None:
+            sample["person_garment_mask"] = (TF.to_tensor(person_garment_mask) > 0.5).float()
+        return sample
+
+
+class VTONValidationDataset(Dataset):
+    """Fixed train/test reconstructions and test garment swaps sharing noise seeds."""
+
+    def __init__(self, root, image_size=(512, 384), garment_parse_labels=(5, 6, 7),
+                 test_samples=8, train_samples=4, preview_sample_id=None):
+        if test_samples < 2 or train_samples < 0:
+            raise ValueError("Validation needs at least two test samples and nonnegative train_samples")
+        self.datasets = {}
+        self.items = []
+        for split, count in (("test", int(test_samples)), ("train", int(train_samples))):
+            if count == 0:
+                continue
+            dataset = VTONHDDataset(
+                root, split=split, image_size=image_size, paired=False,
+                garment_parse_labels=garment_parse_labels,
+                preview_sample_id=preview_sample_id if split == "test" else None,
+            )
+            if count > len(dataset):
+                raise ValueError(f"Requested {count} {split} examples but only {len(dataset)} exist")
+            indices = torch.linspace(0, len(dataset) - 1, count).long().tolist()
+            names = [dataset.pairs[i][0] for i in indices]
+            original_pairs = [dataset.pairs[i] for i in indices]
+            dataset.pairs = []
+            self.datasets[split] = dataset
+            for index, (person, reference) in enumerate(original_pairs):
+                dataset.pairs.append((person, person))
+                self.items.append((split, len(dataset.pairs) - 1, f"{split}_paired", index))
+                if split == "test":
+                    if reference == person:
+                        reference = names[(index + 1) % len(names)]
+                    if reference == person:
+                        raise ValueError("Validation swaps require distinct garment names")
+                    dataset.pairs.append((person, reference))
+                    self.items.append((split, len(dataset.pairs) - 1, "test_unpaired", index))
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index):
+        split, item, group, seed = self.items[index]
+        sample = self.datasets[split][item]
+        sample["validation_group"] = group
+        sample["validation_seed"] = torch.tensor(seed + (10000 if split == "train" else 0))
         return sample
 
 

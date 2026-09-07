@@ -4,9 +4,92 @@ import torch.nn.functional as F
 from timm.models.vision_transformer import Attention, Mlp, PatchEmbed
 from torch.utils.checkpoint import checkpoint
 
+from patch_flow.attention_smoothing import key_coordinates
+
 from .pf_transformer import PatchForcingDiT, pf_modulate
 
 GARMENT_SCALES = ("coarse", "middle", "detail")
+
+
+class GarmentLatentRefiner(nn.Module):
+    """Equal-grid cross-attention with a separate output at every VAE latent cell.
+
+    Learned subpixel queries preserve the four phases of a PFT patch. Garment
+    detail values and the velocity residual never pass through coarse pooling.
+    SDPA avoids materialising a full fine-grid attention matrix during training.
+    """
+
+    def __init__(self, backbone_dim, channels=4, width=256, heads=8, patch_size=2):
+        super().__init__()
+        if width < 1 or heads < 1 or width % heads or width // heads < 2:
+            raise ValueError("Refiner width must be divisible by heads with at least two channels per head")
+        self.heads = heads
+        self.width = width
+        self.patch_size = patch_size
+        self.query_expand = nn.Linear(backbone_dim, width * patch_size ** 2)
+        self.condition = nn.Linear(backbone_dim, width)
+        self.state = nn.Conv2d(channels * 2, width, 3, padding=1)
+        self.position = nn.Linear(backbone_dim, width, bias=False)
+        self.query_norm = nn.LayerNorm(width)
+        self.key_norm = nn.LayerNorm(width)
+        self.query = nn.Linear(width, width)
+        self.key = nn.Linear(backbone_dim, width)
+        self.value = nn.Linear(backbone_dim, width)
+        self.attention_out = nn.Linear(width, width)
+        self.local = nn.Sequential(
+            nn.GroupNorm(1, width), nn.Conv2d(width, width, 3, padding=1, groups=width),
+            nn.GELU(), nn.Conv2d(width, width, 1),
+        )
+        self.output = nn.Conv2d(width, channels, 1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, tokens, cond, noisy, agnostic, values, position, edit, garment_mask, return_centers=False):
+        batch, _, height, width = noisy.shape
+        if values.shape[1] != height * width:
+            raise ValueError("Person and garment detail grids must have identical resolution")
+        ph, pw = height // self.patch_size, width // self.patch_size
+        query = self.query_expand(tokens).transpose(1, 2).reshape(batch, -1, ph, pw)
+        query = F.pixel_shuffle(query, self.patch_size)
+        condition = self.condition(cond).transpose(1, 2).reshape(batch, self.width, ph, pw)
+        query = query + F.interpolate(condition, (height, width), mode="nearest")
+        query = query + self.state(torch.cat((noisy, agnostic), dim=1))
+        query = query.flatten(2).transpose(1, 2)
+        pos = self.position(position)
+        q = self.query(self.query_norm(query) + pos)
+        k = self.key_norm(self.key(values)) + pos
+        v = self.value(values)
+        def heads(tensor):
+            return tensor.reshape(batch, height * width, self.heads, -1).transpose(1, 2)
+        if garment_mask is None:
+            valid = torch.ones(batch, height * width, device=noisy.device, dtype=torch.bool)
+        else:
+            valid = F.adaptive_max_pool2d(garment_mask.float(), (height, width)).flatten(1) > 0
+        active = valid.any(1)
+        # An empty/dropped garment must be finite AND contribute exactly zero.
+        valid = valid.clone()
+        valid[~active, 0] = True
+        q, k, v = heads(q), heads(k), heads(v)
+        transported = F.scaled_dot_product_attention(
+            q, k, v, attn_mask=valid[:, None, None, :], dropout_p=0.0,
+        ).transpose(1, 2).reshape(batch, height * width, self.width)
+        features = (query + self.attention_out(transported)).transpose(1, 2).reshape(
+            batch, self.width, height, width
+        )
+        residual = self.output(features + self.local(features))
+        gate = F.interpolate(edit.float(), (height, width), mode="area").clamp(0, 1)
+        residual = residual * gate * active[:, None, None, None].to(residual.dtype)
+        if return_centers:
+            # A second fused reduction computes A @ coordinates directly. Pad V to
+            # the head dimension for Flash SDPA compatibility; never allocate A.
+            coordinates = key_coordinates((height, width), q.device, q.dtype)
+            coordinate_values = F.pad(coordinates, (0, q.shape[-1] - 2))
+            coordinate_values = coordinate_values[None, None].expand(batch, self.heads, -1, -1).contiguous()
+            centers = F.scaled_dot_product_attention(
+                q, k, coordinate_values, attn_mask=valid[:, None, None, :], dropout_p=0.0,
+            )[..., :2].float().mean(1)
+            return residual, centers
+        return residual
 
 
 class VTONPatchForcingBlock(nn.Module):
@@ -132,6 +215,10 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         garment_attention_output_init_std=1e-3,
         cross_attention_every=4,
         gradient_checkpointing=False,
+        garment_match_query_grid=False,
+        garment_latent_refiner=False,
+        garment_refiner_width=256,
+        garment_refiner_heads=8,
         pretrained_ckpt=None,
         pretrained_use_ema=True,
         **kwargs,
@@ -234,6 +321,16 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             )
             block.load_state_dict(old_block.state_dict(), strict=False)
             self.blocks.append(block)
+
+        self.garment_match_query_grid = bool(garment_match_query_grid)
+        self.garment_refiner = None
+        if garment_latent_refiner:
+            if not self.use_multiscale_garment:
+                raise ValueError("The latent refiner requires multiscale garment features")
+            self.garment_refiner = GarmentLatentRefiner(
+                self.hidden_size, self.state_channels, garment_refiner_width,
+                garment_refiner_heads, self.patch_size,
+            )
 
         if pretrained_ckpt is not None:
             self.load_pretrained_checkpoint(pretrained_ckpt, use_ema=pretrained_use_ema)
@@ -411,8 +508,11 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         return_uncertainty=False,
         return_garment_attention=False,
         garment_attention_scales=None,
+        return_garment_centers=False,
     ):
         batch, _, height, width = x.shape
+        if return_garment_centers and not return_garment_attention:
+            raise ValueError("return_garment_centers requires return_garment_attention")
         if person_agnostic is None:
             person_agnostic = torch.zeros_like(x)
         if person_mask is None:
@@ -421,6 +521,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         person_mask = F.interpolate(person_mask.float(), size=(height, width), mode="area").to(x.dtype)
         if edit_mask is None:
             edit_mask = person_mask
+        noisy_latent = x
         x = torch.cat((x, person_agnostic, person_mask), dim=1)
         position = self._position_embedding(height, width, x.dtype, x.device)
         x = self.x_embedder(x) + position
@@ -436,6 +537,20 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         garment_tokens, garment_values, garment_grids = self._garment_branches(
             garment, garment_middle, garment_detail, x, position, height, width
         )
+        fine_values = garment_values.get("detail")
+        if self.garment_refiner is not None and fine_values is not None:
+            if garment_grids["detail"] != (height, width):
+                raise ValueError("Person and garment detail grids must have identical resolution")
+        if self.garment_match_query_grid:
+            query_grid = (height // self.patch_size, width // self.patch_size)
+            for scale, grid in garment_grids.items():
+                if grid == query_grid:
+                    continue
+                content = garment_values[scale].transpose(1, 2).reshape(batch, self.hidden_size, *grid)
+                content = F.adaptive_avg_pool2d(content, query_grid).flatten(2).transpose(1, 2)
+                garment_values[scale] = content
+                garment_tokens[scale] = content + position
+                garment_grids[scale] = query_grid
         garment_padding_masks = self._garment_padding_masks(garment_mask, garment_grids)
         if garment_attention_scales is not None:
             garment_attention_scales = set(garment_attention_scales)
@@ -482,15 +597,31 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                         "weights": weights,
                         "output": transported_value,
                         "grid": garment_grids[block.garment_scale],
+                        "query_grid": (height // self.patch_size, width // self.patch_size),
                         "key_padding": block_padding_mask,
                     }
                 )
             else:
                 x = output
+        fine_velocity = None
+        if self.garment_refiner is not None and fine_values is not None:
+            args = (x, cond, noisy_latent, person_agnostic, fine_values,
+                    self._grid_position_embedding(height, width, x.dtype, x.device), edit_mask, garment_mask,
+                    return_garment_centers)
+            if self.gradient_checkpointing and self.training:
+                fine_velocity = checkpoint(self.garment_refiner, *args, use_reentrant=False)
+            else:
+                fine_velocity = self.garment_refiner(*args)
+            if return_garment_centers:
+                fine_velocity, centers = fine_velocity
+                attention_maps.append({"scale": "refiner", "centers": centers,
+                                       "grid": (height, width), "query_grid": (height, width)})
         x = self.final_layer(x, cond)
         x = self._unpatchify_rectangular(x, height, width)
         logvar_theta = x[:, -1:, :, :]
         velocity = x[:, :-1, :, :]
+        if fine_velocity is not None:
+            velocity = velocity + fine_velocity
         if return_garment_attention:
             if return_uncertainty:
                 return velocity, logvar_theta, attention_maps

@@ -47,6 +47,53 @@ IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 
 
+class _StableAttentionEntropy(torch.autograd.Function):
+    """Entropy with a finite derivative for probabilities underflowed to zero.
+
+    BF16 garment attention contains exact zeros on the 3072-key detail grid.
+    ``torch.special.entr(0)`` is finite in the forward pass but has an infinite
+    derivative, which makes softmax backward NaN. Work in key chunks as well, so the
+    stability fix does not materialise another full (B,H,Q,K) tensor during forward.
+    """
+
+    @staticmethod
+    def forward(ctx, probabilities, eps, chunk_size):
+        ctx.save_for_backward(probabilities)
+        ctx.eps = max(float(eps), float(torch.finfo(probabilities.dtype).tiny))
+        ctx.chunk_size = int(chunk_size)
+        entropy = torch.zeros(
+            probabilities.shape[:-1], device=probabilities.device, dtype=torch.float32
+        )
+        for start in range(0, probabilities.shape[-1], ctx.chunk_size):
+            values = probabilities[..., start : start + ctx.chunk_size]
+            safe = values.clamp_min(ctx.eps)
+            entropy.add_(-(values * safe.log()).sum(-1).float())
+        return entropy
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (probabilities,) = ctx.saved_tensors
+        gradient = torch.empty_like(probabilities)
+        upstream = grad_output.to(probabilities.dtype).unsqueeze(-1)
+        for start in range(0, probabilities.shape[-1], ctx.chunk_size):
+            values = probabilities[..., start : start + ctx.chunk_size]
+            safe = values.clamp_min(ctx.eps)
+            # d[-p log(clamp(p, eps))]/dp. Below eps, the clamp's derivative is
+            # zero, leaving the finite linear derivative -log(eps).
+            derivative = -safe.log() - (values >= ctx.eps).to(values.dtype)
+            gradient[..., start : start + ctx.chunk_size] = upstream * derivative
+        return gradient, None, None
+
+
+def stable_attention_entropy(probabilities, eps=1e-6, chunk_size=256):
+    """Per-head entropy reduced over keys with finite BF16 gradients."""
+    if not probabilities.is_floating_point():
+        raise TypeError("Attention probabilities must be floating point")
+    if chunk_size < 1:
+        raise ValueError("chunk_size must be positive")
+    return _StableAttentionEntropy.apply(probabilities, float(eps), int(chunk_size))
+
+
 def grid_coordinates(grid, device=None, dtype=torch.float32):
     """Normalised (u, v) centres of a row-major ``grid`` of tokens, shape (H*W, 2)."""
     height, width = int(grid[0]), int(grid[1])
@@ -157,6 +204,7 @@ class DinoCorrespondenceTeacher(nn.Module):
         soft_target_temperature=0.0,
         mutual=False,
         weight_by_similarity=False,
+        cycle_tolerance=None,
     ):
         """Match editable person tokens to garment tokens and return their positions.
 
@@ -177,6 +225,7 @@ class DinoCorrespondenceTeacher(nn.Module):
             soft_target_temperature=soft_target_temperature,
             mutual=mutual,
             weight_by_similarity=weight_by_similarity,
+            cycle_tolerance=cycle_tolerance,
         )
 
 
@@ -191,6 +240,7 @@ def correspondence_targets(
     soft_target_temperature=0.0,
     mutual=False,
     weight_by_similarity=False,
+    cycle_tolerance=None,
 ):
     """Cosine-similarity correspondence from person tokens to garment positions."""
     person = F.normalize(person_features.float().flatten(2).transpose(1, 2), dim=-1)
@@ -212,14 +262,25 @@ def correspondence_targets(
 
     valid = torch.ones_like(best_similarity, dtype=torch.bool) if person_valid is None else person_valid.clone()
     valid = valid & (best_similarity >= float(min_similarity))
-    if mutual:
+    if cycle_tolerance is not None and float(cycle_tolerance) < 0:
+        raise ValueError("cycle_tolerance must be non-negative or None")
+    if mutual or cycle_tolerance is not None:
         # Cycle consistency: the garment token a person token chose must choose it back.
         backward = similarity
         if person_valid is not None:
             backward = backward.masked_fill(~person_valid[:, :, None], neginf)
         back_index = backward.argmax(dim=1)
         positions = torch.arange(similarity.shape[1], device=similarity.device)
-        valid = valid & (back_index.gather(1, best_index) == positions[None, :])
+        returned = back_index.gather(1, best_index)
+        if mutual:
+            valid = valid & (returned == positions[None, :])
+        else:
+            # Euclidean distance in PERSON-token units, preserving the aspect ratio.
+            # Nearby returns survive local garment deformation, unlike exact mutual NN.
+            width = person_features.shape[-1]
+            dy = returned.div(width, rounding_mode="floor") - positions.div(width, rounding_mode="floor")[None]
+            dx = returned.remainder(width) - positions.remainder(width)[None]
+            valid = valid & (dy.square() + dx.square() <= float(cycle_tolerance) ** 2)
 
     weight = valid.to(similarity.dtype)
     if weight_by_similarity:
@@ -447,9 +508,9 @@ class CorrespondenceAttentionLoss(nn.Module):
             if self.entropy_weight > 0 and spread_weight is not None:
                 spread_heads = spread_weight[:, None].expand(-1, heads, -1)
                 spread_denominator = spread_heads.sum().clamp_min(1e-6)
-                # One differentiable x*log(x) op avoids retaining a second full per-head
-                # log tensor for backward. ``entr(0) == 0`` is also exact.
-                entropy = torch.special.entr(attention_heads).sum(-1).float()
+                entropy = stable_attention_entropy(
+                    attention_heads, eps=self.entropy_eps, chunk_size=256
+                )
                 padding = entry.get("key_padding")
                 keys = (
                     torch.full(
@@ -473,10 +534,16 @@ class CorrespondenceAttentionLoss(nn.Module):
                 routing_attention = attention_heads.mean(dim=1).float()
                 photometric_denominator = appearance_weight.sum().clamp_min(1e-6)
                 keys_appearance = (
-                    F.adaptive_avg_pool2d(appearance["garment"].float(), (int(grid[0]), int(grid[1])))
-                    .flatten(2)
-                    .transpose(1, 2)
+                    appearance["garment"].float()
                 )
+                key_mask = appearance.get("garment_mask")
+                if key_mask is not None:
+                    key_coverage = F.adaptive_avg_pool2d(key_mask.float(), grid)
+                    keys_appearance = F.adaptive_avg_pool2d(keys_appearance * key_mask, grid)
+                    keys_appearance = keys_appearance / key_coverage.clamp_min(1e-6)
+                else:
+                    keys_appearance = F.adaptive_avg_pool2d(keys_appearance, grid)
+                keys_appearance = keys_appearance.flatten(2).transpose(1, 2)
                 retrieved = routing_attention @ keys_appearance
                 error = (retrieved - appearance["query"].float()).square().sum(-1)
                 photometric_loss = (error * appearance_weight).sum() / photometric_denominator

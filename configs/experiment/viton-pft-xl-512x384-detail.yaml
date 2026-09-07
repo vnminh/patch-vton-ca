@@ -1,0 +1,39 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384-garment-fix
+  - _self_
+
+name: vton/pft-xl-512x384-detail
+
+model:
+  params:
+    # Backbone: 32x24 person queries AND garment keys at every routed scale.
+    garment_match_query_grid: true
+    # Fine branch: 64x48 person queries AND unpooled garment detail keys/values.
+    # Its velocity residual remains 64x48, i.e. one output per 8x8 image region.
+    garment_latent_refiner: true
+    garment_refiner_width: 256
+    garment_refiner_heads: 8
+
+trainer:
+  params:
+    allow_new_garment_refiner: true
+    decoded_rgb_weight: 0.2
+    decoded_edge_weight: 0.5
+    # Use refinement states, not pure noise, for decoded reconstruction losses.
+    decoded_min_time: 0.3
+    decoded_max_time: 0.95
+    decoded_max_samples: 1
+    decoded_checkpoint: true
+    # StableVITON-inspired masked center TV on backbone AND fine attention.
+    # Small auxiliary weight, sharing the 1000-step correspondence warmup.
+    attention_tv_weight: 0.01
+
+data:
+  params:
+    # Leave headroom for gradients through the frozen full-resolution VAE decoder.
+    # Person and garment both remain 512x384. Global batch remains 32.
+    batch_size: 1
+
+train_params:
+  accumulate_grad_batches: 32

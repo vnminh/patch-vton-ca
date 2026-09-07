@@ -25,7 +25,7 @@ data:
   params:
     # The detail branch adds 3072 garment keys at 512x384; batch 8 x accum 4 keeps the
     # global batch at 32 within 24 GB.
-    batch_size: 8
+    batch_size: 4
     val_batch_size: 1
 
 trainer:
@@ -47,7 +47,10 @@ trainer:
     # value aligns both direction and magnitude to a slowly moving EMA target.
     correspondence_nll_weight: 0.1
     correspondence_center_weight: 0.05
-    correspondence_entropy_weight: 0.01
+    # Per-head NLL already concentrates probability inside the small target radius.
+    # Disable entropy for this experiment: it is redundant here and removes an extra
+    # full-attention backward path on the 3072-key detail scale.
+    correspondence_entropy_weight: 0.0
     correspondence_photometric_weight: 0.1
     correspondence_value_weight: 0.1
     correspondence_value_cosine_mix: 0.5
@@ -66,7 +69,7 @@ trainer:
 
 train_params:
   max_steps: 100000
-  accumulate_grad_batches: 4
+  accumulate_grad_batches: 8
   garment_grad_log_every_n_steps: 50
   limit_val_batches: 1
   val_check_interval: 100

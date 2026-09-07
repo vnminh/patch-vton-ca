@@ -13,6 +13,7 @@ from patch_flow.correspondence import (
     grid_coordinates,
     mask_to_token_valid,
     neighbourhood_mass,
+    stable_attention_entropy,
 )
 from patch_flow.flow_vton import VTONPatchFlowForcing
 from patch_flow.models.pf_transformer import PatchForcingDiT
@@ -186,6 +187,37 @@ class VTONTests(unittest.TestCase):
         self.assertLess(evaluate(with_entropy, sharp), evaluate(with_entropy, diffuse))
         # A uniform distribution over every key is exactly one normalised nat.
         self.assertAlmostEqual(evaluate(with_entropy, diffuse) - evaluate(center_only, diffuse), 1.0, places=5)
+
+    def test_bf16_entropy_backward_is_finite_when_softmax_underflows_to_zero(self):
+        logits = torch.tensor(
+            [[[[0.0, -100.0, -100.0, -100.0]]]], dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        attention = logits.softmax(-1)
+        self.assertTrue((attention == 0).any())
+        entropy = stable_attention_entropy(attention, eps=1e-8).sum()
+        entropy.backward()
+        self.assertTrue(torch.isfinite(entropy))
+        self.assertTrue(torch.isfinite(logits.grad).all())
+
+    def test_correspondence_entropy_backward_is_finite_with_exact_zero_heads(self):
+        attention = torch.tensor(
+            [[[[1.0, 0.0]], [[0.0, 1.0]]]], dtype=torch.bfloat16,
+            requires_grad=True,
+        )
+        loss_fn = CorrespondenceAttentionLoss(
+            center_weight=0.0,
+            entropy_weight=1.0,
+            nll_weight=0.0,
+            photometric_weight=0.0,
+        )
+        loss, _ = loss_fn(
+            self._map(attention, (1, 2)),
+            appearance_weight=torch.ones(1, 1),
+        )
+        loss.backward()
+        self.assertTrue(torch.isfinite(loss))
+        self.assertTrue(torch.isfinite(attention.grad).all())
 
     def test_unsupervised_tokens_do_not_contribute(self):
         grid = (1, 4)
@@ -902,7 +934,7 @@ class VTONTests(unittest.TestCase):
         self.assertEqual(routes.count("detail"), 6)
         self.assertEqual(config.trainer.params.correspondence_nll_weight, 0.1)
         self.assertEqual(config.trainer.params.correspondence_center_weight, 0.05)
-        self.assertEqual(config.trainer.params.correspondence_entropy_weight, 0.01)
+        self.assertEqual(config.trainer.params.correspondence_entropy_weight, 0.0)
         self.assertEqual(config.trainer.params.correspondence_photometric_weight, 0.1)
         self.assertEqual(config.trainer.params.correspondence_value_weight, 0.1)
         self.assertEqual(config.trainer.params.detail_loss_weight, 0.5)
