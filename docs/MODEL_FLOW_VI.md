@@ -212,10 +212,8 @@ Khi `return_garment_attention=True`, mỗi block route trả về dict:
 
 ```
 tokens x       (B,768,1152) → Linear(1152 → 256*4) → (B,1024,32,24)
-                            → pixel_shuffle(2)      → (B,256,64,48)   # giữ 4 pha subpixel
-cond           (B,768,1152) → Linear(1152→256) → (B,256,32,24) → interp nearest → (B,256,64,48)
-[noisy; agnostic] (B,8,64,48) → Conv2d(8→256,3x3)                    → (B,256,64,48)
-query = tổng 3 thành phần → flatten                                   (B,3072,256)
+                            → pixel_shuffle(2)      → (B,256,64,48)
+query → flatten                                                       (B,3072,256)
 
 pos = Linear(1152→256, no bias)(pos_embed 64x48)                      (3072,256)
 q = Linear(LN(query)) + pos                                           (B,3072,256)
@@ -223,13 +221,13 @@ k = LN(Linear(fine_values)) + pos      fine_values (B,3072,1152)      (B,3072,25
 v = Linear(fine_values)                                               (B,3072,256)
 
 SDPA(heads=8, head_dim=32, attn_mask = garment valid (B,1,1,3072))    (B,3072,256)
-features = query + out_proj(transported) → (B,256,64,48)
+features = out_proj(transported) → (B,256,64,48)  # không có shortcut từ person query
 residual = Conv2d(256→4, zero-init)(features + local(features))       (B,4,64,48)
 residual *= gate(edit_mask, area-pool) * active                       (B,4,64,48)
 ```
 
-Nếu `return_garment_centers=True`: SDPA thứ hai với `V = toạ độ key` (pad tới 32 chiều)
-để lấy `centers (B,3072,2)` mà **không bao giờ vật chất hoá ma trận A** `3072x3072`.
+Khi train, refiner trả thêm Q/K và `out_proj(A@V)` để giám sát correspondence/value
+trực tiếp. Loss QxK chạy theo chunk 256 query, không giữ toàn bộ ma trận 3072x3072.
 
 ### 4.8 Đầu ra
 
@@ -251,8 +249,9 @@ loss = flow_loss
      + 0.01  * outside_velocity_loss
      + 0.01  * sigma_loss
      + 0.5   * detail_loss
-     + 0.01  * ramp * attention_tv_loss
      + ramp  * correspondence_loss
+     + 0.2   * ramp * fine_correspondence_loss
+     + 0.25  * ramp * fine_value_loss
      + 0.2   * decoded_rgb + 0.5 * decoded_edge
 ```
 
@@ -304,17 +303,20 @@ weight (B,768): (sim ≥ 0.35) ∧ cycle-consistency ≤ 1.5 token ∧ coverage 
 `value` là term **duy nhất** huấn luyện trực tiếp `V` và `out_proj` (mang logo/hoạ tiết);
 mọi term còn lại chỉ dạy Q/K định tuyến.
 
-### 5.4 `attention_tv_loss` (weight 0.01)
+### 5.4 Fine refiner supervision
 
-`patch_flow/attention_smoothing.py` — TV bậc nhất của **tâm attention** (`B,Q,2`) bên
-trong mask áo, cho cả 14 block backbone lẫn refiner. Regularize hình học
-correspondence, không phải RGB.
+DINO target 32x24 đáng tin cậy được nội suy lên person grid 64x48. Mỗi head phải đặt
+mass vào lân cận 3x3 của garment key đích (`fine_correspondence_loss`). Đồng thời
+`out_proj(A@V)` 256 chiều phải khớp đặc trưng VAE người đích 64x48 qua projector EMA
+đóng băng (`fine_value_loss`). Không còn ATV/attention-TV vì loss đó cho phép mọi query
+collapse về cùng một key.
 
 ### 5.5 `decoded_*` loss (rgb 0.2 / edge 0.5)
 
-Chọn ngẫu nhiên `decoded_max_samples: 1` mẫu có `0.3 ≤ t ≤ 0.95`, giải mã
-`predicted_clean (1,4,64,48)` qua **decoder SD-VAE có gradient** (`_decode_with_grad`,
-bọc checkpoint) → `(1,3,512,384)`, so L1 + L1-sai-phân với ảnh người thật trong mask áo.
+Giải mã **mọi** mẫu hợp lệ (`decoded_max_samples: 0`) có `0.3 ≤ t ≤ 0.95`, tuần tự
+từng ảnh để giữ peak memory thấp. `predicted_clean` đi qua decoder SD-VAE có gradient
+(`_decode_with_grad`, bọc checkpoint), rồi so L1 + L1-sai-phân với ảnh người thật
+trong mask áo.
 
 ### 5.6 Optimizer
 

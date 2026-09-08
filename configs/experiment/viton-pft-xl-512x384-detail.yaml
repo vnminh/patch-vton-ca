@@ -23,17 +23,22 @@ trainer:
     # Use refinement states, not pure noise, for decoded reconstruction losses.
     decoded_min_time: 0.3
     decoded_max_time: 0.95
-    decoded_max_samples: 1
+    # Zero means every eligible sample. Decoding is serialized per image to cap memory.
+    decoded_max_samples: 0
     decoded_checkpoint: true
-    # StableVITON-inspired masked center TV on backbone AND fine attention.
-    # Small auxiliary weight, sharing the 1000-step correspondence warmup.
-    attention_tv_weight: 0.01
+    # Direct supervision for the 64x48 Q/K routing and transported garment feature.
+    # A 3x3 positive key neighbourhood tolerates small DINO/garment deformation errors.
+    fine_correspondence_weight: 0.2
+    fine_correspondence_radius: 1
+    fine_value_weight: 0.25
+    fine_value_cosine_mix: 0.5
+    fine_loss_chunk_size: 256
 
 data:
   params:
-    # Leave headroom for gradients through the frozen full-resolution VAE decoder.
+    # Fine QxK loss is checkpointed in query chunks and decoded samples are serialized.
     # Person and garment both remain 512x384. Global batch remains 32.
-    batch_size: 1
+    batch_size: 4
 
 train_params:
-  accumulate_grad_batches: 32
+  accumulate_grad_batches: 8

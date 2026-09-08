@@ -201,6 +201,7 @@ def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detai
         garment_scale_routes=['coarse','middle','detail'], gradient_checkpointing=True,
         garment_match_query_grid=fine_detail, garment_latent_refiner=fine_detail,
         garment_refiner_width=32, garment_refiner_heads=4,
+        garment_refiner_qk_norm=fine_detail,
     )
     with patch('transformers.AutoModel.from_pretrained', return_value=FakeDinoBackbone()):
         module = LatentVTONPatchForcingTrainer(
@@ -213,7 +214,10 @@ def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detai
             correspondence_value_weight=.1, correspondence_entropy_weight=0.,
             detail_loss_weight=.5, detail_pure_noise_only=False, garment_dropout_prob=0.,
             decoded_rgb_weight=.2 if fine_detail else 0., decoded_edge_weight=.5 if fine_detail else 0.,
-            attention_tv_weight=.01 if fine_detail else 0.,
+            fine_correspondence_weight=.2 if fine_detail else 0.,
+            fine_value_weight=.25 if fine_detail else 0.,
+            fine_rgb_weight=.1 if fine_detail else 0.,
+            fine_correspondence_radius=1,
             sample_kwargs={'num_steps':2,'cfg_scale':1.,'adaptive':False,'progress':False},
         )
     module.flow.t_sampler = lambda shape, device, dtype: torch.full(shape, .5, device=device, dtype=dtype)
@@ -231,9 +235,12 @@ def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detai
     assert metrics['garment_supervision_fraction'] < 1
     assert metrics['detail_active_fraction'] == 1
     if fine_detail:
+        assert metrics['fine_rgb_loss'] > 0
         assert metrics['decoded_rgb_loss'] > 0
         assert metrics['decoded_samples'] == 1
-        assert metrics['attention_tv/refiner'] > 0
+        assert metrics['fine_correspondence_loss'] > 0
+        assert metrics['fine_value_loss'] > 0
+        assert metrics['fine_supervised_fraction'] > 0
     loss.backward()
     if fine_detail:
         assert model.garment_refiner.output.weight.grad.abs().sum() > 0

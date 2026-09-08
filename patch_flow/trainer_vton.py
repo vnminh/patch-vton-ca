@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import warnings
 from copy import deepcopy
 
@@ -12,7 +13,6 @@ from torchvision.utils import save_image
 from jutils import exists
 
 from patch_flow.correspondence import CorrespondenceAttentionLoss, DinoCorrespondenceTeacher
-from patch_flow.attention_smoothing import attention_centers, masked_center_tv
 from patch_flow.diagonal_gaussian import DiagonalGaussian
 from patch_flow.log_utils import log_images
 from patch_flow.trainer import LatentFlowTrainer, un_normalize_ims
@@ -38,7 +38,12 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         decoded_max_samples=1,
         decoded_checkpoint=True,
         allow_new_garment_refiner=False,
-        attention_tv_weight=0.0,
+        fine_correspondence_weight=0.0,
+        fine_correspondence_radius=1,
+        fine_value_weight=0.0,
+        fine_value_cosine_mix=0.5,
+        fine_rgb_weight=0.0,
+        fine_loss_chunk_size=256,
         garment_supervision_only=False,
         garment_token_min_coverage=0.8,
         garment_dropout_prob=0.1,
@@ -86,15 +91,24 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         self.decoded_max_samples = int(decoded_max_samples)
         self.decoded_checkpoint = bool(decoded_checkpoint)
         self.allow_new_garment_refiner = bool(allow_new_garment_refiner)
-        self.attention_tv_weight = float(attention_tv_weight)
-        if self.attention_tv_weight < 0:
-            raise ValueError("attention_tv_weight must be non-negative")
+        self.fine_correspondence_weight = float(fine_correspondence_weight)
+        self.fine_correspondence_radius = int(fine_correspondence_radius)
+        self.fine_value_weight = float(fine_value_weight)
+        self.fine_value_cosine_mix = float(fine_value_cosine_mix)
+        self.fine_rgb_weight = float(fine_rgb_weight)
+        self.fine_loss_chunk_size = int(fine_loss_chunk_size)
+        if min(self.fine_correspondence_weight, self.fine_value_weight, self.fine_rgb_weight) < 0:
+            raise ValueError("Fine supervision weights must be non-negative")
+        if self.fine_correspondence_radius < 0 or self.fine_loss_chunk_size < 1:
+            raise ValueError("Fine correspondence radius must be non-negative and chunk size positive")
+        if not 0 <= self.fine_value_cosine_mix <= 1:
+            raise ValueError("fine_value_cosine_mix must be in [0, 1]")
         if min(self.decoded_rgb_weight, self.decoded_edge_weight) < 0:
             raise ValueError("Decoded loss weights must be non-negative")
         if not 0 < self.decoded_min_time <= self.decoded_max_time < 1:
             raise ValueError("Decoded time window must satisfy 0 < min <= max < 1")
-        if self.decoded_max_samples < 1:
-            raise ValueError("decoded_max_samples must be positive")
+        if self.decoded_max_samples < 0:
+            raise ValueError("decoded_max_samples must be non-negative (zero means all eligible samples)")
         self.garment_supervision_only = bool(garment_supervision_only)
         self.garment_token_min_coverage = float(garment_token_min_coverage)
         if not 0 < self.garment_token_min_coverage <= 1:
@@ -132,12 +146,19 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             raise ValueError("correspondence_value_target_ema must be in [0, 1)")
         self.value_target_embedders = nn.ModuleDict()
         self.value_target_norms = nn.ModuleDict()
-        if self.correspondence_loss.value_weight > 0:
+        needs_fine_value = self.fine_value_weight > 0
+        if needs_fine_value and getattr(self.model, "garment_refiner", None) is None:
+            raise ValueError("fine_value_weight requires model.garment_latent_refiner")
+        if max(self.fine_correspondence_weight, self.fine_rgb_weight) > 0 and getattr(self.model, "garment_refiner", None) is None:
+            raise ValueError("fine_correspondence_weight requires model.garment_latent_refiner")
+        if self.correspondence_loss.value_weight > 0 or needs_fine_value:
             configured_scales = set(
                 self.correspondence_scales
                 if self.correspondence_scales is not None
                 else self.model._enabled_scales()
             )
+            if needs_fine_value:
+                configured_scales.add("detail")
             for scale in self.model._enabled_scales():
                 if scale not in configured_scales:
                     continue
@@ -148,6 +169,12 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 )
             self.value_target_embedders.requires_grad_(False)
             self.value_target_norms.requires_grad_(False)
+        self.fine_value_target_projector = None
+        if needs_fine_value:
+            self.fine_value_target_projector = nn.Sequential(
+                deepcopy(self.model.garment_refiner.value),
+                deepcopy(self.model.garment_refiner.attention_out),
+            ).requires_grad_(False)
         self.correspondence_warmup_steps = int(correspondence_warmup_steps)
         if self.correspondence_warmup_steps < 0:
             raise ValueError("correspondence_warmup_steps must be non-negative")
@@ -159,7 +186,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         # The photometric and entropy terms need no teacher, so it is only constructed
         # when a position target is actually consumed.
         self.correspondence_teacher = None
-        if self.correspondence_loss.needs_target:
+        if self.correspondence_loss.needs_target or max(self.fine_correspondence_weight, self.fine_value_weight, self.fine_rgb_weight) > 0:
             self.correspondence_teacher = DinoCorrespondenceTeacher(
                 model_name=correspondence_teacher_name,
                 input_size=correspondence_teacher_input_size,
@@ -274,8 +301,10 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             if self.correspondence_scales is not None
             else getattr(self.model, "_enabled_scales")()
         )
+        if self.fine_value_weight > 0:
+            supervised_scales.add("detail")
         needs_target_pyramid = (
-            self.training and self.correspondence_loss.value_weight > 0
+            self.training and (self.correspondence_loss.value_weight > 0 or self.fine_value_weight > 0)
             and self.use_multiscale_garment
             and bool(supervised_scales & {"middle", "detail"})
             and (target_middle is None or target_detail is None)
@@ -400,6 +429,13 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             source_norm = self._value_source_norm(scale)
             if source_norm is not None:
                 self._ema_module(self.value_target_norms[scale], source_norm, decay)
+        if self.fine_value_target_projector is not None:
+            self._ema_module(
+                self.fine_value_target_projector[0], self.model.garment_refiner.value, decay
+            )
+            self._ema_module(
+                self.fine_value_target_projector[1], self.model.garment_refiner.attention_out, decay
+            )
 
     def load_state_dict(self, state_dict, strict=True, assign=False):
         """Load legacy targets; optionally warm-start a wholly absent detail refiner.
@@ -407,7 +443,10 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         This does not migrate optimizer states. Old architectures require load_weights,
         not resume_checkpoint. Partially missing refiner weights remain strict errors.
         """
-        target_prefixes = ("value_target_embedders.", "value_target_norms.")
+        target_prefixes = (
+            "value_target_embedders.", "value_target_norms.",
+            "fine_value_target_projector.",
+        )
         try:
             incompatible = super().load_state_dict(state_dict, strict=False, assign=assign)
         except TypeError:  # PyTorch versions before the ``assign`` argument.
@@ -428,6 +467,14 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                         UserWarning,
                     )
         unexpected = list(incompatible.unexpected_keys)
+        if self.allow_new_garment_refiner:
+            obsolete = (
+                "model.garment_refiner.condition.", "model.garment_refiner.state.",
+                "model.garment_refiner.local.1.bias", "model.garment_refiner.local.3.bias",
+                "ema_model.garment_refiner.condition.", "ema_model.garment_refiner.state.",
+                "ema_model.garment_refiner.local.1.bias", "ema_model.garment_refiner.local.3.bias",
+            )
+            unexpected = [key for key in unexpected if not key.startswith(obsolete)]
         if strict and (missing or unexpected):
             details = []
             if missing:
@@ -604,29 +651,186 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         )
         return masked_mean(horizontal.abs(), horizontal_mask) + masked_mean(vertical.abs(), vertical_mask)
 
-    def _attention_tv_loss(self, entries, batch, keep):
-        pixels = self._supervision_pixels(batch)
+    def _fine_supervision_weights(self, batch, encoded, keep):
+        grid = encoded["target"].shape[-2:]
+        coverage = F.adaptive_avg_pool2d(self._supervision_pixels(batch), grid).flatten(1)
+        weight = coverage * (coverage >= self.garment_token_min_coverage)
         if keep is not None:
-            pixels = pixels * keep[:, None, None, None]
+            weight = weight * keep[:, None].to(weight.dtype)
         if batch.get("has_ground_truth") is not None:
-            pixels = pixels * batch["has_ground_truth"][:, None, None, None]
+            weight = weight * batch["has_ground_truth"][:, None].to(weight.dtype)
         if batch.get("garment_mask") is not None:
-            pixels = pixels * batch["garment_mask"].flatten(1).any(1)[:, None, None, None]
-        per_scale = {}
-        for entry in entries:
-            grid = entry["query_grid"]
-            coverage = F.adaptive_avg_pool2d(pixels, grid)
-            mask = coverage * (coverage >= self.garment_token_min_coverage)
-            centers = entry.get("centers")
-            if centers is None:
-                centers = attention_centers(entry["weights"], entry["grid"])
-            value = masked_center_tv(centers, grid, mask)
-            per_scale.setdefault(entry["scale"], []).append(value)
-        means = {scale: torch.stack(values).mean() for scale, values in per_scale.items()}
-        total = torch.stack(list(means.values())).mean() if means else pixels.sum() * 0
-        metrics = {f"attention_tv/{scale}": value.detach() for scale, value in means.items()}
-        metrics["attention_tv_loss"] = total.detach()
-        return total, metrics
+            weight = weight * batch["garment_mask"].flatten(1).any(1)[:, None]
+        return weight
+
+    def _fine_targets(self, target, teacher_weight, batch, encoded, keep):
+        """Upsample reliable 32x24 DINO matches onto the 64x48 latent grid."""
+        coarse_grid = self._person_token_grid(encoded["target"])
+        fine_grid = encoded["target"].shape[-2:]
+        target = target.transpose(1, 2).reshape(target.shape[0], 2, *coarse_grid)
+        # DINO matches are discrete correspondences, not a smooth UV field. Bilinear
+        # interpolation invented matches between disconnected sleeve/chest regions,
+        # including rejected neighbours. Keep each accepted teacher match intact;
+        # the positive key neighbourhood handles its sub-token uncertainty.
+        target = F.interpolate(target, fine_grid, mode="nearest")
+        target = target.flatten(2).transpose(1, 2)
+        reliable = (teacher_weight > 0).reshape(teacher_weight.shape[0], 1, *coarse_grid).float()
+        reliable = F.interpolate(reliable, fine_grid, mode="nearest").flatten(1)
+        return target, self._fine_supervision_weights(batch, encoded, keep) * reliable
+
+    def _fine_correspondence_chunk(
+        self, query, key, target, weight, key_valid, key_height, key_width
+    ):
+        """Local-mass NLL for one query chunk; checkpointed to bound QxK memory."""
+        batch, heads, queries, width = query.shape
+        key_height, key_width = int(key_height), int(key_width)
+        if key_height * key_width != key.shape[-2]:
+            raise ValueError("Fine garment key grid does not match key tensor")
+        # Compute scores in FP32, not just their reduction after a BF16 dot product.
+        with torch.autocast(device_type=query.device.type, enabled=False):
+            logits = torch.einsum("bhqd,bhkd->bhqk", query.float(), key.float()) / math.sqrt(width)
+        active = key_valid.any(-1)
+        safe_valid = key_valid.clone()
+        safe_valid[~active, 0] = True
+        logits = logits.masked_fill(~safe_valid[:, None, None], float("-inf"))
+        log_normalizer = torch.logsumexp(logits, dim=-1)
+
+        radius = self.fine_correspondence_radius
+        offsets_y, offsets_x = torch.meshgrid(
+            torch.arange(-radius, radius + 1, device=query.device),
+            torch.arange(-radius, radius + 1, device=query.device),
+            indexing="ij",
+        )
+        center_y = (target[..., 1] * key_height - 0.5).round().long()
+        center_x = (target[..., 0] * key_width - 0.5).round().long()
+        row = center_y[..., None] + offsets_y.flatten()
+        column = center_x[..., None] + offsets_x.flatten()
+        inside = (row >= 0) & (row < key_height) & (column >= 0) & (column < key_width)
+        index = row.clamp(0, key_height - 1) * key_width + column.clamp(0, key_width - 1)
+        positive_valid = inside & key_valid.gather(1, index.reshape(batch, -1)).reshape_as(index)
+        positive = logits.gather(
+            -1, index[:, None].expand(-1, heads, -1, -1)
+        ).masked_fill(~positive_valid[:, None], float("-inf"))
+        has_positive = positive_valid.any(-1) & active[:, None]
+        # Avoid an all-minus-infinity logsumexp even for a zero-weight query.
+        positive = torch.where(has_positive[:, None, :, None], positive, torch.zeros_like(positive))
+        log_mass = torch.logsumexp(positive, dim=-1) - log_normalizer
+        log_mass = torch.where(has_positive[:, None], log_mass, torch.zeros_like(log_mass))
+        effective = weight * has_positive
+        weighted = effective[:, None]
+        numerator = (-log_mass.nan_to_num(posinf=0.0, neginf=0.0) * weighted).sum()
+        mass_sum = (log_mass.exp().nan_to_num() * weighted).sum()
+        nearest = center_y.clamp(0, key_height - 1) * key_width + center_x.clamp(0, key_width - 1)
+        correct_sum = ((logits.argmax(-1) == nearest[:, None]) * weighted).sum()
+        return numerator, mass_sum, correct_sum, effective.sum()
+
+    @staticmethod
+    def _fine_rgb_chunk(query, key, target_rgb, garment_rgb, weight, key_valid):
+        """Fixed RGB values cannot co-adapt into a constant learned feature target.
+
+        Each head must retrieve the worn colour. This is a weak appearance cue, not
+        a geometric warp or a substitute for decoded logo/edge reconstruction.
+        """
+        active = key_valid.any(-1)
+        valid = key_valid.clone()
+        valid[~active, 0] = True
+        with torch.autocast(device_type=query.device.type, enabled=False):
+            logits = query.float() @ key.float().transpose(-1, -2) / math.sqrt(query.shape[-1])
+            attention = logits.masked_fill(~valid[:, None, None], float("-inf")).softmax(-1)
+            transported = attention @ garment_rgb.float()[:, None]
+            error = (transported - target_rgb.float()[:, None]).abs().mean(-1)
+            return (error * weight[:, None] * active[:, None, None]).sum()
+
+    @torch.no_grad()
+    def _fine_rgb_targets(self, batch, encoded, grid):
+        def pool(image, mask):
+            if mask is None:
+                mask = torch.ones_like(image[:, :1])
+            coverage = F.adaptive_avg_pool2d(mask.float(), grid)
+            colour = F.adaptive_avg_pool2d((image.float() + 1) * .5 * mask, grid)
+            return (colour / coverage.clamp_min(1e-6)).flatten(2).transpose(1, 2)
+        return (pool(encoded["target_image"], self._supervision_pixels(batch)),
+                pool(batch["garment"], batch.get("garment_mask")))
+
+    def _fine_value_target(self, encoded):
+        if encoded["target_detail"] is None:
+            raise ValueError("Fine value supervision requires target SD-VAE detail features")
+        embedded = self.value_target_embedders["detail"](encoded["target_detail"])
+        embedded = self.value_target_norms["detail"](embedded.flatten(2).transpose(1, 2))
+        return self.fine_value_target_projector(embedded).detach().float()
+
+    def _fine_losses(self, entry, target, teacher_weight, batch, encoded, keep):
+        target, weight = self._fine_targets(target, teacher_weight, batch, encoded, keep)
+        query, key, key_valid = entry["query"], entry["key"], entry["key_valid"]
+        if query.shape[-2] != target.shape[1] or key.shape[-2] != entry["grid"][0] * entry["grid"][1]:
+            raise ValueError("Fine correspondence tensors do not match the 64x48 person/garment grids")
+        zero = query.sum() * 0.0
+        correspondence = target_mass = top1 = zero
+        supervised = weight.sum()
+        if self.fine_correspondence_weight > 0:
+            numerator = mass_sum = correct_sum = effective_sum = zero
+            for start in range(0, query.shape[-2], self.fine_loss_chunk_size):
+                args = (query[:, :, start:start + self.fine_loss_chunk_size], key,
+                        target[:, start:start + self.fine_loss_chunk_size],
+                        weight[:, start:start + self.fine_loss_chunk_size], key_valid,
+                        entry["grid"][0], entry["grid"][1])
+                if self.training and torch.is_grad_enabled():
+                    chunk = checkpoint(self._fine_correspondence_chunk, *args, use_reentrant=False)
+                else:
+                    chunk = self._fine_correspondence_chunk(*args)
+                numerator = numerator + chunk[0]
+                mass_sum = mass_sum + chunk[1]
+                correct_sum = correct_sum + chunk[2]
+                effective_sum = effective_sum + chunk[3]
+            denominator = effective_sum.clamp_min(1.0) * query.shape[1]
+            correspondence = numerator / denominator
+            target_mass = mass_sum / denominator
+            top1 = correct_sum / denominator
+
+        value_loss = value_cosine = value_huber = zero
+        if self.fine_value_weight > 0:
+            value_target = self._fine_value_target(encoded)
+            transported = entry["output"].float()
+            cosine_error = 1 - F.cosine_similarity(transported, value_target, dim=-1)
+            huber_error = F.smooth_l1_loss(transported, value_target, reduction="none").mean(-1)
+            value_error = self.fine_value_cosine_mix * cosine_error + (
+                1 - self.fine_value_cosine_mix
+            ) * huber_error
+            denominator = weight.sum().clamp_min(1.0)
+            value_loss = (value_error * weight).sum() / denominator
+            value_cosine = (cosine_error * weight).sum() / denominator
+            value_huber = (huber_error * weight).sum() / denominator
+        rgb_loss = zero
+        if self.fine_rgb_weight > 0:
+            # Paired colour supervision remains available where DINO is uncertain.
+            rgb_weight = self._fine_supervision_weights(batch, encoded, keep)
+            target_rgb, garment_rgb = self._fine_rgb_targets(batch, encoded, entry["grid"])
+            numerator = zero
+            for start in range(0, query.shape[-2], self.fine_loss_chunk_size):
+                stop = start + self.fine_loss_chunk_size
+                args = (query[:, :, start:stop], key, target_rgb[:, start:stop],
+                        garment_rgb, rgb_weight[:, start:stop], key_valid)
+                if self.training and torch.is_grad_enabled():
+                    numerator = numerator + checkpoint(self._fine_rgb_chunk, *args, use_reentrant=False)
+                else:
+                    numerator = numerator + self._fine_rgb_chunk(*args)
+            rgb_loss = numerator / (rgb_weight.sum().clamp_min(1) * query.shape[1])
+        loss = (self.fine_correspondence_weight * correspondence + self.fine_value_weight * value_loss
+                + self.fine_rgb_weight * rgb_loss)
+        metrics = {
+            "fine_correspondence_loss": correspondence.detach(),
+            "fine_target_mass": target_mass.detach(),
+            "fine_top1_accuracy": top1.detach(),
+            "fine_value_loss": value_loss.detach(),
+            "fine_value_cosine": value_cosine.detach(),
+            "fine_value_huber": value_huber.detach(),
+            "fine_rgb_loss": rgb_loss.detach(),
+            "fine_query_rms": query.detach().float().square().mean().sqrt(),
+            "fine_key_rms": key.detach().float().square().mean().sqrt(),
+            "fine_supervised_fraction": (weight > 0).float().mean().detach(),
+            "fine_supervision_weight": supervised.detach(),
+        }
+        return loss, metrics
 
     def _decode_with_grad(self, latent):
         # jutils AutoencoderKL.decode ALSO has @no_grad. Reproduce its SD-VAE
@@ -663,24 +867,30 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                    "decoded_samples": zero.detach(), "decoded_supervised_fraction": zero.detach()}
         if candidates.numel() == 0:
             return zero, metrics
-        # Random selection avoids always training the first person in each batch.
-        selected = candidates[torch.randperm(candidates.numel(), device=candidates.device)[:self.decoded_max_samples]]
-        latent = predicted_clean[selected]
-        if self.decoded_checkpoint and torch.is_grad_enabled():
-            decoded = checkpoint(self._decode_with_grad, latent, use_reentrant=False)
-        else:
-            decoded = self._decode_with_grad(latent)
-        target = encoded["target_image"][selected]
-        if decoded.shape != target.shape:
-            raise ValueError("Decoded prediction and person target must have identical image resolution")
-        # Work in [0,1] units, but do not clamp predictions and lose out-of-range gradients.
-        decoded, target = (decoded.float() + 1) * 0.5, (target.float() + 1) * 0.5
-        mask = mask[selected]
-        rgb = masked_mean((decoded - target).abs(), mask)
-        edge = self._detail_loss(decoded, target, mask)
+        order = candidates[torch.randperm(candidates.numel(), device=candidates.device)]
+        selected = order if self.decoded_max_samples == 0 else order[:self.decoded_max_samples]
+        rgb_losses, edge_losses = [], []
+        # Decode one sample at a time. With decoded_max_samples=0 this covers every
+        # eligible sample without multiplying the frozen decoder's peak activation memory.
+        for index in selected.split(1):
+            latent = predicted_clean[index]
+            if self.decoded_checkpoint and torch.is_grad_enabled():
+                decoded = checkpoint(self._decode_with_grad, latent, use_reentrant=False)
+            else:
+                decoded = self._decode_with_grad(latent)
+            target = encoded["target_image"][index]
+            if decoded.shape != target.shape:
+                raise ValueError("Decoded prediction and person target must have identical image resolution")
+            # Work in [0,1] units, but do not clamp predictions and lose out-of-range gradients.
+            decoded, target = (decoded.float() + 1) * 0.5, (target.float() + 1) * 0.5
+            selected_mask = mask[index]
+            rgb_losses.append(masked_mean((decoded - target).abs(), selected_mask))
+            edge_losses.append(self._detail_loss(decoded, target, selected_mask))
+        rgb = torch.stack(rgb_losses).mean()
+        edge = torch.stack(edge_losses).mean()
         metrics.update(decoded_rgb_loss=rgb.detach(), decoded_edge_loss=edge.detach(),
                        decoded_samples=rgb.new_tensor(selected.numel()),
-                       decoded_supervised_fraction=mask.mean().detach())
+                       decoded_supervised_fraction=mask[selected].mean().detach())
         return self.decoded_rgb_weight * rgb + self.decoded_edge_weight * edge, metrics
 
     def forward(self, batch):
@@ -700,8 +910,12 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         supervise_correspondence = (
             self.training and self.correspondence_loss.enabled and self._correspondence_ramp() > 0
         )
-        supervise_tv = self.training and self.attention_tv_weight > 0 and self._correspondence_ramp() > 0
-        request_attention = supervise_correspondence or supervise_tv
+        supervise_fine = (
+            self.training
+            and max(self.fine_correspondence_weight, self.fine_value_weight, self.fine_rgb_weight) > 0
+            and self._correspondence_ramp() > 0
+        )
+        request_attention = supervise_correspondence or supervise_fine
         output = self.model(
             x=xt,
             t=timesteps,
@@ -712,7 +926,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             garment_mask=garment_mask,
             return_uncertainty=True,
             return_garment_attention=request_attention,
-            return_garment_centers=supervise_tv,
+            return_refiner_supervision=supervise_fine,
             garment_attention_scales=self.correspondence_scales,
             **conditions,
         )
@@ -758,11 +972,22 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             metrics["detail_active_fraction"] = detail_mask.flatten(1).any(1).float().mean()
             metrics["detail_edge_importance"] = masked_mean(detail_importance, detail_mask)
             metrics["detail_supervised_fraction"] = detail_mask.sum() / masks.latent.sum().clamp_min(1)
-        if supervise_tv:
-            tv_loss, tv_metrics = self._attention_tv_loss(attention_maps, batch, keep)
-            loss = loss + self.attention_tv_weight * self._correspondence_ramp() * tv_loss
-            metrics.update(tv_metrics)
+        fine_entries = [entry for entry in attention_maps if entry.get("scale") == "refiner"]
         attention_maps = [entry for entry in attention_maps if "weights" in entry]
+        correspondence_target = correspondence_weight = similarity = None
+        if (supervise_correspondence or supervise_fine) and self.correspondence_teacher is not None:
+            correspondence_target, correspondence_weight, similarity = self._correspondence_targets(
+                batch, encoded, masks.token, keep
+            )
+        ramp = self._correspondence_ramp()
+        if supervise_fine:
+            if len(fine_entries) != 1 or correspondence_target is None:
+                raise RuntimeError("Fine supervision requires one refiner entry and DINO correspondence targets")
+            fine_loss, fine_metrics = self._fine_losses(
+                fine_entries[0], correspondence_target, correspondence_weight, batch, encoded, keep
+            )
+            loss = loss + ramp * fine_loss
+            metrics.update(fine_metrics)
         if attention_maps and supervise_correspondence:
             appearance, appearance_weight = self._appearance_targets(batch, encoded, masks.token, keep)
             value_targets = (
@@ -775,11 +1000,6 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 # raw 1/2- and 1/4-resolution target pyramids before CORAL backward.
                 encoded["target_middle"] = None
                 encoded["target_detail"] = None
-            correspondence_target = correspondence_weight = similarity = None
-            if self.correspondence_teacher is not None:
-                correspondence_target, correspondence_weight, similarity = self._correspondence_targets(
-                    batch, encoded, masks.token, keep
-                )
             correspondence_loss, correspondence_metrics = self.correspondence_loss(
                 attention_maps,
                 correspondence_target,
@@ -788,7 +1008,6 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 appearance_weight=appearance_weight,
                 value_targets=value_targets,
             )
-            ramp = self._correspondence_ramp()
             loss = loss + ramp * correspondence_loss
             metrics.update(correspondence_metrics)
             metrics["correspondence_loss"] = correspondence_loss.detach()
@@ -804,6 +1023,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 metrics["correspondence_similarity"] = (
                     similarity * eligible.float()
                 ).sum() / editable
+        if supervise_correspondence or supervise_fine:
+            metrics["correspondence_ramp"] = torch.as_tensor(ramp, device=loss.device)
         if use_decoded:
             decoded_loss, decoded_metrics = self._decoded_garment_loss(
                 predicted_clean, batch, encoded, timesteps, keep

@@ -21,12 +21,13 @@ def main():
     parser.add_argument('--height', type=int, default=128)
     parser.add_argument('--width', type=int, default=96)
     parser.add_argument('--checkpoint', help='Also audit the full XL checkpoint on CPU/meta, without optimizer loading')
+    parser.add_argument('--experiment', default='viton-pft-xl-512x384-detail')
     args = parser.parse_args()
     torch.set_num_threads(2)
     torch.manual_seed(42)
     repo = Path(__file__).resolve().parents[1]
     with initialize_config_dir(config_dir=str(repo/'configs'), version_base=None):
-        cfg = compose(config_name='config', overrides=['experiment=viton-pft-xl-512x384-detail'])
+        cfg = compose(config_name='config', overrides=[f'experiment={args.experiment}'])
     cfg.model.params.pretrained_ckpt = None
     if args.checkpoint:
         # Resolve the completed file behind last.ckpt before opening it. mmap avoids
@@ -39,10 +40,14 @@ def main():
         current = {key[6:]:value for key,value in saved['state_dict'].items() if key.startswith('model.')}
         missing = set(expected)-set(current)
         unexpected = set(current)-set(expected)
-        assert not unexpected, unexpected
+        obsolete = {key for key in unexpected if key.startswith(
+            ('garment_refiner.condition.','garment_refiner.state.')
+        ) or key in ('garment_refiner.local.1.bias','garment_refiner.local.3.bias')}
+        assert unexpected == obsolete, unexpected - obsolete
         assert all(key.startswith('garment_refiner.') for key in missing), missing
-        assert all(current[key].shape == expected[key].shape for key in current)
-        print(f"CHECKPOINT PASS: step={saved['global_step']}, matching={len(current)}, new_refiner_tensors={len(missing)}", flush=True)
+        assert all(current[key].shape == expected[key].shape for key in set(current) & set(expected))
+        print(f"CHECKPOINT PASS: step={saved['global_step']}, matching={len(set(current)&set(expected))}, "
+              f"new_refiner_tensors={len(missing)}, obsolete_shortcut_tensors={len(obsolete)}", flush=True)
         del saved, current, expected, full
     cfg.model.params.hidden_size = 64
     cfg.model.params.depth = 3
@@ -82,7 +87,8 @@ def main():
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         print({'step':step, **{key:float(metrics[key].detach()) for key in (
-            'flow_loss','decoded_rgb_loss','decoded_edge_loss','attention_tv_loss','attention_tv/refiner'
+            'flow_loss','decoded_rgb_loss','decoded_edge_loss','fine_correspondence_loss',
+            'fine_target_mass','fine_value_loss','fine_top1_accuracy','fine_rgb_loss'
         )}}, flush=True)
     # Check actual SD decoder numerical parity and latent-input gradient propagation.
     latent = module.encode(data['image']).detach().requires_grad_(True)
@@ -92,7 +98,7 @@ def main():
     torch.testing.assert_close(decoded, reference, rtol=0, atol=0)
     decoded.mean().backward()
     assert latent.grad.abs().sum() > 0
-    print(f'PASS: {args.height}x{args.width} real paired images, frozen SD-VAE and DINO, two optimizer steps, decoded gradient/parity and masked ATV. XL GPU peak memory and image quality are not tested.', flush=True)
+    print(f'PASS: {args.height}x{args.width} real paired images, frozen SD-VAE and DINO, two optimizer steps, decoded gradient/parity and direct fine correspondence/value supervision. XL GPU peak memory and image quality are not tested.', flush=True)
 
 
 if __name__ == '__main__':

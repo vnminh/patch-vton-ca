@@ -1,0 +1,22 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384-detail-supervised
+  - _self_
+
+name: vton/pft-xl-512x384-detail-stable
+
+model:
+  params:
+    # Per-head cosine attention bounds logits after positional injection. Shared by
+    # inference SDPA and direct Q/K supervision; no new checkpoint parameters.
+    garment_refiner_qk_norm: true
+    garment_refiner_cosine_scale: 10.0
+
+trainer:
+  params:
+    # Geometry still matters, but must not overwhelm flow/decoded reconstruction.
+    fine_correspondence_weight: 0.05
+    fine_rgb_weight: 0.1
+    # Retain feature transport supervision at lower weight: EMA feature agreement
+    # alone decreased despite poor routing in the supervised run.
+    fine_value_weight: 0.1

@@ -1,0 +1,7 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384-detail
+  - _self_
+
+# Separate logs/checkpoints from the collapsed ATV experiment.
+name: vton/pft-xl-512x384-detail-supervised

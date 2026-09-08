@@ -1,6 +1,11 @@
 # Equal-grid detail refinement and garment supervision
 
-Experiment: `viton-pft-xl-512x384-detail` (inherits the garment-mask fixes).
+2026-09-08 update: use `viton-pft-xl-512x384-detail-stable` for the bounded
+fine-attention/RGB-transport revision. See [training audit and restart
+instructions](VTON_TRAINING_AUDIT_20260908.md). The supervised experiment and
+results below document the previous stage, not a successful logo-quality result.
+
+Experiment: `viton-pft-xl-512x384-detail-supervised` (inherits the garment-mask fixes).
 
 Both person and garment images stay **512x384**. All backbone cross-attention
 routes now use 32x24 person queries and 32x24 garment keys. The existing detail
@@ -8,8 +13,10 @@ features are pooled only for these backbone routes. A new 256-channel refiner
 uses **64x48 person queries and unpooled 64x48 garment keys/values**. Learned
 subpixel query expansion distinguishes the four latent cells inside each PFT
 patch; the refiner writes a 4-channel velocity residual directly at 64x48.
-It does not pool the transported fine features back to 32x24. Its output
-projection starts at zero. Other existing parameters retain their shapes.
+It does not pool the transported fine features back to 32x24. Person/backbone
+features form the queries, but the output path is strictly
+`attention @ garment_value -> projection -> local block -> velocity`: the old
+direct person-query residual has been removed.
 
 ## Losses
 
@@ -22,78 +29,75 @@ projection starts at zero. Other existing parameters retain their shapes.
 - Full-resolution garment/edit mask intersection selects supervised pixels;
   both endpoints must be valid for an edge. The decoder still has a receptive
   field, so gradients can propagate outside an eligible pixel's latent cell.
-- `attention_tv_weight: 0.01` adds **StableVITON-inspired attention-center total
-  variation**, averaging heads and regularizing neighboring query centers inside
-  the garment. It applies to each backbone scale and the fine refiner, with
-  scale-balanced averaging and the existing 1000-step correspondence warmup.
-  Fine centers use a second fused coordinate-value reduction, not a stored
-  3072x3072 attention matrix. No center calculation is needed at inference.
+- Fine correspondence (`0.2`) directly supervises every refiner head at 64x48
+  using reliable DINO targets upsampled from 32x24. The positive set is a 3x3
+  garment-key neighborhood. The QxK loss is computed in checkpointed 256-query
+  chunks, so the full 3072x3072 attention matrix is never retained.
+- Fine transported-value supervision (`0.25`) aligns the actual 256-channel
+  `out_proj(A@V)` with unpooled target-person VAE features through frozen EMA
+  projectors. It directly trains V/output content transport.
+- There is no attention-TV/ATV implementation or configuration. The previous
+  loss admitted the observed fixed-key collapse and was removed completely.
 
-This is an adaptation of the [StableVITON ATV objective](https://openaccess.thecvf.com/content/CVPR2024/papers/Kim_StableVITON_Learning_Semantic_Correspondence_with_Latent_Diffusion_Model_for_Virtual_CVPR_2024_paper.pdf),
-not a verbatim implementation: centers are probability-normalized coordinates
-in [-1,1], and **both endpoints are masked** to avoid an artificial pull toward
-zero at garment boundaries. It smooths correspondence geometry, not RGB/logos.
-TV alone admits constant/collapsed centers; retain correspondence and appearance
-losses and inspect previews. These weights are starting points, not tuned claims.
-
-Decoder checkpointing and microbatch 1 / accumulation 32 keep the effective
-single-GPU batch at 32 and leave more GPU headroom. Full XL GPU memory and
+Decoder checkpointing, serialized per-image decoding, microbatch 4 and
+accumulation 8 keep the effective single-GPU batch at 32. Every eligible sample
+is decoded (`decoded_max_samples: 0`), rather than one sample per microbatch.
+Full XL GPU memory and
 quality improvement require an actual new training run; CPU checks do not
-establish either. DINO targets remain on their original 32x24 grid; the new
-fine branch receives flow, decoded reconstruction, and masked center-TV losses.
+establish either.
 
 ## Server: warm-start with existing learned weights
 
-Uploaded checkout: `/workspace/patch-forcing-detail-20260907`.
+Uploaded checkout: `/workspace/patch-forcing-detail-supervised-20260907`.
 The active old checkout and training process are not modified or stopped.
 Stop the old run yourself after a completed checkpoint, then run directly:
 
 ```bash
-cd /workspace/patch-forcing-detail-20260907
+cd /workspace/patch-forcing-detail-supervised-20260907
 source /venv/ai/bin/activate
 export VITONHD_ROOT=/workspace/high-resolution-viton-zalando-dataset
-export PFT_XL_CKPT=/workspace/patch-forcing/checkpoints/pft-xl_step400k_ema.ckpt
-python train.py experiment=viton-pft-xl-512x384-detail \
-  load_weights=/workspace/patch-forcing-garment-fix-20260906/logs/vton/pft-xl-512x384-garment-fix/2026-09-06/T160658/checkpoints/last.ckpt
+python train.py experiment=viton-pft-xl-512x384-detail-supervised \
+  model.params.pretrained_ckpt=null \
+  load_weights=/workspace/patch-forcing-detail-20260907/logs/vton/pft-xl-512x384-detail/2026-09-07/T022635/checkpoints/step002000.ckpt \
+  +resume_step=2000
 ```
 
-This is a **weight warm-start with fresh optimizer and step counter**, not an
-exact resume. New parameters make the old optimizer incompatible. Strict
-loading allows a wholly absent refiner only with `allow_new_garment_refiner`;
-partially missing or unexpected model weights still fail. Matching the backbone
-key grids also changes attention behavior, even though weights are preserved.
-Optionally append `+resume_step=19000` only if the selected checkpoint is step
-19000; that changes the displayed counter, not optimizer history.
+This is a **weight warm-start with a fresh optimizer**, not an exact resume.
+It keeps the displayed step at 2000 while restarting the LR and correspondence
+warmups. New EMA target projectors are initialized from the loaded student.
+Obsolete person-shortcut tensors are explicitly discarded; other missing or
+unexpected weights still fail strict loading.
 
 After this architecture saves its own checkpoint, exact optimizer resume uses:
 
 ```bash
-python train.py experiment=viton-pft-xl-512x384-detail resume_checkpoint=/absolute/path/to/new-detail-run/checkpoints/last.ckpt
+python train.py experiment=viton-pft-xl-512x384-detail-supervised resume_checkpoint=/absolute/path/to/new-supervised-run/checkpoints/last.ckpt
 ```
 
 Do not specify `load_weights` and `resume_checkpoint` together. Do not launch
 beside the old process on the same 24-GB GPU. Logs are under a separate
-`logs/vton/pft-xl-512x384-detail` directory; no old checkpoints are deleted.
-Monitor `decoded_rgb_loss`, `decoded_edge_loss`, `attention_tv/{scale}`,
+`logs/vton/pft-xl-512x384-detail-supervised` directory; no old checkpoints are deleted.
+Monitor `decoded_rgb_loss`, `decoded_edge_loss`, `fine_target_mass`,
+`fine_top1_accuracy`, `fine_value_loss`,
 `garment_grad/refiner/{query,key,value,output}`, and held-out paired previews.
-The zero output initialization means value-path gradients start after the first
-nonzero-learning-rate update; Q/K can also receive the TV gradient once its
-warmup begins.
 
 ## Verification
 
-Verified on 2026-09-07: 78 local tests plus 7 subtests passed, including BF16
-backward and paired/swap validation. The uploaded code passed two real-data
-512x384 CPU optimizer updates with pretrained SD-VAE/DINO, nonzero fine
+Verified on 2026-09-07: 77 local tests plus 7 subtests passed, including BF16
+backward and paired/swap validation. The uploaded code passed two 128x96
+real-data CPU optimizer updates with pretrained SD-VAE/DINO, nonzero fine
 query/key/value/output gradients, frozen VAE parameters, and exact decoder
-output parity. Step-19000 XL checkpoint audit: all 388 existing model tensors
-match; 27 refiner tensors are new. No full-XL GPU training was started.
+output parity. Fine NLL fell 2.410 to 2.351, target mass rose 0.0927 to 0.0980,
+and value loss fell 0.236 to 0.217 in that wiring check. The full XL step-2000
+checkpoint loaded strictly: 409 model tensors matched, six obsolete shortcut
+tensors were discarded, and new EMA targets were initialized from the loaded
+student. No full-XL GPU training was started.
 
 ```bash
 OMP_NUM_THREADS=2 CUDA_VISIBLE_DEVICES='' python -m pytest tests/test_vton.py tests/test_vton_supervision.py tests/test_vton_detail.py -q
 HF_HUB_OFFLINE=1 CUDA_VISIBLE_DEVICES='' python scripts/verify_vton_detail.py \
   --data-root /workspace/high-resolution-viton-zalando-dataset \
-  --vae-checkpoint /workspace/patch-forcing/checkpoints/sd_ae.ckpt \
+  --vae-checkpoint checkpoints/sd_ae.ckpt \
   --height 512 --width 384
 ```
 
