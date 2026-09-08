@@ -1,6 +1,7 @@
 import os
 import random
 
+import cv2
 import numpy as np
 import torch
 from PIL import Image
@@ -59,6 +60,9 @@ class VTONHDDataset(Dataset):
         paired=True,
         preview_sample_id=None,
         garment_parse_labels=None,
+        dense_pose_dir=None,
+        garment_high_frequency=False,
+        garment_high_frequency_canny_thresholds=(100, 200),
     ):
         self.root = os.path.abspath(root)
         self.split = split
@@ -84,6 +88,17 @@ class VTONHDDataset(Dataset):
         self.agnostic_mask_dir = os.path.join(split_root, "agnostic-mask")
         self.garment_mask_dir = os.path.join(split_root, "cloth-mask")
         self.person_parse_dir = os.path.join(split_root, "image-parse-v3")
+        self.dense_pose_dir = None if dense_pose_dir is None else os.path.join(split_root, str(dense_pose_dir))
+        if self.dense_pose_dir is not None and not os.path.isdir(self.dense_pose_dir):
+            raise FileNotFoundError(f"DensePose conditioning requires: {self.dense_pose_dir}")
+        self.garment_high_frequency = bool(garment_high_frequency)
+        thresholds = tuple(int(value) for value in garment_high_frequency_canny_thresholds)
+        if len(thresholds) != 2 or not 0 <= thresholds[0] < thresholds[1] <= 255:
+            raise ValueError(
+                "garment_high_frequency_canny_thresholds must be [low, high] with "
+                "0 <= low < high <= 255"
+            )
+        self.garment_high_frequency_canny_thresholds = thresholds
         if self.garment_parse_labels is not None and not os.path.isdir(self.person_parse_dir):
             raise FileNotFoundError(f"Garment supervision requires parsing labels: {self.person_parse_dir}")
         pair_list = pair_list or os.path.join(self.root, f"{split}_pairs.txt")
@@ -125,6 +140,16 @@ class VTONHDDataset(Dataset):
         scale = random.uniform(1.0 - self.scale_limit, 1.0 + self.scale_limit)
         return translate, scale
 
+    def _garment_high_frequency_map(self, garment, garment_mask):
+        """Canny detail from the transformed target cloth, restricted to its mask."""
+        rgb = np.asarray(garment, dtype=np.uint8)
+        mask = np.asarray(garment_mask, dtype=np.uint8) > 127
+        gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+        low, high = self.garment_high_frequency_canny_thresholds
+        edges = cv2.Canny(gray, low, high)
+        edges[~mask] = 0
+        return torch.from_numpy(edges.copy()).unsqueeze(0).float().div_(255.0)
+
     @staticmethod
     def _apply_shift_scale(image, mask, params):
         if params is None:
@@ -161,6 +186,9 @@ class VTONHDDataset(Dataset):
         garment = self._load_rgb(_resolve_file(self.garment_dir, garment_name))
         agnostic_mask = self._load_mask(_resolve_file(self.agnostic_mask_dir, person_name, mask=True))
         garment_mask = self._load_mask(_resolve_file(self.garment_mask_dir, garment_name, mask=True))
+        dense_pose = None
+        if self.dense_pose_dir is not None:
+            dense_pose = self._load_rgb(_resolve_file(self.dense_pose_dir, person_name))
         person_garment_mask = None
         if self.garment_parse_labels is not None:
             # Preserve palette indices: L conversion gives brightness, not labels.
@@ -179,10 +207,16 @@ class VTONHDDataset(Dataset):
             garment = TF.hflip(garment)
             agnostic_mask = TF.hflip(agnostic_mask)
             garment_mask = TF.hflip(garment_mask)
+            if dense_pose is not None:
+                dense_pose = TF.hflip(dense_pose)
             if person_garment_mask is not None:
                 person_garment_mask = TF.hflip(person_garment_mask)
 
         person_transform = self._sample_shift_scale()
+        if dense_pose is not None:
+            dense_pose, _ = self._apply_shift_scale(
+                dense_pose, Image.new("L", dense_pose.size), person_transform
+            )
         if person_garment_mask is not None:
             _, person_garment_mask = self._apply_shift_scale(person, person_garment_mask, person_transform)
         person, agnostic_mask = self._apply_shift_scale(
@@ -191,6 +225,12 @@ class VTONHDDataset(Dataset):
         garment, garment_mask = self._apply_shift_scale(
             garment, garment_mask, self._sample_shift_scale()
         )
+
+        garment_high_frequency = None
+        if self.garment_high_frequency:
+            # Compute after all garment augmentation: RGB, cloth mask and HF map then
+            # describe the same target garment coordinates in paired and unpaired data.
+            garment_high_frequency = self._garment_high_frequency_map(garment, garment_mask)
 
         person = TF.to_tensor(person) * 2 - 1
         garment = TF.to_tensor(garment) * 2 - 1
@@ -210,6 +250,10 @@ class VTONHDDataset(Dataset):
         }
         if person_garment_mask is not None:
             sample["person_garment_mask"] = (TF.to_tensor(person_garment_mask) > 0.5).float()
+        if dense_pose is not None:
+            sample["dense_pose"] = TF.to_tensor(dense_pose) * 2 - 1
+        if garment_high_frequency is not None:
+            sample["garment_high_frequency"] = garment_high_frequency
         return sample
 
 
@@ -217,7 +261,9 @@ class VTONValidationDataset(Dataset):
     """Fixed train/test reconstructions and test garment swaps sharing noise seeds."""
 
     def __init__(self, root, image_size=(512, 384), garment_parse_labels=(5, 6, 7),
-                 test_samples=8, train_samples=4, preview_sample_id=None):
+                 dense_pose_dir=None, garment_high_frequency=False,
+                 garment_high_frequency_canny_thresholds=(100, 200), test_samples=8,
+                 train_samples=4, preview_sample_id=None):
         if test_samples < 2 or train_samples < 0:
             raise ValueError("Validation needs at least two test samples and nonnegative train_samples")
         self.datasets = {}
@@ -228,6 +274,9 @@ class VTONValidationDataset(Dataset):
             dataset = VTONHDDataset(
                 root, split=split, image_size=image_size, paired=False,
                 garment_parse_labels=garment_parse_labels,
+                dense_pose_dir=dense_pose_dir,
+                garment_high_frequency=garment_high_frequency,
+                garment_high_frequency_canny_thresholds=garment_high_frequency_canny_thresholds,
                 preview_sample_id=preview_sample_id if split == "test" else None,
             )
             if count > len(dataset):

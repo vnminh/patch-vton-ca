@@ -100,6 +100,8 @@ class VTONPatchFlowForcing:
         edit_condition_mask,
         garment_conditions,
         garment_mask,
+        dense_pose,
+        garment_high_frequency,
         y,
         cfg_scale,
         return_uncertainty,
@@ -109,6 +111,8 @@ class VTONPatchFlowForcing:
             person_mask=person_condition_mask,
             edit_mask=edit_condition_mask,
             garment_mask=garment_mask,
+            dense_pose=dense_pose,
+            garment_high_frequency=garment_high_frequency,
             y=y,
             return_uncertainty=return_uncertainty,
             **garment_conditions,
@@ -122,6 +126,11 @@ class VTONPatchFlowForcing:
         kwargs["person_agnostic"] = self._repeat_condition(person_condition, 2)
         kwargs["person_mask"] = self._repeat_condition(person_condition_mask, 2)
         kwargs["edit_mask"] = self._repeat_condition(edit_condition_mask, 2)
+        kwargs["dense_pose"] = self._repeat_condition(dense_pose, 2)
+        if garment_high_frequency is not None:
+            kwargs["garment_high_frequency"] = torch.cat(
+                (torch.zeros_like(garment_high_frequency), garment_high_frequency), dim=0
+            )
         kwargs["y"] = self._repeat_condition(y, 2)
         for key in GARMENT_CONDITION_KEYS:
             value = garment_conditions.get(key)
@@ -168,6 +177,8 @@ class VTONPatchFlowForcing:
         garment_middle=None,
         garment_detail=None,
         garment_mask=None,
+        dense_pose=None,
+        garment_high_frequency=None,
         person_condition=None,
         person_condition_mask=None,
         y=None,
@@ -219,6 +230,8 @@ class VTONPatchFlowForcing:
                 masks.condition,
                 garment_conditions,
                 garment_mask,
+                dense_pose,
+                garment_high_frequency,
                 y,
                 cfg_scale,
                 return_uncertainty=adaptive,
@@ -249,6 +262,8 @@ class VTONPatchFlowForcing:
                         masks.condition,
                         garment_conditions,
                         garment_mask,
+                        dense_pose,
+                        garment_high_frequency,
                         y,
                         cfg_scale,
                         return_uncertainty=False,

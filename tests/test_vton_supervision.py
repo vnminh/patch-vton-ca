@@ -121,12 +121,15 @@ def test_validation_metrics_ignore_swaps_empty_masks_and_non_garment_errors():
 
 def make_dataset(root):
     for split in ('train','test'):
-        for folder in ('image','cloth','agnostic-mask','cloth-mask','image-parse-v3'):
+        for folder in ('image','cloth','agnostic-mask','cloth-mask','image-parse-v3','image-densepose'):
             (root / split / folder).mkdir(parents=True)
         (root / f'{split}_pairs.txt').write_text('a.jpg a.jpg\nb.jpg b.jpg\n')
         for name in ('a','b'):
             for folder in ('image','cloth'):
                 Image.new('RGB',(32,32),(64,64,64)).save(root/split/folder/f'{name}.jpg')
+            Image.new('RGB',(32,32),(32 if name == 'a' else 224,64,96)).save(
+                root/split/'image-densepose'/f'{name}.jpg'
+            )
             for folder in ('agnostic-mask','cloth-mask'):
                 Image.new('L',(32,32),255).save(root/split/folder/f'{name}.png')
             labels = np.zeros((32,32),dtype=np.uint8)
@@ -163,6 +166,18 @@ def test_fixed_validation_has_paired_train_test_and_swaps_with_shared_noise_seed
         assert paired['validation_seed'] == swapped['validation_seed']
         assert paired['person_name'] == swapped['person_name']
         assert dataset[4]['validation_group'] == 'train_paired'
+
+
+def test_dense_pose_follows_person_and_is_shared_across_garment_swap():
+    with TemporaryDirectory() as folder:
+        root = Path(folder)
+        make_dataset(root)
+        dataset = VTONValidationDataset(root, image_size=32, dense_pose_dir='image-densepose',
+                                        test_samples=2, train_samples=0)
+        paired, swapped = dataset[0], dataset[1]
+        torch.testing.assert_close(paired['dense_pose'], swapped['dense_pose'])
+        assert paired['dense_pose'].shape == (3,32,32)
+        assert paired['person_name'] == swapped['person_name']
 
 
 def test_fix_experiment_composes_and_keeps_optimizer_shapes():
@@ -202,6 +217,7 @@ def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detai
         garment_match_query_grid=fine_detail, garment_latent_refiner=fine_detail,
         garment_refiner_width=32, garment_refiner_heads=4,
         garment_refiner_qk_norm=fine_detail,
+        garment_high_frequency_channels=1 if fine_detail else 0,
     )
     with patch('transformers.AutoModel.from_pretrained', return_value=FakeDinoBackbone()):
         module = LatentVTONPatchForcingTrainer(
@@ -229,6 +245,8 @@ def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detai
             'agnostic_mask':edit, 'person_garment_mask':worn, 'garment':person.clone(),
             'garment_mask':edit, 'has_ground_truth':torch.ones(2,dtype=torch.bool),
             'validation_seed':torch.tensor([0,0]), 'validation_group':['test_paired','test_unpaired']}
+    if fine_detail:
+        data['garment_high_frequency'] = torch.randint(0, 2, (2, 1, 64, 48)).float()
     with torch.autocast('cpu',dtype=torch.bfloat16):
         loss, metrics = module(data)
     assert torch.isfinite(loss)
@@ -244,6 +262,7 @@ def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detai
     loss.backward()
     if fine_detail:
         assert model.garment_refiner.output.weight.grad.abs().sum() > 0
+        assert model.garment_high_frequency_control.output.weight.grad.abs().sum() > 0
         assert model.garment_refiner.query.weight.grad.abs().sum() > 0
         assert all(p.grad is None and not p.requires_grad for p in vae.parameters())
     for scale in ('coarse','middle','detail'):

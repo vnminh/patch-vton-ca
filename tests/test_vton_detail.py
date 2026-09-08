@@ -12,13 +12,15 @@ from patch_flow.trainer_vton import LatentVTONPatchForcingTrainer
 from test_vton_supervision import trainer, batch
 
 
-def model(refiner=False, match=False):
+def model(refiner=False, match=False, dense_pose_channels=0, garment_high_frequency_channels=0):
     return VTONPatchForcingDiT(
         input_size=8, in_channels=4, hidden_size=32, depth=3, num_heads=4,
         num_classes=10, cross_attention_every=1, garment_middle_channels=8,
         garment_detail_channels=8, garment_scale_routes=['coarse', 'middle', 'detail'],
         garment_latent_refiner=refiner, garment_match_query_grid=match,
         garment_refiner_width=32, garment_refiner_heads=4, gradient_checkpointing=True,
+        dense_pose_channels=dense_pose_channels,
+        garment_high_frequency_channels=garment_high_frequency_channels,
     )
 
 
@@ -51,6 +53,127 @@ def test_equal_query_key_grids_and_fine_output_neutral_initialization():
     data['garment_detail'] = torch.randn(2,8,24,32)
     with pytest.raises(ValueError, match='identical resolution'):
         new(**data)
+
+
+def test_dense_pose_is_only_zero_initialized_appended_input_channels():
+    def wrap(network):
+        return LatentVTONPatchForcingTrainer(
+            model=network, first_stage=torch.nn.Identity(), ema_rate=0,
+            flow={'target':'patch_flow.flow_vton.VTONPatchFlowForcing','params':{'patch_size':2}},
+            compute_validation_metrics=False, correspondence_center_weight=0,
+            correspondence_nll_weight=0, correspondence_entropy_weight=0,
+            correspondence_photometric_weight=0,
+        )
+    old, new = wrap(model()), wrap(model(dense_pose_channels=4))
+    old_weight = old.model.x_embedder.proj.weight.detach().clone()
+    with pytest.warns(UserWarning,match='zero-initialized conditioning channel'):
+        new.load_state_dict(old.state_dict(),strict=True)
+    weight = new.model.x_embedder.proj.weight
+    torch.testing.assert_close(weight[:,:9],old_weight,rtol=0,atol=0)
+    assert not weight[:,9:].any()
+    data = inputs()
+    old.eval(); new.eval()
+    with torch.no_grad():
+        reference = old.model(**data)
+        output = new.model(**data,dense_pose=torch.randn(2,4,8,6))
+    torch.testing.assert_close(output,reference,rtol=0,atol=0)
+    new.train()
+    embedded = []
+    handle = new.model.x_embedder.register_forward_hook(lambda module,args,output: embedded.append(output))
+    new.model(**data,dense_pose=torch.randn(2,4,8,6))
+    handle.remove()
+    embedded[0].sum().backward()
+    assert weight.grad[:,9:].abs().sum() > 0
+
+
+@pytest.mark.parametrize('ema_rate', [0, .99])
+def test_high_frequency_control_preserves_13_inputs_and_warm_starts(ema_rate):
+    def wrap(network):
+        return LatentVTONPatchForcingTrainer(
+            model=network, first_stage=torch.nn.Identity(), ema_rate=ema_rate,
+            flow={'target':'patch_flow.flow_vton.VTONPatchFlowForcing','params':{'patch_size':2}},
+            compute_validation_metrics=False, correspondence_center_weight=0,
+            correspondence_nll_weight=0, correspondence_entropy_weight=0,
+            correspondence_photometric_weight=0,
+            allow_new_garment_high_frequency=True,
+        )
+    old = wrap(model(refiner=True, dense_pose_channels=4))
+    # Nonzero old output makes prediction parity a meaningful check.
+    nn.init.normal_(old.model.final_layer.linear.weight, std=.1)
+    new = wrap(model(refiner=True, dense_pose_channels=4, garment_high_frequency_channels=1))
+    old_weight = old.model.x_embedder.proj.weight.detach().clone()
+    with pytest.warns(UserWarning, match='zero-initialized velocity output'):
+        new.load_state_dict(old.state_dict(), strict=True)
+    weight = new.model.x_embedder.proj.weight
+    assert weight.shape[1] == 13
+    torch.testing.assert_close(weight, old_weight, rtol=0, atol=0)
+    assert not new.model.garment_high_frequency_control.output.weight.any()
+    if ema_rate:
+        assert not new.ema_model.garment_high_frequency_control.output.weight.any()
+
+    data = inputs()
+    dense_pose = torch.randn(2, 4, 8, 6)
+    high_frequency = torch.randint(0, 2, (2, 1, 64, 48)).float()
+    old.eval(); new.eval()
+    with torch.no_grad():
+        reference = old.model(**data, dense_pose=dense_pose)
+        output = new.model(
+            **data, dense_pose=dense_pose, garment_high_frequency=high_frequency
+        )
+    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+
+    # Previously trained 14-channel checkpoints can explicitly discard just HF.
+    state = old.state_dict()
+    for key in ('model.x_embedder.proj.weight', 'ema_model.x_embedder.proj.weight'):
+        if key in state:
+            state[key] = torch.cat((state[key], torch.ones_like(state[key][:, :1])), dim=1)
+    with pytest.warns(UserWarning):
+        new.load_state_dict(state, strict=True)
+    torch.testing.assert_close(new.model.x_embedder.proj.weight, old_weight, rtol=0, atol=0)
+    new.load_state_dict(new.state_dict(), strict=True)
+    partial = new.state_dict()
+    del partial['model.garment_high_frequency_control.output.bias']
+    with pytest.raises(RuntimeError, match='Missing key'):
+        new.load_state_dict(partial, strict=True)
+
+
+def test_hf_control_adds_velocity_only_and_trains_after_zero_output_step():
+    net = model(refiner=True, garment_high_frequency_channels=1).train()
+    data = inputs()
+    data['edit_mask'] = torch.ones(2, 1, 8, 6)
+    data['edit_mask'][0, :, :, 3:] = 0
+    hf = torch.randint(0, 2, (2, 1, 64, 48)).float()
+    control = net.garment_high_frequency_control
+    optimizer = torch.optim.Adam(control.parameters(), lr=.01)
+    for step in range(2):
+        captured = []
+        handle = control.register_forward_hook(lambda module, args, value: captured.append(value))
+        velocity, logvar = net(**data, garment_high_frequency=hf, return_uncertainty=True)
+        handle.remove()
+        if step == 0:
+            assert not captured[0].any()
+        with torch.no_grad():
+            baseline, baseline_logvar = net(
+                **data, garment_high_frequency=torch.zeros_like(hf), return_uncertainty=True
+            )
+        torch.testing.assert_close(velocity, baseline + captured[0])
+        torch.testing.assert_close(logvar, baseline_logvar, rtol=0, atol=0)
+        assert not captured[0][0, :, :, 3:].any()
+        (velocity - torch.randn_like(velocity)).square().mean().backward()
+        assert control.output.weight.grad.abs().sum() > 0
+        if step:
+            assert control.encoder[1].weight.grad.abs().sum() > 0
+        optimizer.step()
+        net.zero_grad(set_to_none=True)
+    assert not torch.allclose(control.encoder[0](hf), control.encoder[0](hf.roll(1, -1)))
+    # Biases cannot leak a residual with dropped cloth or an empty edge map.
+    args = []
+    handle = control.register_forward_hook(lambda module, inputs, value: args.append(value))
+    net(**data, garment_high_frequency=torch.zeros_like(hf))
+    data['garment_mask'].zero_()
+    net(**data, garment_high_frequency=hf)
+    handle.remove()
+    assert all(not value.any() for value in args)
 
 
 def test_refiner_is_garment_transport_only_and_preserves_fine_phase():
@@ -231,9 +354,24 @@ def test_stable_experiment_composes_without_changing_resolution():
     with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
         cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-512x384-detail-stable'])
     assert cfg.model.params.garment_refiner_qk_norm
+    assert cfg.model.params.dense_pose_channels == 4
+    assert cfg.model.params.get('garment_high_frequency_channels', 0) == 0
     assert cfg.trainer.params.fine_rgb_weight > 0
     assert cfg.trainer.params.fine_correspondence_weight == .05
     assert list(cfg.data.params.train.params.image_size) == [512,384]
+    assert cfg.data.params.train.params.dense_pose_dir == 'image-densepose'
+    assert not cfg.data.params.train.params.get('garment_high_frequency', False)
+
+
+def test_hf_control_experiment_is_separate_and_enabled_for_paired_and_swapped_data():
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
+        cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-512x384-detail-rebalance-hf'])
+    assert cfg.model.params.garment_high_frequency_channels == 1
+    assert cfg.model.params.garment_latent_refiner
+    assert cfg.trainer.params.allow_new_garment_high_frequency
+    assert cfg.data.params.train.params.garment_high_frequency
+    assert cfg.data.params.validation.params.garment_high_frequency
+    assert cfg.name.endswith('hf-control')
 
 
 class TinyDecoder(nn.Module):
@@ -262,7 +400,10 @@ def test_decoded_loss_frozen_decoder_input_gradients_and_pixel_time_pair_masking
     loss.backward()
     assert latent.grad[0,:,:2,:2].abs().sum() > 0
     assert not latent.grad[1:].any()
-    assert not latent.grad[0,:,2:].any() and not latent.grad[0,:,:,2:].any()
+    # Decoded reconstruction covers the full edit region, including non-garment
+    # anatomy. Only the top-right token is excluded by its .99 timestep here.
+    assert latent.grad[0,:,2:].abs().sum() > 0
+    assert not latent.grad[0,:,:2,2:].any()
     assert all(p.grad is None for p in module.first_stage.parameters())
     torch.testing.assert_close(module._decode_with_grad(latent),module.first_stage.decode(latent))
     module.decoded_max_samples = 0
@@ -276,6 +417,36 @@ def test_decoded_loss_frozen_decoder_input_gradients_and_pixel_time_pair_masking
         with patch.object(module,'_decode_with_grad',side_effect=AssertionError('empty mask decoded')):
             loss, metrics = module._decoded_garment_loss(latent,data,{'target_image':target},times,keep)
         assert loss == 0 and metrics['decoded_samples'] == 0
+
+
+def test_garment_losses_exclude_arms_while_decoded_reconstruction_includes_them():
+    module = trainer()
+    data = batch()
+    data['person_garment_mask'].zero_()
+    data['person_garment_mask'][:, :, :, :8] = 1
+    # The right half represents an erased arm: editable, but not garment parsing.
+    garment_pixels = module._supervision_pixels(data)
+    reconstruction_pixels = module._reconstruction_pixels(data)
+    assert garment_pixels[:, :, :, :8].all()
+    assert not garment_pixels[:, :, :, 8:].any()
+    assert reconstruction_pixels[:, :, :, 8:].all()
+
+    module.first_stage = TinyDecoder().requires_grad_(False)
+    module.decoded_rgb_weight, module.decoded_edge_weight = 1., 0.
+    module.decoded_max_samples = 0
+    latent = torch.randn(3, 4, 4, 4, requires_grad=True)
+    target = torch.zeros(3, 3, 16, 16)
+    times = torch.full((3, 4), .5)
+    loss, metrics = module._decoded_garment_loss(
+        latent, data, {'target_image': target}, times, torch.ones(3)
+    )
+    assert loss > 0 and metrics['decoded_samples'] == 2
+    loss.backward()
+    # Both halves receive decoded reconstruction gradients, while the third sample
+    # remains excluded because batch() marks it unpaired.
+    assert latent.grad[:2, :, :, :2].abs().sum() > 0
+    assert latent.grad[:2, :, :, 2:].abs().sum() > 0
+    assert not latent.grad[2].any()
 
 
 def test_strict_legacy_warmstart_only_allows_wholly_new_refiner():

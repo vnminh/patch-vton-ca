@@ -1,0 +1,100 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384-detail-stable
+  - _self_
+
+name: vton/pft-xl-512x384-detail-rebalance
+
+# Move budget out of the terms that stopped learning and into the ones that did not.
+#
+# Measured on detail-stable, window 2500+ (weighted contributions sum to the logged
+# train/loss of 1.3261):
+#   flow      0.4594  35%   still the largest single term
+#   detail    0.4335  33%   flat at 0.86 for 3000 steps
+#   corr nll  0.2559  19%   2.690 -> 2.559 over 3000 steps, essentially at its floor
+#   fine      0.1124   8%   the only family improving monotonically
+#   decoded   0.0350   3%   both terms at their best values of the run
+#
+# fine_correspondence 4.90 -> 2.05, fine_target_mass 0.008 -> 0.155 and fine_top1 0.0014
+# -> 0.0579 are monotone across every window; decoded_rgb 0.0428 and decoded_edge 0.0529
+# are the best of the run. Those two families were carrying 11% of the gradient between
+# them. This config gives them 37%.
+#
+# Architecture is byte-identical to detail-stable, so its checkpoints load strict.
+# garment_refiner_qk_norm stays on: flipping it mid-run already reset the refiner routing
+# to chance once (fine_top1 0.00036 against a 1/3072 = 0.000326 chance level at step 2,
+# from a checkpoint trained with fine_correspondence_weight 0.2).
+
+trainer:
+  params:
+    # ---- Backbone correspondence NLL: down, and give it a reachable target ----------
+    # garment_match_query_grid pools all three scales onto one 32x24 grid, so the old
+    # per-scale radii were 15 / 9 / 9 keys out of 768 -- demanded of each of 16 heads,
+    # three times over. 0.06 is a 5x5 = 25 key window on that grid for every branch.
+    correspondence_nll_weight: 0.02
+    correspondence_nll_radius:
+      coarse: 0.06
+      middle: 0.06
+      detail: 0.06
+
+    # ---- Fine refiner supervision: up. This is what transports logos and text -------
+    # top1 is still only 5.8% on the 3072-key detail grid after 3000 steps. The previous
+    # detail-supervised run used 0.2 / 0.25 and backed off to 0.05 / 0.1 because the
+    # unbounded refiner logits made it overwhelm reconstruction. qk_norm now bounds every
+    # score to cosine * 10, which is exactly what makes the higher weight safe again.
+    fine_correspondence_weight: 0.15
+    fine_value_weight: 0.25
+    fine_rgb_weight: 0.2
+
+    # ---- Decoded pixel supervision: up ----------------------------------------------
+    # The only term that supervises real decoded pixels through the VAE. Its mask is the
+    # full agnostic edit region so erased arms/hands receive direct reconstruction loss.
+    # Correspondence, value and fine RGB targets remain garment-only. The time window
+    # stays at [0.3, 0.95] and decoded_max_samples stays 0 (every eligible sample).
+    decoded_rgb_weight: 0.5
+    decoded_edge_weight: 1.0
+
+    # ---- Latent detail L1: down, and only where its target is determined ------------
+    # Flat at 0.86 for 3000 steps while consuming a third of the objective. It is L1 on
+    # the edges of predicted_clean = xt + (1-t)*velocity, and the flow optimum is
+    # E[x1|xt], which is genuinely blurry at mid t -- so over [0.3, 0.95] it asks for
+    # detail that cannot be inferred from xt. Keep it on pure-noise garment forcing plus
+    # t >= 0.85, where the target is determined and logos and text are written.
+    # NOTE: train/detail_loss will jump on the first step. Different time window, so it
+    # is a different quantity; do not compare it against the old 0.86.
+    detail_loss_weight: 0.15
+    detail_min_time: 0.85
+    detail_max_time: 1.0
+
+    # fine_* is multiplied by the correspondence ramp too (trainer_vton.py:989), so this
+    # gates both families. Halved: this resumes a trained model, and 1000 steps of ramp
+    # is 1000 steps before the change is observable.
+    correspondence_warmup_steps: 500
+
+# Projected budget with the loss values measured above:
+#   flow 0.459 (42%) | fine 0.329 (30%) | detail ~0.15 (14%) | decoded 0.074 (6.8%)
+#   corr 0.066 (6.0%) | sigma 0.009
+# Flow stays the largest single term and fine_* becomes the dominant auxiliary.
+
+# ---- Measurement --------------------------------------------------------------------
+# Four val points spaced 500 steps apart over 8 paired test samples could not separate a
+# real regression from sampling noise: on 12 preview samples the mean garment MAE runs
+# .0711 / .0699 / .0743 / .0718 at steps 500 / 1000 / 2000 / 2500 with a per-sample sd of
+# .0121, i.e. sd(mean) = .0035 against a total spread of .0044.
+data:
+  params:
+    validation:
+      params:
+        test_samples: 16
+
+train_params:
+  val_check_interval: 250
+  limit_val_batches: 36
+
+# Deliberately NOT changed:
+#   lr / lr warmup             1e-4 / 1000 -- the step-1000 turn was noise, not the
+#                                             learning rate reaching full value
+#   decoded window, max_samples [0.3,0.95], 0 -- both decoded terms are improving
+#   garment_match_query_grid   true -- pooling three scales onto one 32x24 grid is a real
+#                                      design smell, but changing it invalidates every
+#                                      checkpoint. Separate experiment, from scratch.

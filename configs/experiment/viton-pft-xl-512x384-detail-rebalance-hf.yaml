@@ -1,0 +1,25 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384-detail-rebalance
+  - _self_
+
+name: vton/pft-xl-512x384-detail-rebalance-hf-control
+
+model:
+  params:
+    # One pixel-space HF channel feeds a separate control encoder, never x_embedder.
+    # Supervised detail Q/K align its content-only values; zero conv adds to velocity.
+    garment_high_frequency_channels: 1
+
+trainer:
+  params:
+    allow_new_garment_high_frequency: true
+
+data:
+  params:
+    train:
+      params:
+        garment_high_frequency: true
+    validation:
+      params:
+        garment_high_frequency: true

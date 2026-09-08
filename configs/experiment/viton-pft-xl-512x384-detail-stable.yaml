@@ -11,6 +11,9 @@ model:
     # inference SDPA and direct Q/K supervision; no new checkpoint parameters.
     garment_refiner_qk_norm: true
     garment_refiner_cosine_scale: 10.0
+    # Same frozen SD-VAE latent concatenated directly into x_embedder; there is no
+    # separate DensePose branch. Legacy weights are copied and these 4 channels are zero.
+    dense_pose_channels: 4
 
 trainer:
   params:
@@ -20,3 +23,12 @@ trainer:
     # Retain feature transport supervision at lower weight: EMA feature agreement
     # alone decreased despite poor routing in the supervised run.
     fine_value_weight: 0.1
+
+data:
+  params:
+    train:
+      params:
+        dense_pose_dir: image-densepose
+    validation:
+      params:
+        dense_pose_dir: image-densepose

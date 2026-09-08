@@ -38,6 +38,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         decoded_max_samples=1,
         decoded_checkpoint=True,
         allow_new_garment_refiner=False,
+        allow_new_garment_high_frequency=False,
         fine_correspondence_weight=0.0,
         fine_correspondence_radius=1,
         fine_value_weight=0.0,
@@ -91,6 +92,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         self.decoded_max_samples = int(decoded_max_samples)
         self.decoded_checkpoint = bool(decoded_checkpoint)
         self.allow_new_garment_refiner = bool(allow_new_garment_refiner)
+        self.allow_new_garment_high_frequency = bool(allow_new_garment_high_frequency)
         self.fine_correspondence_weight = float(fine_correspondence_weight)
         self.fine_correspondence_radius = int(fine_correspondence_radius)
         self.fine_value_weight = float(fine_value_weight)
@@ -277,6 +279,10 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         if refiner is not None:
             for name in ("query_expand", "query", "key", "value", "output"):
                 metrics[f"garment_grad/refiner/{name}"] = self._gradient_norm(getattr(refiner, name).weight)
+        control = getattr(self.model, "garment_high_frequency_control", None)
+        if control is not None:
+            metrics["garment_grad/hf/encoder"] = self._gradient_norm(control.encoder[1].weight)
+            metrics["garment_grad/hf/output"] = self._gradient_norm(control.output.weight)
         return metrics
 
     def _label(self, batch, batch_size, device):
@@ -325,6 +331,25 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         )
         agnostic_latent = self.encode(batch["person_agnostic"])
         person_context = agnostic_latent * (1 - masks.latent)
+        dense_pose_latent = None
+        if getattr(self.model, "dense_pose_channels", 0):
+            if "dense_pose" not in batch:
+                raise KeyError("DensePose-enabled VTON requires batch['dense_pose']")
+            dense_pose_latent = self.encode(batch["dense_pose"])
+            if dense_pose_latent.shape[1] != self.model.dense_pose_channels:
+                raise ValueError("Encoded DensePose channels do not match model.dense_pose_channels")
+        garment_high_frequency = None
+        if getattr(self.model, "garment_high_frequency_channels", 0):
+            if "garment_high_frequency" not in batch:
+                raise KeyError(
+                    "High-frequency-enabled VTON requires batch['garment_high_frequency']"
+                )
+            garment_high_frequency = batch["garment_high_frequency"].float()
+            if garment_high_frequency.shape[1] != self.model.garment_high_frequency_channels:
+                raise ValueError(
+                    "Garment high-frequency channels do not match "
+                    "model.garment_high_frequency_channels"
+                )
 
         garment_latent = batch.get("garment_latent")
         garment_middle = batch.get("garment_middle")
@@ -343,6 +368,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             "target_middle": target_middle,
             "target_detail": target_detail,
             "person_context": person_context,
+            "dense_pose": dense_pose_latent,
+            "garment_high_frequency": garment_high_frequency,
             "masks": masks,
             "garment": garment_latent,
             "garment_middle": garment_middle,
@@ -443,6 +470,48 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         This does not migrate optimizer states. Old architectures require load_weights,
         not resume_checkpoint. Partially missing refiner weights remain strict errors.
         """
+        state_dict = state_dict.copy()
+        expected_state = self.state_dict()
+        # Expand old 9-channel or DensePose 13-channel VTON inputs without perturbing
+        # their function. Every newly configured conditioning channel starts at zero.
+        for key in ("model.x_embedder.proj.weight", "ema_model.x_embedder.proj.weight"):
+            source = state_dict.get(key)
+            expected = expected_state.get(key)
+            if source is None or expected is None or source.shape == expected.shape:
+                continue
+            dense_channels = int(getattr(self.model, "dense_pose_channels", 0))
+            # Explicitly requested rollback of the previous direct HF input. Preserve
+            # DensePose and all other learned slices; a trained HF slice is discarded.
+            base_channels = self.model.state_channels + self.model.person_condition_channels
+            if (self.allow_new_garment_high_frequency
+                    and expected.shape[1] == base_channels + dense_channels
+                    and source.shape[1] == expected.shape[1] + 1
+                    and source.shape[0] == expected.shape[0]
+                    and source.shape[2:] == expected.shape[2:]
+                    and not any(k.startswith("model.garment_high_frequency_control.") for k in state_dict)):
+                state_dict[key] = source[:, :expected.shape[1]].clone()
+                warnings.warn(
+                    f"Warm-start: removed legacy HF input slice from {key}. Its learned contribution "
+                    "is discarded; use load_weights with a fresh optimizer.", UserWarning,
+                )
+                continue
+            appended_channels = expected.shape[1] - source.shape[1]
+            compatible = (
+                appended_channels > 0
+                and appended_channels == dense_channels
+                and source.shape[0] == expected.shape[0]
+                and source.shape[2:] == expected.shape[2:]
+            )
+            if not compatible:
+                continue
+            expanded = expected.detach().clone().zero_()
+            expanded[:, :source.shape[1]].copy_(source)
+            state_dict[key] = expanded
+            warnings.warn(
+                f"Warm-start: expanded {key} with {appended_channels} zero-initialized "
+                "conditioning channel(s). "
+                "Use load_weights with a fresh optimizer.", UserWarning,
+            )
         target_prefixes = (
             "value_target_embedders.", "value_target_norms.",
             "fine_value_target_projector.",
@@ -455,6 +524,19 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             key for key in incompatible.missing_keys if key.startswith(target_prefixes)
         ]
         missing = [key for key in incompatible.missing_keys if key not in missing_targets]
+        if self.allow_new_garment_high_frequency:
+            for prefix in ("model.garment_high_frequency_control.", "ema_model.garment_high_frequency_control."):
+                branch_keys = {key for key in expected_state if key.startswith(prefix)}
+                if branch_keys and not any(key.startswith(prefix) for key in state_dict):
+                    # Do not silently retain a trained output when reusing a module.
+                    network = self.ema_model if prefix.startswith("ema_model.") else self.model
+                    nn.init.zeros_(network.garment_high_frequency_control.output.weight)
+                    nn.init.zeros_(network.garment_high_frequency_control.output.bias)
+                    missing = [key for key in missing if key not in branch_keys]
+                    warnings.warn(
+                        f"Warm-start: {prefix} is new with a zero-initialized velocity output. "
+                        "Use load_weights with a fresh optimizer.", UserWarning,
+                    )
         if self.allow_new_garment_refiner:
             expected = self.state_dict().keys()
             for prefix in ("model.garment_refiner.", "ema_model.garment_refiner."):
@@ -495,13 +577,23 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
 
     @torch.no_grad()
     def _supervision_pixels(self, batch):
-        """Training targets only; never used as generation conditioning."""
+        """Garment pixels for correspondence and garment-feature supervision."""
         edit = batch["agnostic_mask"].float()
         if not self.garment_supervision_only:
             return edit
         if "person_garment_mask" not in batch:
             raise ValueError("garment_supervision_only requires dataset garment_parse_labels")
         return edit * batch["person_garment_mask"].float()
+
+    @staticmethod
+    def _reconstruction_pixels(batch):
+        """Full edited person region for decoded RGB/edge reconstruction.
+
+        Agnostic preprocessing can erase arms and hands together with the garment.
+        Those pixels still need direct decoded supervision even when correspondence
+        and garment-feature losses deliberately exclude non-garment anatomy.
+        """
+        return batch["agnostic_mask"].float()
 
     def _supervision_weights(self, batch, encoded, edit_tokens, keep):
         if self.garment_supervision_only:
@@ -842,13 +934,15 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         return vae.decoder(vae.post_quant_conv(latent))
 
     def _decoded_garment_loss(self, predicted_clean, batch, encoded, timesteps, keep):
-        """Pixel supervision on paired, retained garments at refinement timesteps.
+        """Pixel supervision on the full paired edit region at refinement timesteps.
 
         Decode the estimated clean latent, NOT velocity. Do not use self.decode:
         that inference helper has no_grad and would silently cut off this loss.
+        The full agnostic mask includes erased arms/hands. Correspondence, value and
+        fine RGB supervision remain restricted to parsed garment pixels elsewhere.
         Targets/masks are full-resolution; edges require both endpoints eligible.
         """
-        pixels = self._supervision_pixels(batch)
+        pixels = self._reconstruction_pixels(batch)
         eligible = (timesteps >= self.decoded_min_time) & (timesteps <= self.decoded_max_time)
         time_mask = self.flow._tokens_to_latent(
             eligible.float(), *predicted_clean.shape[-2:], torch.float32
@@ -900,6 +994,11 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         conditions, garment_mask, keep = self._drop_garment(
             self._garment_conditions(encoded), batch.get("garment_mask")
         )
+        garment_high_frequency = encoded["garment_high_frequency"]
+        if garment_high_frequency is not None and keep is not None:
+            garment_high_frequency = garment_high_frequency * keep[:, None, None, None].to(
+                garment_high_frequency.dtype
+            )
         xt, ut, timesteps, masks = self.flow.get_interpolants(
             target,
             encoded["person_context"],
@@ -922,6 +1021,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             y=label,
             person_agnostic=encoded["person_context"],
             person_mask=masks.condition,
+            dense_pose=encoded["dense_pose"],
+            garment_high_frequency=garment_high_frequency,
             edit_mask=masks.condition,
             garment_mask=garment_mask,
             return_uncertainty=True,
@@ -1057,6 +1158,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             person_agnostic=encoded["person_context"],
             person_condition=encoded["person_context"],
             person_condition_mask=masks.condition,
+            dense_pose=encoded["dense_pose"],
+            garment_high_frequency=encoded["garment_high_frequency"],
             edit_mask=batch["agnostic_mask"].float(),
             garment_mask=batch.get("garment_mask"),
             y=label,

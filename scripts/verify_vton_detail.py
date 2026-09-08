@@ -44,10 +44,28 @@ def main():
             ('garment_refiner.condition.','garment_refiner.state.')
         ) or key in ('garment_refiner.local.1.bias','garment_refiner.local.3.bias')}
         assert unexpected == obsolete, unexpected - obsolete
-        assert all(key.startswith('garment_refiner.') for key in missing), missing
-        assert all(current[key].shape == expected[key].shape for key in set(current) & set(expected))
+        assert all(key.startswith(('garment_refiner.', 'garment_high_frequency_control.'))
+                   for key in missing), missing
+        mismatched = {
+            key for key in set(current) & set(expected)
+            if current[key].shape != expected[key].shape
+        }
+        allowed_mismatch = set()
+        key = 'x_embedder.proj.weight'
+        if key in mismatched:
+            dense_channels = int(cfg.model.params.get('dense_pose_channels',0))
+            old, new = current[key], expected[key]
+            appended = new.shape[1] - old.shape[1]
+            legacy_hf = (appended == -1 and cfg.trainer.params.get('allow_new_garment_high_frequency', False)
+                         and not any(k.startswith('garment_high_frequency_control.') for k in current))
+            if (((appended > 0 and appended == dense_channels) or legacy_hf)
+                    and old.shape[0] == new.shape[0]
+                    and old.shape[2:] == new.shape[2:]):
+                allowed_mismatch.add(key)
+        assert mismatched == allowed_mismatch, mismatched - allowed_mismatch
         print(f"CHECKPOINT PASS: step={saved['global_step']}, matching={len(set(current)&set(expected))}, "
-              f"new_refiner_tensors={len(missing)}, obsolete_shortcut_tensors={len(obsolete)}", flush=True)
+              f"new_refiner_tensors={len(missing)}, obsolete_shortcut_tensors={len(obsolete)}, "
+              f"input_migration={bool(allowed_mismatch)}, input_channels={expected[key].shape[1]}", flush=True)
         del saved, current, expected, full
     cfg.model.params.hidden_size = 64
     cfg.model.params.depth = 3
@@ -68,7 +86,10 @@ def main():
     module.flow.high_time_probability = 0
     module.flow.t_sampler = lambda shape, device, dtype: torch.full(shape,.5,device=device,dtype=dtype)
     dataset = VTONValidationDataset(args.data_root, image_size=(args.height,args.width),
-                                    preview_sample_id='00055_00.jpg', garment_parse_labels=[5,6,7])
+                                    preview_sample_id='00055_00.jpg', garment_parse_labels=[5,6,7],
+                                    dense_pose_dir='image-densepose' if cfg.model.params.get('dense_pose_channels',0) else None,
+                                    garment_high_frequency=bool(cfg.model.params.get(
+                                        'garment_high_frequency_channels',0)))
     data = default_collate([dataset[0]])
     optimizer = module.configure_optimizers()['optimizer']
     module.train()
@@ -81,8 +102,18 @@ def main():
         assert all(torch.isfinite(p.grad).all() for p in module.parameters() if p.grad is not None)
         assert module.model.garment_refiner.output.weight.grad.abs().sum() > 0
         assert module.model.garment_refiner.query.weight.grad.abs().sum() > 0
+        control = module.model.garment_high_frequency_control
+        if control is not None:
+            assert control.output.weight.grad.abs().sum() > 0
         if step:
             assert module.model.garment_refiner.value.weight.grad.abs().sum() > 0
+            if module.model.dense_pose_channels:
+                start = module.model.state_channels + module.model.person_condition_channels
+                end = start + module.model.dense_pose_channels
+                dense_gradient = module.model.x_embedder.proj.weight.grad[:, start:end]
+                assert dense_gradient.abs().sum() > 0
+            if control is not None:
+                assert control.encoder[1].weight.grad.abs().sum() > 0
         assert all(p.grad is None and not p.requires_grad for p in module.first_stage.parameters())
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -98,6 +129,23 @@ def main():
     torch.testing.assert_close(decoded, reference, rtol=0, atol=0)
     decoded.mean().backward()
     assert latent.grad.abs().sum() > 0
+    if module.model.garment_high_frequency_control is not None:
+        # Same person with a different target garment: HF must remain available in CFG.
+        swapped = default_collate([dataset[1]])
+        assert not swapped['has_ground_truth'].any()
+        assert swapped['garment_high_frequency'].any()
+        module.eval()
+        with torch.no_grad():
+            encoded = module._encode_batch(swapped)
+            samples = module.flow.generate(
+                model=module.model, x=torch.randn_like(encoded['target']),
+                person_agnostic=encoded['person_context'], edit_mask=swapped['agnostic_mask'],
+                dense_pose=encoded['dense_pose'], garment_mask=swapped['garment_mask'],
+                garment_high_frequency=encoded['garment_high_frequency'],
+                num_steps=2, cfg_scale=1.5, **module._garment_conditions(encoded),
+            )
+        assert samples.shape == encoded['target'].shape and torch.isfinite(samples).all()
+        print('HF CONTROL PASS: zero-output head and encoder gradients, unpaired CFG generation.', flush=True)
     print(f'PASS: {args.height}x{args.width} real paired images, frozen SD-VAE and DINO, two optimizer steps, decoded gradient/parity and direct fine correspondence/value supervision. XL GPU peak memory and image quality are not tested.', flush=True)
 
 

@@ -34,6 +34,8 @@ def main():
     data = default_collate([VTONValidationDataset(
         args.data_root, image_size=(512,384), preview_sample_id='00055_00.jpg',
         garment_parse_labels=[5,6,7],
+        dense_pose_dir='image-densepose' if cfg.model.params.get('dense_pose_channels',0) else None,
+        garment_high_frequency=bool(cfg.model.params.get('garment_high_frequency_channels',0)),
     )[0]])
     captured = []
     with torch.no_grad():
@@ -45,6 +47,8 @@ def main():
             x=.5 * target + .5 * torch.randn_like(target),
             t=torch.full((1, target.shape[-2] * target.shape[-1] // 4), .5),
             person_agnostic=encoded['person_context'], person_mask=encoded['masks'].condition,
+            dense_pose=encoded['dense_pose'],
+            garment_high_frequency=encoded['garment_high_frequency'],
             edit_mask=encoded['masks'].condition, garment_mask=data['garment_mask'],
             **module._garment_conditions(encoded),
         )

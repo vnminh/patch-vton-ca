@@ -59,10 +59,15 @@ class ConstantVelocityModel(torch.nn.Module):
 
 
 class RecordingVelocityModel(ConstantVelocityModel):
-    def forward(self, x, t, person_agnostic=None, person_mask=None, edit_mask=None, **kwargs):
+    def forward(self, x, t, person_agnostic=None, person_mask=None, edit_mask=None,
+                garment_high_frequency=None, **kwargs):
         self.person_condition = person_agnostic.detach().clone()
         self.person_mask = person_mask.detach().clone()
         self.edit_mask = edit_mask.detach().clone()
+        self.garment_high_frequency = (
+            None if garment_high_frequency is None
+            else garment_high_frequency.detach().clone()
+        )
         return super().forward(x, t, **kwargs)
 
 
@@ -1198,6 +1203,26 @@ class VTONTests(unittest.TestCase):
         )
         torch.testing.assert_close(model.person_mask, masks.condition)
         torch.testing.assert_close(model.edit_mask, masks.condition)
+
+    def test_cfg_treats_high_frequency_map_as_target_garment_condition(self):
+        flow = VTONPatchFlowForcing(patch_size=2)
+        person_context = torch.zeros(1, 4, 8, 8)
+        raw_mask = torch.ones(1, 1, 8, 8)
+        high_frequency = torch.ones(1, 1, 64, 64)
+        model = RecordingVelocityModel()
+        flow.generate(
+            model,
+            torch.randn_like(person_context),
+            person_context,
+            raw_mask,
+            garment=torch.ones_like(person_context),
+            garment_high_frequency=high_frequency,
+            cfg_scale=1.5,
+            num_steps=1,
+        )
+        unconditional, conditional = model.garment_high_frequency.chunk(2)
+        self.assertFalse(unconditional.any())
+        torch.testing.assert_close(conditional, high_frequency)
 
     def test_sampler_preserves_latent_outside_mask(self):
         flow = VTONPatchFlowForcing(patch_size=2)

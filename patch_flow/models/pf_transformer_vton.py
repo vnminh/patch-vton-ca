@@ -107,6 +107,53 @@ class GarmentLatentRefiner(nn.Module):
         return residual
 
 
+class GarmentHighFrequencyControl(nn.Module):
+    """Cloth HF encoder with aligned transport and a ControlNet-like zero output.
+
+    Routing comes from the supervised detail refiner. Only HF content enters V;
+    person features and position affect routing, never bypassing it into the output.
+    Pixel-unshuffle preserves the 64 pixel phases before learned feature compression.
+    """
+
+    def __init__(self, width, heads, channels=4):
+        super().__init__()
+        self.heads = heads
+        self.encoder = nn.Sequential(
+            nn.PixelUnshuffle(8),
+            nn.Conv2d(64, width, 1), nn.SiLU(),
+            nn.Conv2d(width, width, 3, padding=1, groups=width), nn.SiLU(),
+            nn.Conv2d(width, width, 1),
+        )
+        self.local = nn.Sequential(
+            nn.GroupNorm(1, width), nn.SiLU(),
+            nn.Conv2d(width, width, 3, padding=1, groups=width), nn.SiLU(),
+            nn.Conv2d(width, width, 1),
+        )
+        self.output = nn.Conv2d(width, channels, 1)
+        nn.init.zeros_(self.output.weight)
+        nn.init.zeros_(self.output.bias)
+
+    def forward(self, high_frequency, query, key, valid, edit, garment_mask):
+        batch, _, pixel_height, pixel_width = high_frequency.shape
+        height, width = pixel_height // 8, pixel_width // 8
+        if pixel_height % 8 or pixel_width % 8 or query.shape[-2] != height * width:
+            raise ValueError("HF map must have eight pixels per person/garment latent cell")
+        if garment_mask is not None:
+            mask = F.interpolate(garment_mask.float(), (pixel_height, pixel_width), mode="nearest")
+            high_frequency = high_frequency * mask.to(high_frequency.dtype)
+        active = high_frequency.flatten(1).ne(0).any(1)
+        features = self.encoder(high_frequency)
+        values = features.flatten(2).transpose(1, 2)
+        values = values.reshape(batch, height * width, self.heads, -1).transpose(1, 2)
+        transported = F.scaled_dot_product_attention(
+            query, key, values.to(query.dtype), attn_mask=valid[:, None, None, :], dropout_p=0.0,
+        ).transpose(1, 2).reshape(batch, height * width, -1)
+        features = transported.transpose(1, 2).reshape(batch, -1, height, width)
+        residual = self.output(features + self.local(features))
+        gate = F.interpolate(edit.float(), (height, width), mode="area").clamp(0, 1)
+        return residual * gate.to(residual.dtype) * active[:, None, None, None].to(residual.dtype)
+
+
 class VTONPatchForcingBlock(nn.Module):
     def __init__(
         self,
@@ -205,6 +252,9 @@ class VTONPatchForcingDiT(PatchForcingDiT):
     ``middle``  VAE encoder 1/4-resolution feature map
     ``detail``  VAE encoder 1/2-resolution feature map, the finest appearance carrier
 
+    A 4-channel DensePose VAE latent can be appended to the input projection.
+    Optional target-cloth HF conditioning uses a separate zero-output velocity branch.
+
     Every branch's tokens are LayerNormed before the positional embedding is added
     (``garment_token_norm``), so key magnitude is set by the model rather than by the SD
     VAE's internal activation scale.
@@ -221,6 +271,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         self,
         *args,
         person_condition_channels=5,
+        dense_pose_channels=0,
+        garment_high_frequency_channels=0,
         use_vae_garment=True,
         garment_token_norm=True,
         garment_middle_channels=None,
@@ -246,6 +298,12 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             raise ValueError("VTONPatchForcingDiT requires predict_uncertainty=True")
         if person_condition_channels != 5:
             raise ValueError("person_condition_channels must be 5: four agnostic latent channels and one mask")
+        dense_pose_channels = int(dense_pose_channels)
+        if dense_pose_channels not in (0, self.in_channels):
+            raise ValueError(f"dense_pose_channels must be 0 or {self.in_channels} latent channels")
+        garment_high_frequency_channels = int(garment_high_frequency_channels)
+        if garment_high_frequency_channels not in (0, 1):
+            raise ValueError("garment_high_frequency_channels must be 0 or 1")
         if cross_attention_every < 1:
             raise ValueError("cross_attention_every must be positive")
 
@@ -254,6 +312,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         patch_size = old_embedder.patch_size[0]
         self.state_channels = self.in_channels
         self.person_condition_channels = person_condition_channels
+        self.dense_pose_channels = dense_pose_channels
+        self.garment_high_frequency_channels = garment_high_frequency_channels
         self.use_vae_garment = bool(use_vae_garment)
         self.garment_token_norm = bool(garment_token_norm)
         self.garment_middle_channels = None if garment_middle_channels is None else int(garment_middle_channels)
@@ -265,7 +325,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         self.x_embedder = PatchEmbed(
             input_size,
             patch_size,
-            self.state_channels + person_condition_channels,
+            self.state_channels + person_condition_channels + dense_pose_channels,
             self.hidden_size,
             bias=True,
             strict_img_size=False,
@@ -348,6 +408,14 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 self.hidden_size, self.state_channels, garment_refiner_width,
                 garment_refiner_heads, self.patch_size,
                 qk_norm=garment_refiner_qk_norm, cosine_scale=garment_refiner_cosine_scale,
+            )
+
+        self.garment_high_frequency_control = None
+        if garment_high_frequency_channels:
+            if self.garment_refiner is None:
+                raise ValueError("HF control requires garment_latent_refiner for supervised spatial routing")
+            self.garment_high_frequency_control = GarmentHighFrequencyControl(
+                garment_refiner_width, garment_refiner_heads, self.state_channels,
             )
 
         if pretrained_ckpt is not None:
@@ -518,6 +586,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         y=None,
         person_agnostic=None,
         person_mask=None,
+        dense_pose=None,
+        garment_high_frequency=None,
         edit_mask=None,
         garment=None,
         garment_middle=None,
@@ -537,10 +607,46 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             person_mask = torch.zeros((batch, 1, height, width), device=x.device, dtype=x.dtype)
         person_agnostic = F.interpolate(person_agnostic, size=(height, width), mode="bilinear", align_corners=False)
         person_mask = F.interpolate(person_mask.float(), size=(height, width), mode="area").to(x.dtype)
+        if self.dense_pose_channels:
+            if dense_pose is None:
+                raise ValueError("DensePose latent is required when dense_pose_channels is enabled")
+            if dense_pose.ndim != 4 or dense_pose.shape[1] != self.dense_pose_channels:
+                raise ValueError(
+                    f"Expected DensePose latent with {self.dense_pose_channels} channels, got {tuple(dense_pose.shape)}"
+                )
+            dense_pose = F.interpolate(dense_pose, size=(height, width), mode="bilinear", align_corners=False)
+            dense_pose = dense_pose.to(x.dtype)
+        elif dense_pose is not None:
+            raise ValueError("DensePose latent was provided to a model with dense_pose_channels=0")
+        if self.garment_high_frequency_channels:
+            if garment_high_frequency is None:
+                raise ValueError(
+                    "Target-cloth high-frequency map is required when "
+                    "garment_high_frequency_channels is enabled"
+                )
+            if (garment_high_frequency.ndim != 4
+                    or garment_high_frequency.shape[1] != self.garment_high_frequency_channels):
+                raise ValueError(
+                    f"Expected target-cloth high-frequency map with "
+                    f"{self.garment_high_frequency_channels} channel, got "
+                    f"{tuple(garment_high_frequency.shape)}"
+                )
+            if (garment_high_frequency.shape[0] != batch
+                    or garment_high_frequency.shape[-2:] != (height * 8, width * 8)):
+                raise ValueError("HF control requires a full-resolution map at 8x the latent grid")
+            garment_high_frequency = garment_high_frequency.to(x.dtype)
+        elif garment_high_frequency is not None:
+            raise ValueError(
+                "Target-cloth high-frequency map was provided to a model with "
+                "garment_high_frequency_channels=0"
+            )
         if edit_mask is None:
             edit_mask = person_mask
         noisy_latent = x
-        x = torch.cat((x, person_agnostic, person_mask), dim=1)
+        input_parts = (x, person_agnostic, person_mask)
+        if self.dense_pose_channels:
+            input_parts = (*input_parts, dense_pose)
+        x = torch.cat(input_parts, dim=1)
         position = self._position_embedding(height, width, x.dtype, x.device)
         x = self.x_embedder(x) + position
 
@@ -622,23 +728,37 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             else:
                 x = output
         fine_velocity = None
+        hf_velocity = None
+        if self.garment_high_frequency_control is not None and fine_values is None:
+            raise ValueError("HF control requires garment detail features for spatial routing")
         if self.garment_refiner is not None and fine_values is not None:
+            return_routing = return_refiner_supervision or self.garment_high_frequency_control is not None
             args = (x, noisy_latent, fine_values,
                     self._grid_position_embedding(height, width, x.dtype, x.device), edit_mask, garment_mask,
-                    return_refiner_supervision)
+                    return_routing)
             if self.gradient_checkpointing and self.training:
                 fine_velocity = checkpoint(self.garment_refiner, *args, use_reentrant=False)
             else:
                 fine_velocity = self.garment_refiner(*args)
-            if return_refiner_supervision:
+            if return_routing:
                 fine_velocity, fine_entry = fine_velocity
+            if return_refiner_supervision:
                 attention_maps.append(fine_entry)
+            if self.garment_high_frequency_control is not None:
+                hf_args = (garment_high_frequency, fine_entry["query"], fine_entry["key"],
+                           fine_entry["key_valid"], edit_mask, garment_mask)
+                if self.gradient_checkpointing and self.training:
+                    hf_velocity = checkpoint(self.garment_high_frequency_control, *hf_args, use_reentrant=False)
+                else:
+                    hf_velocity = self.garment_high_frequency_control(*hf_args)
         x = self.final_layer(x, cond)
         x = self._unpatchify_rectangular(x, height, width)
         logvar_theta = x[:, -1:, :, :]
         velocity = x[:, :-1, :, :]
         if fine_velocity is not None:
             velocity = velocity + fine_velocity
+        if hf_velocity is not None:
+            velocity = velocity + hf_velocity
         if return_garment_attention:
             if return_uncertainty:
                 return velocity, logvar_theta, attention_maps
