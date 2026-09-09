@@ -277,11 +277,11 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 metrics[f"garment_grad/embedder_{name}"] = self._gradient_norm(embedder.weight)
         refiner = getattr(self.model, "garment_refiner", None)
         if refiner is not None:
-            for name in ("query_expand", "query", "key", "value", "output"):
+            for name in ("query_expand", "state", "query", "key", "value", "output"):
                 metrics[f"garment_grad/refiner/{name}"] = self._gradient_norm(getattr(refiner, name).weight)
         control = getattr(self.model, "garment_high_frequency_control", None)
         if control is not None:
-            metrics["garment_grad/hf/encoder"] = self._gradient_norm(control.encoder[1].weight)
+            metrics["garment_grad/hf/encoder"] = self._gradient_norm(control.encoder.weight)
             metrics["garment_grad/hf/output"] = self._gradient_norm(control.output.weight)
         return metrics
 

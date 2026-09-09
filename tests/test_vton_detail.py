@@ -140,6 +140,43 @@ def test_high_frequency_control_preserves_13_inputs_and_warm_starts(ema_rate):
         new.load_state_dict(partial, strict=True)
 
 
+def test_garment_gradient_norms_cover_every_conditioning_branch():
+    """train.py is the only caller, so nothing else exercises these attribute paths.
+
+    A stale ``control.encoder[1]`` survived a refactor here and only surfaced as a
+    TypeError after 399 real training iterations.
+    """
+    net = model(refiner=True, dense_pose_channels=4, garment_high_frequency_channels=8)
+    module = LatentVTONPatchForcingTrainer(
+        model=net, first_stage=torch.nn.Identity(), ema_rate=0,
+        flow={'target': 'patch_flow.flow_vton.VTONPatchFlowForcing', 'params': {'patch_size': 2}},
+        compute_validation_metrics=False, correspondence_center_weight=0,
+        correspondence_nll_weight=0, correspondence_entropy_weight=0,
+        correspondence_photometric_weight=0, allow_new_garment_high_frequency=True,
+    )
+    # A loaded checkpoint has a trained refiner head (L2 0.0286 at step 2000), which is
+    # exactly why the zero-initialised `state` receives gradient there. A fresh model's
+    # head is zero, so mimic the real case rather than testing a degenerate one.
+    nn.init.normal_(net.garment_refiner.output.weight, std=.1)
+    data = inputs()
+    velocity = module.model(**data, dense_pose=torch.randn(2, 4, 8, 6),
+                            garment_high_frequency=torch.randn(2, 8, 32, 24))
+    # DiT zero-initialises final_layer.linear, so velocity.square() alone is identically
+    # zero and every gradient with it. Regress against a target instead.
+    (velocity - torch.randn_like(velocity)).square().mean().backward()
+    metrics = module.garment_gradient_norms()
+    for key in ('garment_grad/hf/encoder', 'garment_grad/hf/output',
+                'garment_grad/refiner/state', 'garment_grad/refiner/query',
+                'garment_grad/embedder_detail'):
+        assert key in metrics, key
+        assert torch.isfinite(metrics[key])
+    # The two branches whose gradient path this revision repaired must be alive on the
+    # first backward; the HF head's weight is still waiting for a non-zero input.
+    assert metrics['garment_grad/hf/encoder'] > 0
+    assert metrics['garment_grad/refiner/state'] > 0
+    assert metrics['garment_grad/hf/output'] == 0
+
+
 def test_previous_hf_revision_checkpoint_loads_by_discarding_the_whole_branch():
     """The old pixel encoder is renamed and reshaped, but parts of it collide.
 

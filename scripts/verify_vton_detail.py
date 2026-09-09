@@ -122,6 +122,11 @@ def main():
                 assert dense_gradient.abs().sum() > 0
             if control is not None:
                 assert control.output.weight.grad.abs().sum() > 0
+        # train.py calls this every garment_grad_log_every_n_steps; a stale attribute
+        # path here crashed a real run after 399 iterations.
+        grad_metrics = module.garment_gradient_norms()
+        assert all(torch.isfinite(value) for value in grad_metrics.values())
+        assert {'garment_grad/refiner/state', 'garment_grad/hf/encoder'} <= set(grad_metrics)
         assert all(p.grad is None and not p.requires_grad for p in module.first_stage.parameters())
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
