@@ -41,8 +41,13 @@ def main():
         missing = set(expected)-set(current)
         unexpected = set(current)-set(expected)
         obsolete = {key for key in unexpected if key.startswith(
-            ('garment_refiner.condition.','garment_refiner.state.')
+            ('garment_refiner.condition.',)
         ) or key in ('garment_refiner.local.1.bias','garment_refiner.local.3.bias')}
+        if cfg.trainer.params.get('allow_new_garment_high_frequency', False):
+            # The pixel-encoder revision's tensors are renamed and reshaped, and it never
+            # trained, so they are discarded rather than migrated.
+            obsolete |= {key for key in unexpected
+                         if key.startswith('garment_high_frequency_control.')}
         assert unexpected == obsolete, unexpected - obsolete
         assert all(key.startswith(('garment_refiner.', 'garment_high_frequency_control.'))
                    for key in missing), missing
@@ -104,7 +109,10 @@ def main():
         assert module.model.garment_refiner.query.weight.grad.abs().sum() > 0
         control = module.model.garment_high_frequency_control
         if control is not None:
-            assert control.output.weight.grad.abs().sum() > 0
+            # Zero sits on the encoder, so the encoder trains from step 0 and the head's
+            # weight follows one step later, once its input is non-zero.
+            assert control.encoder.weight.grad.abs().sum() > 0
+            assert control.output.bias.grad.abs().sum() > 0
         if step:
             assert module.model.garment_refiner.value.weight.grad.abs().sum() > 0
             if module.model.dense_pose_channels:
@@ -113,7 +121,7 @@ def main():
                 dense_gradient = module.model.x_embedder.proj.weight.grad[:, start:end]
                 assert dense_gradient.abs().sum() > 0
             if control is not None:
-                assert control.encoder[1].weight.grad.abs().sum() > 0
+                assert control.output.weight.grad.abs().sum() > 0
         assert all(p.grad is None and not p.requires_grad for p in module.first_stage.parameters())
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)

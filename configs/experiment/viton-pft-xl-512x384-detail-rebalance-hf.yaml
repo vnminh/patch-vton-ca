@@ -7,9 +7,12 @@ name: vton/pft-xl-512x384-detail-rebalance-hf-control
 
 model:
   params:
-    # One pixel-space HF channel feeds a separate control encoder, never x_embedder.
-    # Supervised detail Q/K align its content-only values; zero conv adds to velocity.
-    garment_high_frequency_channels: 1
+    # Frozen pretrained SD-VAE half-resolution features of the Canny map feed the
+    # control branch, never x_embedder -- the same basis as garment_detail_channels, so
+    # this must match it. Supervised detail Q/K align its content-only values. The zero
+    # initialisation is on the branch encoder, not on the velocity head, so the encoder
+    # receives gradient from the first step.
+    garment_high_frequency_channels: 128
 
 trainer:
   params:

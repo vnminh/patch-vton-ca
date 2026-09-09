@@ -100,20 +100,23 @@ def test_high_frequency_control_preserves_13_inputs_and_warm_starts(ema_rate):
     old = wrap(model(refiner=True, dense_pose_channels=4))
     # Nonzero old output makes prediction parity a meaningful check.
     nn.init.normal_(old.model.final_layer.linear.weight, std=.1)
-    new = wrap(model(refiner=True, dense_pose_channels=4, garment_high_frequency_channels=1))
+    new = wrap(model(refiner=True, dense_pose_channels=4, garment_high_frequency_channels=8))
     old_weight = old.model.x_embedder.proj.weight.detach().clone()
-    with pytest.warns(UserWarning, match='zero-initialized velocity output'):
+    with pytest.warns(UserWarning, match='zero-initialized encoder'):
         new.load_state_dict(old.state_dict(), strict=True)
     weight = new.model.x_embedder.proj.weight
     assert weight.shape[1] == 13
     torch.testing.assert_close(weight, old_weight, rtol=0, atol=0)
-    assert not new.model.garment_high_frequency_control.output.weight.any()
+    # The zero sits on the encoder, not the head: the head must keep a usable
+    # initialisation or nothing upstream of it ever receives gradient.
+    assert not new.model.garment_high_frequency_control.encoder.weight.any()
+    assert new.model.garment_high_frequency_control.output.weight.any()
     if ema_rate:
-        assert not new.ema_model.garment_high_frequency_control.output.weight.any()
+        assert not new.ema_model.garment_high_frequency_control.encoder.weight.any()
 
     data = inputs()
     dense_pose = torch.randn(2, 4, 8, 6)
-    high_frequency = torch.randint(0, 2, (2, 1, 64, 48)).float()
+    high_frequency = torch.randn(2, 8, 32, 24)
     old.eval(); new.eval()
     with torch.no_grad():
         reference = old.model(**data, dense_pose=dense_pose)
@@ -137,12 +140,12 @@ def test_high_frequency_control_preserves_13_inputs_and_warm_starts(ema_rate):
         new.load_state_dict(partial, strict=True)
 
 
-def test_hf_control_adds_velocity_only_and_trains_after_zero_output_step():
-    net = model(refiner=True, garment_high_frequency_channels=1).train()
+def test_hf_control_adds_velocity_only_and_trains_encoder_from_first_step():
+    net = model(refiner=True, garment_high_frequency_channels=8).train()
     data = inputs()
     data['edit_mask'] = torch.ones(2, 1, 8, 6)
     data['edit_mask'][0, :, :, 3:] = 0
-    hf = torch.randint(0, 2, (2, 1, 64, 48)).float()
+    hf = torch.randn(2, 8, 32, 24)
     control = net.garment_high_frequency_control
     optimizer = torch.optim.Adam(control.parameters(), lr=.01)
     for step in range(2):
@@ -160,12 +163,16 @@ def test_hf_control_adds_velocity_only_and_trains_after_zero_output_step():
         torch.testing.assert_close(logvar, baseline_logvar, rtol=0, atol=0)
         assert not captured[0][0, :, :, 3:].any()
         (velocity - torch.randn_like(velocity)).square().mean().backward()
-        assert control.output.weight.grad.abs().sum() > 0
-        if step:
-            assert control.encoder[1].weight.grad.abs().sum() > 0
+        # The point of moving the zero off the head: the encoder is trainable from the
+        # very first step instead of waiting for a zero head that never grew. The head's
+        # weight has no gradient until the encoder output is non-zero, which costs one
+        # step; its bias carries gradient immediately.
+        assert control.encoder.weight.grad.abs().sum() > 0
+        assert control.output.bias.grad.abs().sum() > 0
+        assert (control.output.weight.grad.abs().sum() > 0) == bool(step)
         optimizer.step()
         net.zero_grad(set_to_none=True)
-    assert not torch.allclose(control.encoder[0](hf), control.encoder[0](hf.roll(1, -1)))
+    assert not torch.allclose(control.encoder(hf), control.encoder(hf.roll(1, -1)))
     # Biases cannot leak a residual with dropped cloth or an empty edge map.
     args = []
     handle = control.register_forward_hook(lambda module, inputs, value: args.append(value))
@@ -183,8 +190,8 @@ def test_refiner_is_garment_transport_only_and_preserves_fine_phase():
     edit[0,:,:,3:] = 0
     garment = torch.ones(2,1,64,48)
     garment[1] = 0
-    args = (torch.randn(2,12,32), torch.randn(2,4,8,6), torch.randn(2,48,32),
-            torch.randn(1,48,32), edit, garment)
+    args = (torch.randn(2,12,32), torch.randn(2,4,8,6), torch.randn(2,4,8,6),
+            torch.randn(2,48,32), torch.randn(1,48,32), edit, garment)
     original = torch.nn.functional.scaled_dot_product_attention
     calls = []
     def capture(q, k, v, **kwargs):
@@ -259,13 +266,13 @@ def test_qk_normalization_bounds_scores_and_matches_inference_transport():
     # Deliberately mimic runaway learned positional scale.
     with torch.no_grad():
         refiner.position.weight.mul_(1000)
-    args = (torch.randn(1,12,32),torch.randn(1,4,8,6),torch.randn(1,48,32),
-            torch.randn(1,48,32),torch.ones(1,1,8,6),torch.ones(1,1,64,48))
+    args = (torch.randn(1,12,32),torch.randn(1,4,8,6),torch.randn(1,4,8,6),
+            torch.randn(1,48,32),torch.randn(1,48,32),torch.ones(1,1,8,6),torch.ones(1,1,64,48))
     _, entry = refiner(*args,return_supervision=True)
     q,k = entry['query'],entry['key']
     scores = q @ k.transpose(-1,-2) / q.shape[-1]**.5
     assert scores.abs().max() <= 10.00001
-    v = refiner.value(args[2]).reshape(1,48,4,8).transpose(1,2)
+    v = refiner.value(args[3]).reshape(1,48,4,8).transpose(1,2)
     expected = (scores.softmax(-1) @ v).transpose(1,2).reshape(1,48,32)
     torch.testing.assert_close(entry['output'],refiner.attention_out(expected),rtol=1e-5,atol=1e-6)
     entry['output'].square().mean().backward()
@@ -277,8 +284,8 @@ def test_qk_normalization_bounds_scores_and_matches_inference_transport():
 
 def test_fine_position_changes_routing_but_never_value_input():
     refiner = GarmentLatentRefiner(32,width=32,heads=4,qk_norm=True)
-    args = [torch.randn(1,12,32),torch.randn(1,4,8,6),torch.randn(1,48,32),
-            torch.randn(1,48,32),torch.ones(1,1,8,6),torch.ones(1,1,64,48)]
+    args = [torch.randn(1,12,32),torch.randn(1,4,8,6),torch.randn(1,4,8,6),
+            torch.randn(1,48,32),torch.randn(1,48,32),torch.ones(1,1,8,6),torch.ones(1,1,64,48)]
     original = torch.nn.functional.scaled_dot_product_attention
     calls = []
     def capture(q,k,v,**kwargs):
@@ -286,7 +293,7 @@ def test_fine_position_changes_routing_but_never_value_input():
         return original(q,k,v,**kwargs)
     with patch('torch.nn.functional.scaled_dot_product_attention',side_effect=capture):
         refiner(*args)
-        args[3] = torch.randn_like(args[3])
+        args[4] = torch.randn_like(args[4])
         refiner(*args)
     assert not torch.allclose(calls[0][0],calls[1][0])
     assert not torch.allclose(calls[0][1],calls[1][1])
@@ -366,7 +373,7 @@ def test_stable_experiment_composes_without_changing_resolution():
 def test_hf_control_experiment_is_separate_and_enabled_for_paired_and_swapped_data():
     with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
         cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-512x384-detail-rebalance-hf'])
-    assert cfg.model.params.garment_high_frequency_channels == 1
+    assert cfg.model.params.garment_high_frequency_channels == 128
     assert cfg.model.params.garment_latent_refiner
     assert cfg.trainer.params.allow_new_garment_high_frequency
     assert cfg.data.params.train.params.garment_high_frequency

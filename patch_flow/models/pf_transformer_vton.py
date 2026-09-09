@@ -31,6 +31,18 @@ class GarmentLatentRefiner(nn.Module):
         if not math.isfinite(self.cosine_scale) or not 0 < self.cosine_scale <= 30:
             raise ValueError("Refiner cosine scale must be finite and in (0, 30]")
         self.query_expand = nn.Linear(backbone_dim, width * patch_size ** 2)
+        # Fine-resolution person evidence for the query. Without it the four subpixel
+        # queries inside a patch differ only by a learned constant slice of
+        # ``query_expand`` and by their positional embedding, both content-independent,
+        # so nothing can tell one subpixel which garment cell it needs. That is the
+        # ceiling behind fine_top1_accuracy sitting near 6% while
+        # fine_correspondence_weight was tripled from 0.05 to 0.15.
+        # Zero-initialised, so a loaded refiner keeps its routing on the first step.
+        # Unlike a zero velocity head, this zero sits on an input branch whose
+        # downstream path is already non-zero, so it receives gradient immediately.
+        self.state = nn.Conv2d(channels * 2, width, 3, padding=1)
+        nn.init.zeros_(self.state.weight)
+        nn.init.zeros_(self.state.bias)
         self.position = nn.Linear(backbone_dim, width, bias=False)
         self.query_norm = nn.LayerNorm(width)
         self.key_norm = nn.LayerNorm(width)
@@ -47,12 +59,16 @@ class GarmentLatentRefiner(nn.Module):
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
-    def forward(self, tokens, noisy, values, position, edit, garment_mask, return_supervision=False):
+    def forward(self, tokens, noisy, agnostic, values, position, edit, garment_mask,
+                return_supervision=False):
         """Return a garment-only residual and optionally compact tensors for losses.
 
-        Person/backbone features construct Q, but there is deliberately no person
-        residual around A@V. Every feature reaching ``output`` has travelled through
-        garment values, closing the shortcut that ignored logos and colour blocks.
+        Person/backbone features construct Q -- including the noisy and agnostic latents
+        at full 64x48 resolution, which is what lets one subpixel query differ from its
+        three neighbours by content rather than by position alone. There is still
+        deliberately no person residual around A@V: every feature reaching ``output`` has
+        travelled through garment values, closing the shortcut that ignored logos and
+        colour blocks. Q may see the person; the output may not.
         """
         batch, _, height, width = noisy.shape
         if values.shape[1] != height * width:
@@ -60,6 +76,7 @@ class GarmentLatentRefiner(nn.Module):
         ph, pw = height // self.patch_size, width // self.patch_size
         query = self.query_expand(tokens).transpose(1, 2).reshape(batch, -1, ph, pw)
         query = F.pixel_shuffle(query, self.patch_size)
+        query = query + self.state(torch.cat((noisy, agnostic.to(noisy.dtype)), dim=1))
         query = query.flatten(2).transpose(1, 2)
         pos = self.position(position)
         if self.qk_norm:
@@ -108,40 +125,68 @@ class GarmentLatentRefiner(nn.Module):
 
 
 class GarmentHighFrequencyControl(nn.Module):
-    """Cloth HF encoder with aligned transport and a ControlNet-like zero output.
+    """Cloth HF control whose values come from the frozen pretrained SD-VAE encoder.
 
-    Routing comes from the supervised detail refiner. Only HF content enters V;
-    person features and position affect routing, never bypassing it into the output.
-    Pixel-unshuffle preserves the 64 pixel phases before learned feature compression.
+    Routing comes from the supervised detail refiner. Only HF content enters V; person
+    features and position affect routing, never bypassing it into the output.
+
+    Two things differ from the previous revision, both forced by measurement. The values
+    are frozen pretrained VAE half-resolution features of the Canny map -- the same basis
+    the refiner's garment keys and values already live in -- instead of a randomly
+    initialised pixel encoder. And the zero initialisation sits on the encoder output
+    rather than on the velocity head: a zero head makes every upstream gradient
+    identically zero, and over 3500 steps that left the old encoder's first convolution
+    at exactly its initialisation rms (0.072657 against a theoretical 0.07217) while the
+    head's own gradient decayed from 0.0146 to 0.0017 instead of growing. Zeroing the
+    encoder keeps the branch's contribution exactly zero on the first step while leaving
+    ``output`` at standard initialisation, so gradient reaches the encoder immediately.
     """
 
-    def __init__(self, width, heads, channels=4):
+    def __init__(self, width, heads, channels=4, source_channels=128, patch_size=4):
         super().__init__()
         self.heads = heads
-        self.encoder = nn.Sequential(
-            nn.PixelUnshuffle(8),
-            nn.Conv2d(64, width, 1), nn.SiLU(),
-            nn.Conv2d(width, width, 3, padding=1, groups=width), nn.SiLU(),
-            nn.Conv2d(width, width, 1),
+        self.width = width
+        self.source_channels = int(source_channels)
+        self.patch_size = int(patch_size)
+        self.encoder = nn.Conv2d(
+            self.source_channels, width, self.patch_size, stride=self.patch_size
         )
         self.local = nn.Sequential(
             nn.GroupNorm(1, width), nn.SiLU(),
-            nn.Conv2d(width, width, 3, padding=1, groups=width), nn.SiLU(),
-            nn.Conv2d(width, width, 1),
+            nn.Conv2d(width, width, 3, padding=1, groups=width, bias=False), nn.SiLU(),
+            nn.Conv2d(width, width, 1, bias=False),
         )
         self.output = nn.Conv2d(width, channels, 1)
-        nn.init.zeros_(self.output.weight)
+        self.reset_zero_gate()
+
+    def reset_zero_gate(self):
+        """Make the branch contribute exactly zero without disabling its gradient.
+
+        ``local`` is bias-free and GroupNorm's bias starts at zero, so zero encoder
+        output propagates as exact zero up to ``output``'s bias, which is zeroed too.
+        ``output.weight`` deliberately keeps its standard initialisation.
+        """
+        nn.init.zeros_(self.encoder.weight)
+        nn.init.zeros_(self.encoder.bias)
         nn.init.zeros_(self.output.bias)
 
     def forward(self, high_frequency, query, key, valid, edit, garment_mask):
-        batch, _, pixel_height, pixel_width = high_frequency.shape
-        height, width = pixel_height // 8, pixel_width // 8
-        if pixel_height % 8 or pixel_width % 8 or query.shape[-2] != height * width:
-            raise ValueError("HF map must have eight pixels per person/garment latent cell")
-        if garment_mask is not None:
-            mask = F.interpolate(garment_mask.float(), (pixel_height, pixel_width), mode="nearest")
-            high_frequency = high_frequency * mask.to(high_frequency.dtype)
+        batch, channels, source_height, source_width = high_frequency.shape
+        height = source_height // self.patch_size
+        width = source_width // self.patch_size
+        if (channels != self.source_channels
+                or source_height % self.patch_size or source_width % self.patch_size
+                or query.shape[-2] != height * width):
+            raise ValueError(
+                "HF control expects frozen VAE half-resolution features at four source "
+                "cells per person latent cell"
+            )
+        # Garment dropout and CFG zero these features, so an exact-zero test still
+        # identifies a dropped sample. An empty cloth mask is caught separately: the VAE
+        # of an all-black Canny map is not itself zero.
         active = high_frequency.flatten(1).ne(0).any(1)
+        if garment_mask is not None:
+            active = active & garment_mask.flatten(1).ne(0).any(1)
         features = self.encoder(high_frequency)
         values = features.flatten(2).transpose(1, 2)
         values = values.reshape(batch, height * width, self.heads, -1).transpose(1, 2)
@@ -302,8 +347,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         if dense_pose_channels not in (0, self.in_channels):
             raise ValueError(f"dense_pose_channels must be 0 or {self.in_channels} latent channels")
         garment_high_frequency_channels = int(garment_high_frequency_channels)
-        if garment_high_frequency_channels not in (0, 1):
-            raise ValueError("garment_high_frequency_channels must be 0 or 1")
+        if garment_high_frequency_channels < 0:
+            raise ValueError("garment_high_frequency_channels must be non-negative")
         if cross_attention_every < 1:
             raise ValueError("cross_attention_every must be positive")
 
@@ -414,8 +459,15 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         if garment_high_frequency_channels:
             if self.garment_refiner is None:
                 raise ValueError("HF control requires garment_latent_refiner for supervised spatial routing")
+            if garment_high_frequency_channels != self.garment_detail_channels:
+                raise ValueError(
+                    "HF control consumes frozen VAE half-resolution features, so "
+                    "garment_high_frequency_channels must equal garment_detail_channels "
+                    f"({self.garment_detail_channels})"
+                )
             self.garment_high_frequency_control = GarmentHighFrequencyControl(
                 garment_refiner_width, garment_refiner_heads, self.state_channels,
+                source_channels=garment_high_frequency_channels,
             )
 
         if pretrained_ckpt is not None:
@@ -627,13 +679,15 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             if (garment_high_frequency.ndim != 4
                     or garment_high_frequency.shape[1] != self.garment_high_frequency_channels):
                 raise ValueError(
-                    f"Expected target-cloth high-frequency map with "
-                    f"{self.garment_high_frequency_channels} channel, got "
+                    f"Expected target-cloth high-frequency features with "
+                    f"{self.garment_high_frequency_channels} channels, got "
                     f"{tuple(garment_high_frequency.shape)}"
                 )
             if (garment_high_frequency.shape[0] != batch
-                    or garment_high_frequency.shape[-2:] != (height * 8, width * 8)):
-                raise ValueError("HF control requires a full-resolution map at 8x the latent grid")
+                    or garment_high_frequency.shape[-2:] != (height * 4, width * 4)):
+                raise ValueError(
+                    "HF control requires VAE half-resolution features at 4x the latent grid"
+                )
             garment_high_frequency = garment_high_frequency.to(x.dtype)
         elif garment_high_frequency is not None:
             raise ValueError(
@@ -733,7 +787,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             raise ValueError("HF control requires garment detail features for spatial routing")
         if self.garment_refiner is not None and fine_values is not None:
             return_routing = return_refiner_supervision or self.garment_high_frequency_control is not None
-            args = (x, noisy_latent, fine_values,
+            args = (x, noisy_latent, person_agnostic, fine_values,
                     self._grid_position_embedding(height, width, x.dtype, x.device), edit_mask, garment_mask,
                     return_routing)
             if self.gradient_checkpointing and self.training:

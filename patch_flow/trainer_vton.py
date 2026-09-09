@@ -344,10 +344,19 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 raise KeyError(
                     "High-frequency-enabled VTON requires batch['garment_high_frequency']"
                 )
-            garment_high_frequency = batch["garment_high_frequency"].float()
+            high_frequency_map = batch["garment_high_frequency"].float()
+            if high_frequency_map.shape[1] != 1:
+                raise ValueError("Expected a single-channel target-cloth high-frequency map")
+            # Frozen pretrained SD-VAE half-resolution features, the same basis the
+            # refiner's garment keys and values live in. A randomly initialised pixel
+            # encoder gave the zero velocity head no consistent direction to grow in, and
+            # it never left initialisation.
+            _, _, garment_high_frequency = encode_vae_pyramid(
+                self.first_stage, (high_frequency_map * 2 - 1).repeat(1, 3, 1, 1)
+            )
             if garment_high_frequency.shape[1] != self.model.garment_high_frequency_channels:
                 raise ValueError(
-                    "Garment high-frequency channels do not match "
+                    "Encoded high-frequency channels do not match "
                     "model.garment_high_frequency_channels"
                 )
 
@@ -472,6 +481,24 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         """
         state_dict = state_dict.copy()
         expected_state = self.state_dict()
+        if self.allow_new_garment_high_frequency:
+            # The previous pixel-encoder revision never trained: its first convolution
+            # stayed at initialisation rms for 3500 steps behind a zero velocity head.
+            # Its tensors have different names and shapes now, so discard them rather
+            # than migrate weights that carry no information.
+            stale = [
+                key for key in state_dict
+                if ".garment_high_frequency_control." in key
+                and (key not in expected_state
+                     or state_dict[key].shape != expected_state[key].shape)
+            ]
+            for key in stale:
+                state_dict.pop(key)
+            if stale:
+                warnings.warn(
+                    f"Warm-start: discarded {len(stale)} incompatible high-frequency "
+                    "tensor(s) from the previous HF revision.", UserWarning,
+                )
         # Expand old 9-channel or DensePose 13-channel VTON inputs without perturbing
         # their function. Every newly configured conditioning channel starts at zero.
         for key in ("model.x_embedder.proj.weight", "ema_model.x_embedder.proj.weight"):
@@ -530,14 +557,29 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 if branch_keys and not any(key.startswith(prefix) for key in state_dict):
                     # Do not silently retain a trained output when reusing a module.
                     network = self.ema_model if prefix.startswith("ema_model.") else self.model
-                    nn.init.zeros_(network.garment_high_frequency_control.output.weight)
-                    nn.init.zeros_(network.garment_high_frequency_control.output.bias)
+                    network.garment_high_frequency_control.reset_zero_gate()
                     missing = [key for key in missing if key not in branch_keys]
                     warnings.warn(
-                        f"Warm-start: {prefix} is new with a zero-initialized velocity output. "
+                        f"Warm-start: {prefix} is new with a zero-initialized encoder. "
                         "Use load_weights with a fresh optimizer.", UserWarning,
                     )
         if self.allow_new_garment_refiner:
+            # ``garment_refiner.state`` is new and zero-initialised, so a checkpoint
+            # without it keeps the refiner's learned routing unchanged on the first step.
+            # Any other partially missing refiner weight remains a strict error.
+            state_keys = {
+                key for key in expected_state
+                if key.startswith(("model.garment_refiner.state.",
+                                   "ema_model.garment_refiner.state."))
+            }
+            absent_state = [key for key in missing if key in state_keys]
+            if absent_state:
+                missing = [key for key in missing if key not in state_keys]
+                warnings.warn(
+                    "Warm-start: garment_refiner.state is new and zero-initialized, so the "
+                    "refiner query is unchanged on the first step. Use load_weights with a "
+                    "fresh optimizer.", UserWarning,
+                )
             expected = self.state_dict().keys()
             for prefix in ("model.garment_refiner.", "ema_model.garment_refiner."):
                 branch_keys = {key for key in expected if key.startswith(prefix)}
