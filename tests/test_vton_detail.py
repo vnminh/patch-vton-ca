@@ -140,6 +140,54 @@ def test_high_frequency_control_preserves_13_inputs_and_warm_starts(ema_rate):
         new.load_state_dict(partial, strict=True)
 
 
+def test_previous_hf_revision_checkpoint_loads_by_discarding_the_whole_branch():
+    """The old pixel encoder is renamed and reshaped, but parts of it collide.
+
+    ``local`` and ``output`` keep matching names and shapes across the two revisions, so
+    dropping only the incompatible tensors leaves the branch looking present, suppresses
+    the warm-start and turns the genuinely new encoder into a strict missing-key error.
+    """
+    net = model(refiner=True, dense_pose_channels=4, garment_high_frequency_channels=8)
+    module = LatentVTONPatchForcingTrainer(
+        model=net, first_stage=torch.nn.Identity(), ema_rate=0,
+        flow={'target': 'patch_flow.flow_vton.VTONPatchFlowForcing', 'params': {'patch_size': 2}},
+        compute_validation_metrics=False, correspondence_center_weight=0,
+        correspondence_nll_weight=0, correspondence_entropy_weight=0,
+        correspondence_photometric_weight=0, allow_new_garment_high_frequency=True,
+    )
+    prefix = 'model.garment_high_frequency_control.'
+    legacy = module.state_dict()
+    for key in (prefix + 'encoder.weight', prefix + 'encoder.bias'):
+        del legacy[key]
+    # Shapes and names of the previous pixel-unshuffle encoder.
+    legacy[prefix + 'encoder.1.weight'] = torch.randn(32, 64, 1, 1)
+    legacy[prefix + 'encoder.1.bias'] = torch.randn(32)
+    legacy[prefix + 'encoder.5.weight'] = torch.randn(32, 32, 1, 1)
+    # Its bias-carrying local block, which the current revision dropped.
+    legacy[prefix + 'local.2.bias'] = torch.randn(32)
+    legacy[prefix + 'local.4.bias'] = torch.randn(32)
+    # Colliding tensors that must not keep the branch alive.
+    nn.init.normal_(module.model.garment_high_frequency_control.output.bias, std=.1)
+    legacy[prefix + 'output.bias'] = module.model.garment_high_frequency_control.output.bias.clone()
+
+    with pytest.warns(UserWarning):
+        module.load_state_dict(legacy, strict=True)
+    control = module.model.garment_high_frequency_control
+    assert not control.encoder.weight.any() and not control.encoder.bias.any()
+    assert not control.output.bias.any()
+    assert control.output.weight.any()
+
+    data = inputs()
+    module.model.eval()
+    with torch.no_grad():
+        residual = []
+        handle = control.register_forward_hook(lambda m, a, v: residual.append(v))
+        module.model(**data, dense_pose=torch.randn(2, 4, 8, 6),
+                     garment_high_frequency=torch.randn(2, 8, 32, 24))
+        handle.remove()
+    assert not residual[0].any()
+
+
 def test_hf_control_adds_velocity_only_and_trains_encoder_from_first_step():
     net = model(refiner=True, garment_high_frequency_channels=8).train()
     data = inputs()

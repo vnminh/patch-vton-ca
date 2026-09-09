@@ -484,20 +484,26 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         if self.allow_new_garment_high_frequency:
             # The previous pixel-encoder revision never trained: its first convolution
             # stayed at initialisation rms for 3500 steps behind a zero velocity head.
-            # Its tensors have different names and shapes now, so discard them rather
-            # than migrate weights that carry no information.
-            stale = [
-                key for key in state_dict
-                if ".garment_high_frequency_control." in key
-                and (key not in expected_state
-                     or state_dict[key].shape != expected_state[key].shape)
-            ]
-            for key in stale:
-                state_dict.pop(key)
-            if stale:
+            # Its tensors are renamed and reshaped, so discard them rather than migrate
+            # weights that carry no information. Drop the WHOLE branch, not just the
+            # incompatible tensors: leaving the coincidentally-matching ones behind makes
+            # the branch look present, which suppresses the warm-start below and turns
+            # the genuinely new encoder into a strict missing-key failure.
+            for prefix in ("model.garment_high_frequency_control.",
+                           "ema_model.garment_high_frequency_control."):
+                present = [key for key in state_dict if key.startswith(prefix)]
+                incompatible = [
+                    key for key in present
+                    if key not in expected_state
+                    or state_dict[key].shape != expected_state[key].shape
+                ]
+                if not incompatible:
+                    continue
+                for key in present:
+                    state_dict.pop(key)
                 warnings.warn(
-                    f"Warm-start: discarded {len(stale)} incompatible high-frequency "
-                    "tensor(s) from the previous HF revision.", UserWarning,
+                    f"Warm-start: discarded all {len(present)} {prefix} tensor(s) from the "
+                    "previous HF revision.", UserWarning,
                 )
         # Expand old 9-channel or DensePose 13-channel VTON inputs without perturbing
         # their function. Every newly configured conditioning channel starts at zero.
