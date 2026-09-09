@@ -18,6 +18,24 @@ trainer:
   params:
     allow_new_garment_high_frequency: true
 
+    # Equalise the two velocity heads on warm start. Measured on step-1000 of
+    # detail-rebalance-hf-control: hf.output rms 0.031433 against refiner.output rms
+    # 0.000792, so the branch with a near-untrained encoder (rms 0.000165 against a
+    # 0.0128 standard init) had 40x the authority of the branch that has to carry logos.
+    # Contributions inside the edit mask were hf 8.5% of backbone velocity and refiner
+    # 0.8%.
+    #
+    # 10x and 0.25x put both heads at rms ~0.0079, 22% of the 0.0361 standard init for
+    # Conv2d(256, 4, 1). Neither branch has earned more authority than the other.
+    #
+    # The refiner scaling is a deliberate shock: its contribution jumps from 0.8% to
+    # roughly 8% immediately. That is the point -- at 0.8% the velocity path returns
+    # almost no gradient to it, so it cannot learn to be useful, and it stayed at 2% of
+    # standard init for 3000 steps. The restored detail_loss is what shapes it from here.
+    # If flow_loss degrades and does not recover within a few hundred steps, halve this.
+    warm_start_refiner_output_gain: 10.0
+    warm_start_high_frequency_output_gain: 0.25
+
 data:
   params:
     train:

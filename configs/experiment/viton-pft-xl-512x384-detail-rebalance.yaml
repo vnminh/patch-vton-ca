@@ -54,17 +54,18 @@ trainer:
     decoded_rgb_weight: 0.5
     decoded_edge_weight: 1.0
 
-    # ---- Latent detail L1: down, and only where its target is determined ------------
-    # Flat at 0.86 for 3000 steps while consuming a third of the objective. It is L1 on
-    # the edges of predicted_clean = xt + (1-t)*velocity, and the flow optimum is
-    # E[x1|xt], which is genuinely blurry at mid t -- so over [0.3, 0.95] it asks for
-    # detail that cannot be inferred from xt. Keep it on pure-noise garment forcing plus
-    # t >= 0.85, where the target is determined and logos and text are written.
-    # NOTE: train/detail_loss will jump on the first step. Different time window, so it
-    # is a different quantity; do not compare it against the old 0.86.
-    detail_loss_weight: 0.15
-    detail_min_time: 0.85
-    detail_max_time: 1.0
+    # ---- Latent detail L1: REVERTED to detail-stable (0.5, [0.3, 0.95]) -------------
+    # This config previously cut it to 0.15 on the window [0.85, 1.0], on the argument
+    # that the flow optimum E[x1|xt] is genuinely blurry at mid t so ground-truth edge
+    # statistics there are unanswerable. The argument holds; the consequence was not
+    # thought through. detail_loss is the only term that rewards the velocity carrying
+    # fine structure, and therefore the only reason the refiner's velocity head has to
+    # grow at all. With it cut, that head stayed at rms 0.000792 -- 2% of standard init --
+    # for 3000 steps, and the whole detail branch contributed 0.8% of the velocity, so
+    # logos had no channel to arrive through. Colour blocks decayed in step with it: the
+    # VANS navy sleeves were correct at the start of the rebalance era and had vanished
+    # into flat purple by its end. Both symptoms track this cut, so it is reverted rather
+    # than re-tuned. The override is simply removed; the inherited values apply.
 
     # fine_* is multiplied by the correspondence ramp too (trainer_vton.py:989), so this
     # gates both families. Halved: this resumes a trained model, and 1000 steps of ramp

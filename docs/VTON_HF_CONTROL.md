@@ -129,3 +129,41 @@ step. Unlike the old HF head, this zero sits on an input branch whose downstream
 path is already non-zero, so it receives gradient immediately. Checkpoints
 without it load under `allow_new_garment_refiner`; any other partially missing
 refiner weight is still a strict error.
+
+## Value centring and head balance (2026-09-09, second revision)
+
+Step-1000 of `detail-rebalance-hf-control`, measured inside the edit mask on a real
+paired sample: backbone velocity rms 0.7416, refiner 0.00613 (0.8%), HF 0.06309
+(8.5%). 82.7% of the HF residual was spatially constant, per-channel means
+[0.0991, -0.0244, 0.0047, 0.0211] -- a flat colour shift in latent space, and the
+visible cause of garments desaturating and colour blocks flattening across the run.
+
+Two separate mistakes produced that.
+
+A Canny map is mostly black with thin strokes, so its VAE features carry a large
+global mean: 0.5591, against -0.0102 for the garment features. Attention that is
+anywhere near diffuse returns that mean. LayerNorm does not help -- it normalises
+each token across channels and leaves the component shared by every token intact,
+measured at 88.3% of the HF value signal before and 93.3% after. The mean has to be
+removed across keys, over valid keys only. The refiner keeps its mean, which is the
+garment's base colour and is wanted; the HF mean carries nothing.
+
+The velocity heads were also inverted. Moving the zero initialisation from the HF
+head to the HF encoder left that head at full standard init (rms 0.031433) while the
+refiner's stayed at 0.000792, so the branch with a near-untrained encoder (rms
+0.000165 against a 0.0128 standard init) had 40x the authority of the branch that
+has to carry logos. `warm_start_refiner_output_gain` and
+`warm_start_high_frequency_output_gain` rescale the loaded heads explicitly; the
+experiment uses 10.0 and 0.25, putting both at rms ~0.0079.
+
+Measured after both changes on the same checkpoint and sample: refiner 6.5%, HF
+1.7%, HF DC share 33.1%, per-channel means [0.0027, 0.0003, 0.0015, -0.0079]. Total
+velocity rms moved 0.74855 to 0.74170, so the two changes roughly cancel and the
+model is not shocked overall. DC injection fell from 7.0% of velocity to 0.56%.
+
+`detail_loss` is reverted to 0.5 on [0.3, 0.95] in the rebalance config. It is the
+only term rewarding a velocity that carries fine structure, so it is the only reason
+the refiner's velocity head has to grow; cutting it to 0.15 on [0.85, 1.0] is why
+that head sat at 2% of standard init for 3000 steps while logos had no channel to
+arrive through.
+

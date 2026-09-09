@@ -177,6 +177,73 @@ def test_garment_gradient_norms_cover_every_conditioning_branch():
     assert metrics['garment_grad/hf/output'] == 0
 
 
+def test_hf_values_are_centred_across_valid_keys_so_diffuse_attention_gives_zero():
+    """A Canny map's VAE features carry a large global mean (measured 0.5591 against
+    -0.0102 for garment features). Uniform attention over uncentred values returns that
+    mean as a spatially constant latent offset -- a flat colour shift once decoded."""
+    net = model(refiner=True, garment_high_frequency_channels=8).eval()
+    control = net.garment_high_frequency_control
+    nn.init.normal_(control.encoder.weight, std=.1)
+    nn.init.constant_(control.encoder.bias, 3.0)          # a large shared component
+    hf = torch.randn(2, 8, 32, 24)
+    valid = torch.ones(2, 48, dtype=torch.bool)
+    valid[:, 24:] = False                                  # only some keys are garment
+    query = torch.zeros(2, 4, 48, 8)                       # uniform attention
+    key = torch.zeros(2, 4, 48, 8)
+    with torch.no_grad():
+        residual = control(hf, query, key, valid,
+                           torch.ones(2, 1, 8, 6), torch.ones(2, 1, 64, 48))
+    # Uniform attention over centred values retrieves the mean of the centred values,
+    # which is zero by construction. Any surviving residual is the DC leak.
+    assert residual.abs().max() < 1e-4, residual.abs().max()
+
+    # The deviations must still survive: a different edge map must give a different
+    # residual once attention is not uniform.
+    sharp = torch.randn(2, 4, 48, 8) * 5
+    with torch.no_grad():
+        a = control(hf, sharp, sharp, valid, torch.ones(2, 1, 8, 6), torch.ones(2, 1, 64, 48))
+        b = control(hf.roll(7, -1), sharp, sharp, valid,
+                    torch.ones(2, 1, 8, 6), torch.ones(2, 1, 64, 48))
+    assert a.abs().sum() > 0 and not torch.allclose(a, b)
+
+
+@pytest.mark.parametrize('gains', [(1., 1.), (10., .25)])
+def test_warm_start_velocity_head_gains_are_explicit_and_weight_only(gains):
+    refiner_gain, hf_gain = gains
+    net = model(refiner=True, garment_high_frequency_channels=8)
+    module = LatentVTONPatchForcingTrainer(
+        model=net, first_stage=torch.nn.Identity(), ema_rate=0,
+        flow={'target': 'patch_flow.flow_vton.VTONPatchFlowForcing', 'params': {'patch_size': 2}},
+        compute_validation_metrics=False, correspondence_center_weight=0,
+        correspondence_nll_weight=0, correspondence_entropy_weight=0,
+        correspondence_photometric_weight=0, allow_new_garment_high_frequency=True,
+        warm_start_refiner_output_gain=refiner_gain,
+        warm_start_high_frequency_output_gain=hf_gain,
+    )
+    state = module.state_dict()
+    # A trained-looking pair of heads, as a real checkpoint would carry.
+    for key, value in (('model.garment_refiner.output.weight', .000792),
+                       ('model.garment_high_frequency_control.output.weight', .031433)):
+        state[key] = torch.full_like(state[key], value)
+    state['model.garment_refiner.output.bias'] = torch.full_like(
+        state['model.garment_refiner.output.bias'], .5)
+    module.load_state_dict(state, strict=True)
+    torch.testing.assert_close(module.model.garment_refiner.output.weight,
+                               torch.full_like(state['model.garment_refiner.output.weight'],
+                                               .000792 * refiner_gain))
+    torch.testing.assert_close(module.model.garment_high_frequency_control.output.weight,
+                               torch.full_like(
+                                   state['model.garment_high_frequency_control.output.weight'],
+                                   .031433 * hf_gain))
+    # Biases are never touched, and a zero head stays zero under any gain.
+    torch.testing.assert_close(module.model.garment_refiner.output.bias,
+                               state['model.garment_refiner.output.bias'])
+    state['model.garment_refiner.output.weight'] = torch.zeros_like(
+        state['model.garment_refiner.output.weight'])
+    module.load_state_dict(state, strict=True)
+    assert not module.model.garment_refiner.output.weight.any()
+
+
 def test_previous_hf_revision_checkpoint_loads_by_discarding_the_whole_branch():
     """The old pixel encoder is renamed and reshaped, but parts of it collide.
 

@@ -130,9 +130,14 @@ class GarmentHighFrequencyControl(nn.Module):
     Routing comes from the supervised detail refiner. Only HF content enters V; person
     features and position affect routing, never bypassing it into the output.
 
-    Two things differ from the previous revision, both forced by measurement. The values
-    are frozen pretrained VAE half-resolution features of the Canny map -- the same basis
-    the refiner's garment keys and values already live in -- instead of a randomly
+    Values are centred across keys so the branch can only transport deviations from the
+    garment-mean edge response, which is what "high frequency" has to mean for a residual
+    driven by attention that is not yet sharp. Unlike the refiner, whose value mean is the
+    garment's base colour and must be kept, the HF mean carries no information.
+
+    Two further things differ from the first revision, both forced by measurement. The
+    values are frozen pretrained VAE half-resolution features of the Canny map -- the same
+    basis the refiner's garment keys and values already live in -- instead of a randomly
     initialised pixel encoder. And the zero initialisation sits on the encoder output
     rather than on the velocity head: a zero head makes every upstream gradient
     identically zero, and over 3500 steps that left the old encoder's first convolution
@@ -189,6 +194,20 @@ class GarmentHighFrequencyControl(nn.Module):
             active = active & garment_mask.flatten(1).ne(0).any(1)
         features = self.encoder(high_frequency)
         values = features.flatten(2).transpose(1, 2)
+        # Centre the values across the valid keys. A Canny map is mostly black with a few
+        # thin strokes, so its VAE features carry a large global mean: measured 0.5591
+        # against -0.0102 for the garment features. Attention that is anywhere near
+        # diffuse then returns that mean, and the branch injects a spatially constant
+        # offset into the latent -- a flat colour shift once decoded. At step 1000 that
+        # was 82.7% of the HF residual and 8.5% of the whole velocity.
+        #
+        # LayerNorm does not fix this: it normalises each token across channels and
+        # leaves the component shared by every token untouched, which measured 88.3% of
+        # the signal before and 93.3% after. The mean has to be removed across keys, and
+        # only over valid ones so background tokens do not drag it.
+        key_mask = valid[..., None].to(values.dtype)
+        mean = (values * key_mask).sum(1, keepdim=True) / key_mask.sum(1, keepdim=True).clamp_min(1)
+        values = values - mean
         values = values.reshape(batch, height * width, self.heads, -1).transpose(1, 2)
         transported = F.scaled_dot_product_attention(
             query, key, values.to(query.dtype), attn_mask=valid[:, None, None, :], dropout_p=0.0,

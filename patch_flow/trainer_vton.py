@@ -39,6 +39,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         decoded_checkpoint=True,
         allow_new_garment_refiner=False,
         allow_new_garment_high_frequency=False,
+        warm_start_refiner_output_gain=1.0,
+        warm_start_high_frequency_output_gain=1.0,
         fine_correspondence_weight=0.0,
         fine_correspondence_radius=1,
         fine_value_weight=0.0,
@@ -93,6 +95,16 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         self.decoded_checkpoint = bool(decoded_checkpoint)
         self.allow_new_garment_refiner = bool(allow_new_garment_refiner)
         self.allow_new_garment_high_frequency = bool(allow_new_garment_high_frequency)
+        # Explicit, opt-in rescaling of the two velocity heads on warm start. Measured at
+        # step 1000: hf.output rms 0.031433 against refiner.output rms 0.000792, so the
+        # branch with a near-untrained encoder had a head 40x stronger than the branch
+        # that has to carry logos. Nothing is rescaled unless a gain is set.
+        self.warm_start_refiner_output_gain = float(warm_start_refiner_output_gain)
+        self.warm_start_high_frequency_output_gain = float(warm_start_high_frequency_output_gain)
+        for name, gain in (("refiner", self.warm_start_refiner_output_gain),
+                           ("high_frequency", self.warm_start_high_frequency_output_gain)):
+            if gain <= 0:
+                raise ValueError(f"warm_start_{name}_output_gain must be positive")
         self.fine_correspondence_weight = float(fine_correspondence_weight)
         self.fine_correspondence_radius = int(fine_correspondence_radius)
         self.fine_value_weight = float(fine_value_weight)
@@ -612,11 +624,36 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             if unexpected:
                 details.append(f"Unexpected key(s): {unexpected}")
             raise RuntimeError("Error(s) in loading state_dict: " + "; ".join(details))
+        self._rescale_velocity_heads()
         if self.value_target_embedders and missing_targets:
             # This runs after the student was loaded, so an old checkpoint starts with a
             # genuinely frozen copy of its learned projectors, not constructor weights.
             self._update_value_target_projectors(decay=0.0)
         return type(incompatible)(missing, unexpected)
+
+    @torch.no_grad()
+    def _rescale_velocity_heads(self):
+        """Scale the loaded refiner and HF velocity heads, once, right after loading.
+
+        Only the weight is touched, never the bias, and only when a gain is configured.
+        A zero-initialised head stays exactly zero under any gain, so this cannot revive
+        a branch that a warm start deliberately neutralised.
+        """
+        targets = (
+            ("garment_refiner", self.warm_start_refiner_output_gain),
+            ("garment_high_frequency_control", self.warm_start_high_frequency_output_gain),
+        )
+        for attribute, gain in targets:
+            if gain == 1.0:
+                continue
+            for network in (self.model, self.ema_model):
+                branch = getattr(network, attribute, None) if network is not None else None
+                if branch is None:
+                    continue
+                branch.output.weight.mul_(gain)
+            warnings.warn(
+                f"Warm-start: scaled {attribute}.output.weight by {gain}.", UserWarning,
+            )
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         super().on_train_batch_end(outputs, batch, batch_idx)
