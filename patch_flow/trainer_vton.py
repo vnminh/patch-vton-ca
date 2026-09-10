@@ -289,7 +289,9 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 metrics[f"garment_grad/embedder_{name}"] = self._gradient_norm(embedder.weight)
         refiner = getattr(self.model, "garment_refiner", None)
         if refiner is not None:
-            for name in ("query_expand", "state", "query", "key", "value", "output"):
+            for name in (
+                "query_expand", "state", "velocity_condition", "query", "key", "value", "output"
+            ):
                 metrics[f"garment_grad/refiner/{name}"] = self._gradient_norm(getattr(refiner, name).weight)
         control = getattr(self.model, "garment_high_frequency_control", None)
         if control is not None:
@@ -582,22 +584,41 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                         "Use load_weights with a fresh optimizer.", UserWarning,
                     )
         if self.allow_new_garment_refiner:
-            # ``garment_refiner.state`` is new and zero-initialised, so a checkpoint
-            # without it keeps the refiner's learned routing unchanged on the first step.
-            # Any other partially missing refiner weight remains a strict error.
+            # ``state`` adds fine person evidence to routing and was introduced as a
+            # zero-initialized function-preserving migration.
             state_keys = {
                 key for key in expected_state
-                if key.startswith(("model.garment_refiner.state.",
-                                   "ema_model.garment_refiner.state."))
+                if key.startswith((
+                    "model.garment_refiner.state.",
+                    "ema_model.garment_refiner.state.",
+                ))
             }
             absent_state = [key for key in missing if key in state_keys]
             if absent_state:
                 missing = [key for key in missing if key not in state_keys]
                 warnings.warn(
-                    "Warm-start: garment_refiner.state is new and zero-initialized, so the "
-                    "refiner query is unchanged on the first step. Use load_weights with a "
-                    "fresh optimizer.", UserWarning,
+                    "Warm-start: garment_refiner.state is new and zero-initialized, so "
+                    "the refiner query is unchanged on the first step. Use load_weights "
+                    "with a fresh optimizer.", UserWarning,
                 )
+            # A checkpoint predating the cascade must omit the whole adapter. Explicitly
+            # reset it because load_state_dict leaves missing tensors at their current
+            # values when a module object is reused. A partially missing adapter is not
+            # a recognized migration and therefore remains a strict error.
+            for prefix in (
+                "model.garment_refiner.velocity_condition.",
+                "ema_model.garment_refiner.velocity_condition.",
+            ):
+                cascade_keys = {key for key in expected_state if key.startswith(prefix)}
+                if cascade_keys and not any(key.startswith(prefix) for key in state_dict):
+                    network = self.ema_model if prefix.startswith("ema_model.") else self.model
+                    network.garment_refiner.reset_velocity_condition()
+                    missing = [key for key in missing if key not in cascade_keys]
+                    warnings.warn(
+                        f"Warm-start: {prefix} is a new garment-refiner adapter and was "
+                        "zero-initialized, so the first prediction is unchanged. Use "
+                        "load_weights with a fresh optimizer.", UserWarning,
+                    )
             expected = self.state_dict().keys()
             for prefix in ("model.garment_refiner.", "ema_model.garment_refiner."):
                 branch_keys = {key for key in expected if key.startswith(prefix)}

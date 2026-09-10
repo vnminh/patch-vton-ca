@@ -166,7 +166,8 @@ def test_garment_gradient_norms_cover_every_conditioning_branch():
     (velocity - torch.randn_like(velocity)).square().mean().backward()
     metrics = module.garment_gradient_norms()
     for key in ('garment_grad/hf/encoder', 'garment_grad/hf/output',
-                'garment_grad/refiner/state', 'garment_grad/refiner/query',
+                'garment_grad/refiner/state', 'garment_grad/refiner/velocity_condition',
+                'garment_grad/refiner/query',
                 'garment_grad/embedder_detail'):
         assert key in metrics, key
         assert torch.isfinite(metrics[key])
@@ -174,6 +175,7 @@ def test_garment_gradient_norms_cover_every_conditioning_branch():
     # first backward; the HF head's weight is still waiting for a non-zero input.
     assert metrics['garment_grad/hf/encoder'] > 0
     assert metrics['garment_grad/refiner/state'] > 0
+    assert metrics['garment_grad/refiner/velocity_condition'] > 0
     assert metrics['garment_grad/hf/output'] == 0
 
 
@@ -302,9 +304,16 @@ def test_hf_control_adds_velocity_only_and_trains_encoder_from_first_step():
     optimizer = torch.optim.Adam(control.parameters(), lr=.01)
     for step in range(2):
         captured = []
-        handle = control.register_forward_hook(lambda module, args, value: captured.append(value))
+        routing_requires_grad = []
+        def capture_control(module, args, value):
+            captured.append(value)
+            routing_requires_grad.append((args[1].requires_grad, args[2].requires_grad))
+        handle = control.register_forward_hook(capture_control)
         velocity, logvar = net(**data, garment_high_frequency=hf, return_uncertainty=True)
         handle.remove()
+        # HF copies the detail refiner's attention probabilities, but its loss must not
+        # update the shared Q/K routing. RGB/correspondence supervision owns that map.
+        assert routing_requires_grad == [(False, False)]
         if step == 0:
             assert not captured[0].any()
         with torch.no_grad():
@@ -333,6 +342,68 @@ def test_hf_control_adds_velocity_only_and_trains_encoder_from_first_step():
     net(**data, garment_high_frequency=hf)
     handle.remove()
     assert all(not value.any() for value in args)
+
+
+def test_hf_velocity_conditions_fine_refiner_as_a_cascade():
+    """HF must change the fine correction, not remain a blind parallel addend."""
+    torch.manual_seed(9)
+    net = model(refiner=True, garment_high_frequency_channels=8).eval()
+    data = inputs()
+    data['edit_mask'] = torch.ones(2, 1, 8, 6)
+    hf = torch.randn(2, 8, 32, 24)
+    with torch.no_grad():
+        nn.init.normal_(net.final_layer.linear.weight, std=.05)
+        nn.init.normal_(net.garment_refiner.output.weight, std=.05)
+        nn.init.normal_(net.garment_refiner.velocity_condition.weight, std=.05)
+        nn.init.normal_(net.garment_high_frequency_control.encoder.weight, std=.05)
+
+    condition_inputs, fine_outputs, hf_outputs = [], [], []
+    condition_handle = net.garment_refiner.velocity_condition.register_forward_pre_hook(
+        lambda module, args: condition_inputs.append(args[0].detach().clone())
+    )
+    fine_handle = net.garment_refiner.output.register_forward_hook(
+        lambda module, args, value: fine_outputs.append(value.detach().clone())
+    )
+    hf_handle = net.garment_high_frequency_control.register_forward_hook(
+        lambda module, args, value: hf_outputs.append(value.detach().clone())
+    )
+    output_without_hf = net(**data, garment_high_frequency=torch.zeros_like(hf))
+    output_with_hf = net(**data, garment_high_frequency=hf)
+    condition_handle.remove(); fine_handle.remove(); hf_handle.remove()
+
+    assert len(condition_inputs) == len(fine_outputs) == len(hf_outputs) == 2
+    assert not hf_outputs[0].any() and hf_outputs[1].abs().sum() > 0
+    # velocity_condition receives [backbone + HF velocity, provisional clean x1].
+    torch.testing.assert_close(
+        condition_inputs[1][:, :4] - condition_inputs[0][:, :4], hf_outputs[1]
+    )
+    torch.testing.assert_close(
+        condition_inputs[1][:, 4:] - condition_inputs[0][:, 4:], .5 * hf_outputs[1]
+    )
+    assert not torch.allclose(fine_outputs[0], fine_outputs[1])
+    # The final change is HF plus an HF-conditioned fine correction, not HF alone.
+    assert not torch.allclose(output_with_hf - output_without_hf, hf_outputs[1])
+
+
+def test_existing_hf_checkpoint_warm_starts_zero_cascade_adapter():
+    net = model(refiner=True, garment_high_frequency_channels=8)
+    module = LatentVTONPatchForcingTrainer(
+        model=net, first_stage=torch.nn.Identity(), ema_rate=0,
+        flow={'target': 'patch_flow.flow_vton.VTONPatchFlowForcing', 'params': {'patch_size': 2}},
+        compute_validation_metrics=False, correspondence_center_weight=0,
+        correspondence_nll_weight=0, correspondence_entropy_weight=0,
+        correspondence_photometric_weight=0, allow_new_garment_refiner=True,
+        allow_new_garment_high_frequency=True,
+    )
+    legacy = module.state_dict()
+    del legacy['model.garment_refiner.velocity_condition.weight']
+    del legacy['model.garment_refiner.velocity_condition.bias']
+    nn.init.normal_(module.model.garment_refiner.velocity_condition.weight)
+    nn.init.normal_(module.model.garment_refiner.velocity_condition.bias)
+    with pytest.warns(UserWarning, match='new garment-refiner adapter'):
+        module.load_state_dict(legacy, strict=True)
+    assert not module.model.garment_refiner.velocity_condition.weight.any()
+    assert not module.model.garment_refiner.velocity_condition.bias.any()
 
 
 def test_refiner_is_garment_transport_only_and_preserves_fine_phase():
@@ -531,6 +602,18 @@ def test_hf_control_experiment_is_separate_and_enabled_for_paired_and_swapped_da
     assert cfg.data.params.train.params.garment_high_frequency
     assert cfg.data.params.validation.params.garment_high_frequency
     assert cfg.name.endswith('hf-control')
+
+
+def test_cascade_experiment_does_not_repeat_previous_head_rebalance():
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
+        cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-512x384-detail-cascade'])
+    assert cfg.model.params.garment_high_frequency_channels == 128
+    assert cfg.model.params.garment_latent_refiner
+    assert cfg.trainer.params.allow_new_garment_refiner
+    assert cfg.trainer.params.allow_new_garment_high_frequency
+    assert cfg.trainer.params.warm_start_refiner_output_gain == 1.0
+    assert cfg.trainer.params.warm_start_high_frequency_output_gain == 1.0
+    assert cfg.name.endswith('detail-cascade')
 
 
 class TinyDecoder(nn.Module):

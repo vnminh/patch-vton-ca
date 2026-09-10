@@ -43,6 +43,13 @@ class GarmentLatentRefiner(nn.Module):
         self.state = nn.Conv2d(channels * 2, width, 3, padding=1)
         nn.init.zeros_(self.state.weight)
         nn.init.zeros_(self.state.bias)
+        # The fine decoder must correct the velocity that will actually be integrated,
+        # not predict an independent residual in parallel. The first half is the
+        # backbone+HF preliminary velocity and the second half is its x1 estimate.
+        # Zero initialisation makes this architecture checkpoint-compatible: before
+        # the adapter learns, the old and new velocity sums are exactly identical.
+        self.velocity_condition = nn.Conv2d(channels * 2, width, 3, padding=1)
+        self.reset_velocity_condition()
         self.position = nn.Linear(backbone_dim, width, bias=False)
         self.query_norm = nn.LayerNorm(width)
         self.key_norm = nn.LayerNorm(width)
@@ -59,16 +66,18 @@ class GarmentLatentRefiner(nn.Module):
         nn.init.zeros_(self.output.weight)
         nn.init.zeros_(self.output.bias)
 
-    def forward(self, tokens, noisy, agnostic, values, position, edit, garment_mask,
-                return_supervision=False):
-        """Return a garment-only residual and optionally compact tensors for losses.
+    def reset_velocity_condition(self):
+        """Neutralize the cascade adapter for a function-preserving warm start."""
+        nn.init.zeros_(self.velocity_condition.weight)
+        nn.init.zeros_(self.velocity_condition.bias)
+
+    def route(self, tokens, noisy, agnostic, values, position, garment_mask):
+        """Transport garment-detail values and return their supervised routing.
 
         Person/backbone features construct Q -- including the noisy and agnostic latents
         at full 64x48 resolution, which is what lets one subpixel query differ from its
-        three neighbours by content rather than by position alone. There is still
-        deliberately no person residual around A@V: every feature reaching ``output`` has
-        travelled through garment values, closing the shortcut that ignored logos and
-        colour blocks. Q may see the person; the output may not.
+        three neighbours by content rather than by position alone. This phase is kept
+        separate so the HF branch can reuse Q/K before the final correction is decoded.
         """
         batch, _, height, width = noisy.shape
         if values.shape[1] != height * width:
@@ -112,15 +121,49 @@ class GarmentLatentRefiner(nn.Module):
         features = transported.transpose(1, 2).reshape(
             batch, self.width, height, width
         )
-        residual = self.output(features + self.local(features))
+        return features, {
+            "scale": "refiner", "query": q, "key": k,
+            "output": transported, "key_valid": valid,
+            "grid": (height, width), "query_grid": (height, width),
+        }, active
+
+    def refine(self, features, preliminary_velocity, preliminary_clean, edit, active):
+        """Decode a fine correction conditioned on the backbone+HF provisional flow.
+
+        The caller stop-gradients the provisional tensors. The adapter learns how to
+        correct the current state without using this conditioning shortcut to rewrite
+        the backbone or HF branch. The bounded multiplicative modulation cannot become
+        a person-only additive shortcut: garment-transported detail stays the carrier.
+        """
+        if preliminary_velocity.shape != preliminary_clean.shape:
+            raise ValueError("Preliminary velocity and clean estimate must have identical shapes")
+        if preliminary_velocity.shape[-2:] != features.shape[-2:]:
+            raise ValueError("Preliminary flow and refiner feature grids must be identical")
+        condition = self.velocity_condition(
+            torch.cat((preliminary_velocity, preliminary_clean), dim=1)
+        )
+        fused = features * (1 + torch.tanh(condition))
+        residual = self.output(fused + self.local(fused))
+        height, width = features.shape[-2:]
         gate = F.interpolate(edit.float(), (height, width), mode="area").clamp(0, 1)
-        residual = residual * gate * active[:, None, None, None].to(residual.dtype)
+        return residual * gate * active[:, None, None, None].to(residual.dtype)
+
+    def forward(self, tokens, noisy, agnostic, values, position, edit, garment_mask,
+                return_supervision=False, preliminary_velocity=None, preliminary_clean=None):
+        """Return the garment-only correction, optionally with compact loss tensors."""
+        features, supervision, active = self.route(
+            tokens, noisy, agnostic, values, position, garment_mask
+        )
+        if (preliminary_velocity is None) != (preliminary_clean is None):
+            raise ValueError("Both preliminary_velocity and preliminary_clean must be provided together")
+        if preliminary_velocity is None:
+            preliminary_velocity = torch.zeros_like(noisy)
+            preliminary_clean = torch.zeros_like(noisy)
+        residual = self.refine(
+            features, preliminary_velocity, preliminary_clean, edit, active
+        )
         if return_supervision:
-            return residual, {
-                "scale": "refiner", "query": q, "key": k,
-                "output": transported, "key_valid": valid,
-                "grid": (height, width), "query_grid": (height, width),
-            }
+            return residual, supervision
         return residual
 
 
@@ -800,38 +843,61 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 )
             else:
                 x = output
-        fine_velocity = None
-        hf_velocity = None
+        # Decode the backbone first. HF alters that provisional flow, then the fine
+        # branch sees and corrects the result. This replaces the old blind parallel sum
+        # (backbone + fine + HF) with backbone -> HF -> fine refinement.
+        prediction = self.final_layer(x, cond)
+        prediction = self._unpatchify_rectangular(prediction, height, width)
+        logvar_theta = prediction[:, -1:, :, :]
+        velocity = prediction[:, :-1, :, :]
         if self.garment_high_frequency_control is not None and fine_values is None:
             raise ValueError("HF control requires garment detail features for spatial routing")
         if self.garment_refiner is not None and fine_values is not None:
-            return_routing = return_refiner_supervision or self.garment_high_frequency_control is not None
-            args = (x, noisy_latent, person_agnostic, fine_values,
-                    self._grid_position_embedding(height, width, x.dtype, x.device), edit_mask, garment_mask,
-                    return_routing)
+            route_args = (
+                x, noisy_latent, person_agnostic, fine_values,
+                self._grid_position_embedding(height, width, x.dtype, x.device),
+                garment_mask,
+            )
             if self.gradient_checkpointing and self.training:
-                fine_velocity = checkpoint(self.garment_refiner, *args, use_reentrant=False)
+                fine_features, fine_entry, fine_active = checkpoint(
+                    self.garment_refiner.route, *route_args, use_reentrant=False
+                )
             else:
-                fine_velocity = self.garment_refiner(*args)
-            if return_routing:
-                fine_velocity, fine_entry = fine_velocity
+                fine_features, fine_entry, fine_active = self.garment_refiner.route(*route_args)
             if return_refiner_supervision:
                 attention_maps.append(fine_entry)
             if self.garment_high_frequency_control is not None:
-                hf_args = (garment_high_frequency, fine_entry["query"], fine_entry["key"],
+                # Reuse the detail refiner's RGB/correspondence-supervised routing, but
+                # do not let the auxiliary HF residual rewrite that routing.  The same
+                # detached Q/K still produce exactly the same attention probabilities;
+                # gradients remain enabled for the HF value encoder and output path.
+                hf_args = (garment_high_frequency, fine_entry["query"].detach(),
+                           fine_entry["key"].detach(),
                            fine_entry["key_valid"], edit_mask, garment_mask)
                 if self.gradient_checkpointing and self.training:
                     hf_velocity = checkpoint(self.garment_high_frequency_control, *hf_args, use_reentrant=False)
                 else:
                     hf_velocity = self.garment_high_frequency_control(*hf_args)
-        x = self.final_layer(x, cond)
-        x = self._unpatchify_rectangular(x, height, width)
-        logvar_theta = x[:, -1:, :, :]
-        velocity = x[:, :-1, :, :]
-        if fine_velocity is not None:
+                velocity = velocity + hf_velocity
+
+            token_height = height // self.patch_size
+            token_width = width // self.patch_size
+            time_latent = t.reshape(batch, 1, token_height, token_width)
+            time_latent = time_latent.repeat_interleave(
+                self.patch_size, -2
+            ).repeat_interleave(self.patch_size, -1).to(velocity.dtype)
+            preliminary_clean = noisy_latent + (1 - time_latent) * velocity
+            refine_args = (
+                fine_features, velocity.detach(), preliminary_clean.detach(),
+                edit_mask, fine_active,
+            )
+            if self.gradient_checkpointing and self.training:
+                fine_velocity = checkpoint(
+                    self.garment_refiner.refine, *refine_args, use_reentrant=False
+                )
+            else:
+                fine_velocity = self.garment_refiner.refine(*refine_args)
             velocity = velocity + fine_velocity
-        if hf_velocity is not None:
-            velocity = velocity + hf_velocity
         if return_garment_attention:
             if return_uncertainty:
                 return velocity, logvar_theta, attention_maps

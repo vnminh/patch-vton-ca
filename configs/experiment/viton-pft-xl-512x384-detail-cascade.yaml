@@ -1,0 +1,14 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384-detail-rebalance-hf
+  - _self_
+
+name: vton/pft-xl-512x384-detail-cascade
+
+trainer:
+  params:
+    # detail-rebalance-hf-control already applied the one-time 10x/0.25x head
+    # rebalance. Loading its latest checkpoint must not apply those gains again.
+    # The new cascade adapter is independently zero-initialized by the loader.
+    warm_start_refiner_output_gain: 1.0
+    warm_start_high_frequency_output_gain: 1.0
