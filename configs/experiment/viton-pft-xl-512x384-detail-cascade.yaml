@@ -5,8 +5,25 @@ defaults:
 
 name: vton/pft-xl-512x384-detail-cascade
 
+model:
+  params:
+    # Measured on the cascade step-2000 checkpoint, rescaling the same q.k directions:
+    # at t=0.5 the target-window mass runs 0.304 / 0.463 / 0.534 for scale 10 / 20 / 30.
+    # The bound is a cap on how peaked a softmax over ~1300 valid keys can get, and 10
+    # was leaving that on the table. It changes no parameter, so checkpoints still load.
+    garment_refiner_cosine_scale: 30.0
+
 trainer:
   params:
+    # Routing only matters where the edit region has no answer in it yet. Same
+    # checkpoint: target-window mass 0.1448 at t=0 against 0.3043 at t=0.5, top1 0.0262
+    # against 0.1315. The refiner had learned to match a nearly-clean xt to a
+    # similar-looking garment patch -- a shortcut that pays for 65% of sampled timesteps
+    # and collapses at the t=0 where generation starts. Weighting by (1-t)^2 moves the
+    # supervision to where it is load-bearing; the fine losses are weighted means, so
+    # this reweights which queries count rather than changing the loss magnitude.
+    fine_low_time_power: 2.0
+
     # detail-rebalance-hf-control already applied the one-time 10x/0.25x head
     # rebalance. Loading its latest checkpoint must not apply those gains again.
     # The new cascade adapter is independently zero-initialized by the loader.

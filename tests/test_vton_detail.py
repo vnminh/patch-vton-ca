@@ -479,9 +479,41 @@ def test_fine_teacher_never_blends_rejected_or_disconnected_matches():
     teacher = torch.tensor([[1.,0.,1.,1.]]).expand(3,-1)
     target, weight = module._fine_targets(uv,teacher,data,encoded,None)
     target = target.reshape(3,4,4,2)
-    torch.testing.assert_close(target[0,:2,:2],uv[0,0].expand(2,2,2))
+    # The accepted match is carried intact -- no blending with the rejected neighbour --
+    # but the four subpixels of a patch are separated by their phase, so the mean over
+    # the patch is the teacher's coarse match and no two subpixels coincide.
+    block = target[0,:2,:2].reshape(4,2)
+    torch.testing.assert_close(block.mean(0), uv[0,0])
+    assert len({tuple(row.tolist()) for row in block}) == 4
+    # Half a fine cell on a 4x4 fine grid, in both axes.
+    torch.testing.assert_close((block - uv[0,0]).abs(), torch.full((4,2), .125))
     assert not weight.reshape(3,4,4)[0,:2,2:].any()
     assert not weight[2].any()  # unpaired
+
+
+def test_subpixel_phase_target_lands_on_the_matching_garment_subpixel():
+    """The contract: phase (dy, dx) of a person token must resolve to key p*g + dy.
+
+    ``_fine_correspondence_chunk`` converts a normalised target to a key index with
+    ``round(target * key_size - 0.5)``, so the offset added by ``_fine_targets`` has to
+    survive that round trip exactly, for every coarse cell and every phase.
+    """
+    module = trainer()
+    data = batch()
+    data['person_garment_mask'].fill_(1)
+    encoded = {'target': torch.zeros(1, 4, 8, 8)}
+    coarse, fine = 4, 8
+    gy, gx = torch.meshgrid(torch.arange(coarse), torch.arange(coarse), indexing='ij')
+    uv = torch.stack(((gx.flatten() + .5) / coarse, (gy.flatten() + .5) / coarse), -1)[None]
+    teacher = torch.ones(1, coarse * coarse)
+    target, _ = module._fine_targets(uv, teacher, data, encoded, None)
+    centre_x = (target[0, :, 0] * fine - .5).round().long().reshape(fine, fine)
+    centre_y = (target[0, :, 1] * fine - .5).round().long().reshape(fine, fine)
+    expected = torch.arange(fine)
+    torch.testing.assert_close(centre_y, expected[:, None].expand(fine, fine))
+    torch.testing.assert_close(centre_x, expected[None, :].expand(fine, fine))
+    # Never leaves the key grid, so the caller's clamp is never load-bearing here.
+    assert int(centre_y.min()) == 0 and int(centre_y.max()) == fine - 1
 
 
 def test_qk_normalization_bounds_scores_and_matches_inference_transport():

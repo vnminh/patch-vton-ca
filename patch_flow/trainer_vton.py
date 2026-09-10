@@ -47,6 +47,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         fine_value_cosine_mix=0.5,
         fine_rgb_weight=0.0,
         fine_loss_chunk_size=256,
+        fine_low_time_power=0.0,
         garment_supervision_only=False,
         garment_token_min_coverage=0.8,
         garment_dropout_prob=0.1,
@@ -111,6 +112,15 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         self.fine_value_cosine_mix = float(fine_value_cosine_mix)
         self.fine_rgb_weight = float(fine_rgb_weight)
         self.fine_loss_chunk_size = int(fine_loss_chunk_size)
+        # Routing is only load-bearing where the edit region carries no answer yet.
+        # Measured on the cascade step-2000 checkpoint, target-window mass is 0.1448 at
+        # t=0 against 0.3043 at t=0.5, and top1 0.0262 against 0.1315: the refiner has
+        # learned to match a nearly-clean xt to a similar-looking garment patch, which is
+        # a shortcut that pays off for 65% of the sampled timesteps and collapses at the
+        # t=0 where generation actually starts. The uniform-in-t loss rewards that.
+        self.fine_low_time_power = float(fine_low_time_power)
+        if self.fine_low_time_power < 0:
+            raise ValueError("fine_low_time_power must be non-negative")
         if min(self.fine_correspondence_weight, self.fine_value_weight, self.fine_rgb_weight) < 0:
             raise ValueError("Fine supervision weights must be non-negative")
         if self.fine_correspondence_radius < 0 or self.fine_loss_chunk_size < 1:
@@ -862,19 +872,56 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         return weight
 
     def _fine_targets(self, target, teacher_weight, batch, encoded, keep):
-        """Upsample reliable 32x24 DINO matches onto the 64x48 latent grid."""
+        """Carry reliable 32x24 DINO matches onto 64x48, split by subpixel phase."""
         coarse_grid = self._person_token_grid(encoded["target"])
         fine_grid = encoded["target"].shape[-2:]
         target = target.transpose(1, 2).reshape(target.shape[0], 2, *coarse_grid)
         # DINO matches are discrete correspondences, not a smooth UV field. Bilinear
         # interpolation invented matches between disconnected sleeve/chest regions,
-        # including rejected neighbours. Keep each accepted teacher match intact;
-        # the positive key neighbourhood handles its sub-token uncertainty.
+        # including rejected neighbours. Keep each accepted teacher match intact.
         target = F.interpolate(target, fine_grid, mode="nearest")
+        target = self._subpixel_phase_offset(target, fine_grid)
         target = target.flatten(2).transpose(1, 2)
         reliable = (teacher_weight > 0).reshape(teacher_weight.shape[0], 1, *coarse_grid).float()
         reliable = F.interpolate(reliable, fine_grid, mode="nearest").flatten(1)
         return target, self._fine_supervision_weights(batch, encoded, keep) * reliable
+
+    def _subpixel_phase_offset(self, target, fine_grid):
+        """Give each subpixel of a person token the matching subpixel of its garment cell.
+
+        A nearest upsample alone hands all p*p subpixels inside a patch the same target
+        key, which is degenerate exactly where the fine branch is supposed to add value:
+        if the model complied perfectly, all four would transport the same value and the
+        64x48 branch would be no sharper than the 32x24 backbone. The teacher cannot
+        break the tie either -- DINOv3 ViT-S/16 at 512x384 has a 32x24 patch grid, so its
+        matches are quantised to 16x16 pixel cells while logo strokes are a few pixels
+        wide.
+
+        Instead assume the correspondence is locally a translation, which is a reasonable
+        first-order model at the sub-token scale, and send the subpixel at phase (dy, dx)
+        of a person token to the subpixel at the same phase of the matched garment cell.
+
+        Targets are normalised [0, 1] cell centres, so for a coarse cell index ``g`` on a
+        teacher grid of height ``Hc`` and a fine key grid of height ``Hf = p * Hc``:
+
+            v       = (g + 0.5) / Hc
+            v_fine  = (p * g + dy + 0.5) / Hf  =  v + (dy + 0.5 - p / 2) / Hf
+
+        The index conversion in ``_fine_correspondence_chunk`` then recovers exactly
+        ``p * g + dy``, which always stays inside the grid, so no clamping is needed.
+        """
+        scale = self.flow.patch_size
+        if scale < 2:
+            return target
+        height, width = int(fine_grid[0]), int(fine_grid[1])
+        device, dtype = target.device, target.dtype
+        centre = (scale - 1) / 2
+        rows = (torch.arange(height, device=device, dtype=dtype) % scale - centre) / height
+        columns = (torch.arange(width, device=device, dtype=dtype) % scale - centre) / width
+        offset = torch.stack(
+            (columns[None, :].expand(height, width), rows[:, None].expand(height, width))
+        )
+        return target + offset[None]
 
     def _fine_correspondence_chunk(
         self, query, key, target, weight, key_valid, key_height, key_width
@@ -957,8 +1004,26 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         embedded = self.value_target_norms["detail"](embedded.flatten(2).transpose(1, 2))
         return self.fine_value_target_projector(embedded).detach().float()
 
-    def _fine_losses(self, entry, target, teacher_weight, batch, encoded, keep):
+    def _low_time_weight(self, timesteps, fine_grid):
+        """Per-fine-query emphasis on low timesteps, as a weighted mean, not a rescale.
+
+        Every fine loss divides by the sum of these weights, so this reweights which
+        queries count rather than changing the loss magnitude.
+        """
+        if self.fine_low_time_power == 0:
+            return None
+        height, width = int(fine_grid[0]), int(fine_grid[1])
+        scale = self.flow.patch_size
+        grid = timesteps.reshape(timesteps.shape[0], 1, height // scale, width // scale)
+        grid = grid.repeat_interleave(scale, -2).repeat_interleave(scale, -1)
+        return (1 - grid.flatten(1).clamp(0, 1)) ** self.fine_low_time_power
+
+    def _fine_losses(self, entry, target, teacher_weight, batch, encoded, keep,
+                     timesteps=None):
         target, weight = self._fine_targets(target, teacher_weight, batch, encoded, keep)
+        low_time = self._low_time_weight(timesteps, entry["grid"]) if timesteps is not None else None
+        if low_time is not None:
+            weight = weight * low_time
         query, key, key_valid = entry["query"], entry["key"], entry["key_valid"]
         if query.shape[-2] != target.shape[1] or key.shape[-2] != entry["grid"][0] * entry["grid"][1]:
             raise ValueError("Fine correspondence tensors do not match the 64x48 person/garment grids")
@@ -1002,6 +1067,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         if self.fine_rgb_weight > 0:
             # Paired colour supervision remains available where DINO is uncertain.
             rgb_weight = self._fine_supervision_weights(batch, encoded, keep)
+            if low_time is not None:
+                rgb_weight = rgb_weight * low_time
             target_rgb, garment_rgb = self._fine_rgb_targets(batch, encoded, entry["grid"])
             numerator = zero
             for start in range(0, query.shape[-2], self.fine_loss_chunk_size):
@@ -1191,7 +1258,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             if len(fine_entries) != 1 or correspondence_target is None:
                 raise RuntimeError("Fine supervision requires one refiner entry and DINO correspondence targets")
             fine_loss, fine_metrics = self._fine_losses(
-                fine_entries[0], correspondence_target, correspondence_weight, batch, encoded, keep
+                fine_entries[0], correspondence_target, correspondence_weight, batch, encoded, keep,
+                timesteps=timesteps,
             )
             loss = loss + ramp * fine_loss
             metrics.update(fine_metrics)
