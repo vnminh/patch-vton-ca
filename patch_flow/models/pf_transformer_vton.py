@@ -818,7 +818,12 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             if return_refiner_supervision:
                 attention_maps.append(fine_entry)
             if self.garment_high_frequency_control is not None:
-                hf_args = (garment_high_frequency, fine_entry["query"], fine_entry["key"],
+                # Reuse the detail refiner's RGB/correspondence-supervised routing, but
+                # do not let the auxiliary HF residual rewrite that routing.  The same
+                # detached Q/K still produce exactly the same attention probabilities;
+                # gradients remain enabled for the HF value encoder and output path.
+                hf_args = (garment_high_frequency, fine_entry["query"].detach(),
+                           fine_entry["key"].detach(),
                            fine_entry["key_valid"], edit_mask, garment_mask)
                 if self.gradient_checkpointing and self.training:
                     hf_velocity = checkpoint(self.garment_high_frequency_control, *hf_args, use_reentrant=False)

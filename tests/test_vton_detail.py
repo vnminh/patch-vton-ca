@@ -302,9 +302,16 @@ def test_hf_control_adds_velocity_only_and_trains_encoder_from_first_step():
     optimizer = torch.optim.Adam(control.parameters(), lr=.01)
     for step in range(2):
         captured = []
-        handle = control.register_forward_hook(lambda module, args, value: captured.append(value))
+        routing_requires_grad = []
+        def capture_control(module, args, value):
+            captured.append(value)
+            routing_requires_grad.append((args[1].requires_grad, args[2].requires_grad))
+        handle = control.register_forward_hook(capture_control)
         velocity, logvar = net(**data, garment_high_frequency=hf, return_uncertainty=True)
         handle.remove()
+        # HF copies the detail refiner's attention probabilities, but its loss must not
+        # update the shared Q/K routing. RGB/correspondence supervision owns that map.
+        assert routing_requires_grad == [(False, False)]
         if step == 0:
             assert not captured[0].any()
         with torch.no_grad():
