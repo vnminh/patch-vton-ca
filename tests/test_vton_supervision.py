@@ -199,6 +199,21 @@ def test_fix_experiment_composes_and_keeps_optimizer_shapes():
     new_opt.load_state_dict(old_opt.state_dict())
 
 
+def test_anchor_flow_experiment_uses_sparse_teacher_and_validates_every_50_steps():
+    from hydra import compose, initialize_config_dir
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'), version_base=None):
+        cfg = compose(
+            config_name='config',
+            overrides=['experiment=viton-pft-xl-512x384-detail-anchor-flow'],
+        )
+    assert cfg.model.params.garment_refiner_local_radius == 2
+    assert cfg.trainer.params.correspondence_min_margin > 0
+    assert cfg.trainer.params.correspondence_local_consistency_tolerance == 3
+    assert cfg.trainer.params.correspondence_propagation_steps == 16
+    assert cfg.trainer.params.correspondence_propagated_weight < 1
+    assert cfg.train_params.val_check_interval == 50
+
+
 @pytest.mark.parametrize('fine_detail', [False, True])
 def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detail):
     from jutils.nn.kl_autoencoder import AutoencoderKL
@@ -217,7 +232,7 @@ def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detai
         garment_match_query_grid=fine_detail, garment_latent_refiner=fine_detail,
         garment_refiner_width=32, garment_refiner_heads=4,
         garment_refiner_qk_norm=fine_detail,
-        garment_high_frequency_channels=32 if fine_detail else 0,
+        garment_high_frequency_channels=64 if fine_detail else 0,
     )
     with patch('transformers.AutoModel.from_pretrained', return_value=FakeDinoBackbone()):
         module = LatentVTONPatchForcingTrainer(
@@ -229,10 +244,14 @@ def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detai
             correspondence_min_similarity=0., correspondence_nll_radius=.4,
             correspondence_value_weight=.1, correspondence_entropy_weight=0.,
             detail_loss_weight=.5, detail_pure_noise_only=False, garment_dropout_prob=0.,
+            hf_detail_loss_weight=.5 if fine_detail else 0.,
             decoded_rgb_weight=.2 if fine_detail else 0., decoded_edge_weight=.5 if fine_detail else 0.,
             fine_correspondence_weight=.2 if fine_detail else 0.,
             fine_value_weight=.25 if fine_detail else 0.,
             fine_rgb_weight=.1 if fine_detail else 0.,
+            fine_warp_coordinate_weight=.1 if fine_detail else 0.,
+            fine_warp_smoothness_weight=.02 if fine_detail else 0.,
+            fine_warp_mask_weight=.05 if fine_detail else 0.,
             fine_correspondence_radius=1,
             sample_kwargs={'num_steps':2,'cfg_scale':1.,'adaptive':False,'progress':False},
         )
@@ -246,7 +265,7 @@ def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detai
             'garment_mask':edit, 'has_ground_truth':torch.ones(2,dtype=torch.bool),
             'validation_seed':torch.tensor([0,0]), 'validation_group':['test_paired','test_unpaired']}
     if fine_detail:
-        data['garment_high_frequency'] = torch.randint(0, 2, (2, 1, 64, 48)).float()
+        data['garment_high_frequency'] = torch.rand(2, 6, 64, 48)
     with torch.autocast('cpu',dtype=torch.bfloat16):
         loss, metrics = module(data)
     assert torch.isfinite(loss)
@@ -258,7 +277,12 @@ def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detai
         assert metrics['decoded_samples'] == 1
         assert metrics['fine_correspondence_loss'] > 0
         assert metrics['fine_value_loss'] > 0
+        assert metrics['fine_warp_coordinate_loss'] >= 0
+        assert metrics['fine_warp_smoothness_loss'] >= 0
+        assert metrics['fine_warp_mask_loss'] >= 0
         assert metrics['fine_supervised_fraction'] > 0
+        assert metrics['hf_detail_loss'] > 0
+        assert metrics['hf_detail_active_fraction'] == 1
     loss.backward()
     if fine_detail:
         assert model.garment_refiner.output.weight.grad.abs().sum() > 0

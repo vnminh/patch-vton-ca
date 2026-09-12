@@ -54,17 +54,17 @@ def main():
         )
         handle.remove()
         uv, weight, _ = module._correspondence_targets(data, encoded, encoded['masks'].token, None)
-        uv, weight = module._fine_targets(uv, weight, data, encoded, None)
         indices = (weight[0] > 0).nonzero().flatten()[::4]
         for normalized in (False, True):
             refiner.qk_norm = normalized
             _, entry = refiner(*captured[0], return_supervision=True)
-            q, k = entry['query'][:, :, indices], entry['key']
+            q, k = entry['coarse_query'][:, :, indices], entry['coarse_key']
             logits = q @ k.transpose(-1,-2) / math.sqrt(q.shape[-1])
-            logits = logits.masked_fill(~entry['key_valid'][:,None,None], -torch.inf)
+            logits = logits.masked_fill(~entry['coarse_key_valid'][:,None,None], -torch.inf)
             attention = logits.softmax(-1)
             nll, mass, correct, count = module._fine_correspondence_chunk(
-                q, k, uv[:,indices], weight[:,indices], entry['key_valid'], *entry['grid'],
+                q, k, uv[:,indices], weight[:,indices], entry['coarse_key_valid'],
+                *entry['coarse_grid'],
             )
             denominator = count.clamp_min(1) * q.shape[1]
             print(json.dumps({

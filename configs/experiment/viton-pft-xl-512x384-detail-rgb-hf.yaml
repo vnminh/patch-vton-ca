@@ -1,0 +1,40 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384-detail-anchor-flow
+  - _self_
+
+name: vton/pft-xl-512x384-detail-rgb-hf
+
+model:
+  params:
+    # Two independent 128-channel frozen-VAE detail streams: signed RGB DoG and
+    # luma/chroma/RGB gradients. Their blank-VAE responses are subtracted in trainer.
+    garment_high_frequency_channels: 256
+
+trainer:
+  params:
+    # A loss on the clean latent predicted from backbone.detach() + hf_velocity.
+    # Therefore this objective cannot be absorbed by the backbone or final refiner.
+    hf_detail_loss_weight: 0.5
+    hf_detail_edge_weight: 5.0
+    allow_new_garment_high_frequency: true
+
+data:
+  params:
+    train:
+      params:
+        garment_high_frequency: true
+        garment_high_frequency_mode: rgb_dog_gradient
+        garment_high_frequency_dog_sigmas: [0.8, 2.4]
+        garment_high_frequency_dog_gain: 4.0
+        garment_high_frequency_gradient_gain: 2.0
+    validation:
+      params:
+        garment_high_frequency: true
+        garment_high_frequency_mode: rgb_dog_gradient
+        garment_high_frequency_dog_sigmas: [0.8, 2.4]
+        garment_high_frequency_dog_gain: 4.0
+        garment_high_frequency_gradient_gain: 2.0
+
+train_params:
+  val_check_interval: 50

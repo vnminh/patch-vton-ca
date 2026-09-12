@@ -201,10 +201,12 @@ class DinoCorrespondenceTeacher(nn.Module):
         garment_mask=None,
         person_valid=None,
         min_similarity=0.0,
+        min_margin=0.0,
         soft_target_temperature=0.0,
         mutual=False,
         weight_by_similarity=False,
         cycle_tolerance=None,
+        local_consistency_tolerance=None,
     ):
         """Match editable person tokens to garment tokens and return their positions.
 
@@ -222,10 +224,12 @@ class DinoCorrespondenceTeacher(nn.Module):
             person_valid=person_valid,
             garment_valid=None if garment_mask is None else mask_to_token_valid(garment_mask, garment_grid),
             min_similarity=min_similarity,
+            min_margin=min_margin,
             soft_target_temperature=soft_target_temperature,
             mutual=mutual,
             weight_by_similarity=weight_by_similarity,
             cycle_tolerance=cycle_tolerance,
+            local_consistency_tolerance=local_consistency_tolerance,
         )
 
 
@@ -237,10 +241,12 @@ def correspondence_targets(
     person_valid=None,
     garment_valid=None,
     min_similarity=0.0,
+    min_margin=0.0,
     soft_target_temperature=0.0,
     mutual=False,
     weight_by_similarity=False,
     cycle_tolerance=None,
+    local_consistency_tolerance=None,
 ):
     """Cosine-similarity correspondence from person tokens to garment positions."""
     person = F.normalize(person_features.float().flatten(2).transpose(1, 2), dim=-1)
@@ -252,6 +258,13 @@ def correspondence_targets(
     if garment_valid is not None:
         masked = masked.masked_fill(~garment_valid[:, None, :], neginf)
     best_similarity, best_index = masked.max(dim=-1)
+    if float(min_margin) < 0:
+        raise ValueError("min_margin must be non-negative")
+    if masked.shape[-1] > 1:
+        top_two = masked.topk(2, dim=-1).values
+        match_margin = top_two[..., 0] - top_two[..., 1]
+    else:
+        match_margin = torch.full_like(best_similarity, float("inf"))
 
     coordinates = grid_coordinates(garment_grid, device=similarity.device, dtype=similarity.dtype)
     if soft_target_temperature > 0:
@@ -262,6 +275,9 @@ def correspondence_targets(
 
     valid = torch.ones_like(best_similarity, dtype=torch.bool) if person_valid is None else person_valid.clone()
     valid = valid & (best_similarity >= float(min_similarity))
+    # Repeated colours and symmetric garment parts can have two high-similarity keys.
+    # Only an unambiguous top match is allowed to become a teacher anchor.
+    valid = valid & (match_margin >= float(min_margin))
     if cycle_tolerance is not None and float(cycle_tolerance) < 0:
         raise ValueError("cycle_tolerance must be non-negative or None")
     if mutual or cycle_tolerance is not None:
@@ -281,6 +297,36 @@ def correspondence_targets(
             dy = returned.div(width, rounding_mode="floor") - positions.div(width, rounding_mode="floor")[None]
             dx = returned.remainder(width) - positions.remainder(width)[None]
             valid = valid & (dy.square() + dx.square() <= float(cycle_tolerance) ** 2)
+
+    if local_consistency_tolerance is not None:
+        tolerance = float(local_consistency_tolerance)
+        if tolerance < 0:
+            raise ValueError("local_consistency_tolerance must be non-negative or None")
+        person_height, person_width = person_features.shape[-2:]
+        person_coordinates = grid_coordinates(
+            (person_height, person_width), device=similarity.device, dtype=similarity.dtype
+        )
+        # A cloth warp is locally smooth in displacement space. Reject isolated
+        # sleeve/chest swaps even when their raw DINO cosine similarity is high.
+        scale = similarity.new_tensor((garment_grid[1], garment_grid[0]))
+        displacement = ((target - person_coordinates[None]) * scale).transpose(1, 2).reshape(
+            target.shape[0], 2, person_height, person_width
+        )
+        anchor = valid.reshape(valid.shape[0], 1, person_height, person_width)
+        neighbours = F.unfold(displacement.float(), 3, padding=1).reshape(
+            target.shape[0], 2, 9, person_height * person_width
+        )
+        neighbour_valid = F.unfold(anchor.float(), 3, padding=1).reshape(
+            target.shape[0], 9, person_height * person_width
+        ) > 0
+        neighbour_valid[:, 4] = False  # exclude the query itself
+        centre = displacement.float().flatten(2)[:, :, None]
+        close = (neighbours - centre).square().sum(1).sqrt() <= tolerance
+        available = neighbour_valid.sum(1)
+        coherent = (close & neighbour_valid).sum(1)
+        # One agreeing neighbour is enough at a thin sleeve boundary; an isolated
+        # high-similarity jump is not allowed to seed dense propagation.
+        valid = valid & ((available == 0) | (coherent > 0))
 
     weight = valid.to(similarity.dtype)
     if weight_by_similarity:

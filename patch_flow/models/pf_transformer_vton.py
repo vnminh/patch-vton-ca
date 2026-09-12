@@ -10,6 +10,138 @@ from .pf_transformer import PatchForcingDiT, pf_modulate
 GARMENT_SCALES = ("coarse", "middle", "detail")
 
 
+def attention_sampling_grid(query, key, valid, height, width):
+    """Return per-head soft-argmax garment coordinates without storing attention."""
+    height, width = int(height), int(width)
+    if key.shape[-2] != height * width or valid.shape != (query.shape[0], height * width):
+        raise ValueError("Attention keys, validity mask and garment grid do not match")
+    rows = (torch.arange(height, device=query.device, dtype=torch.float32) + 0.5) / height
+    columns = (torch.arange(width, device=query.device, dtype=torch.float32) + 0.5) / width
+    y, x = torch.meshgrid(rows, columns, indexing="ij")
+    coordinates = torch.stack((x.mul(2).sub(1), y.mul(2).sub(1)), dim=-1)
+    coordinates = coordinates.reshape(1, 1, height * width, 2).to(query.dtype)
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        coordinates.expand(query.shape[0], query.shape[1], -1, -1),
+        attn_mask=valid[:, None, None, :],
+        dropout_p=0.0,
+    )
+
+
+def hard_attention_sampling_grid(query, key, valid, height, width):
+    """Straight-through hard garment coordinate for coherent coarse routing.
+
+    A global soft-argmax can average two distant modes and point between garment parts.
+    The forward pass therefore uses the winning key while the backward pass follows the
+    soft expectation, allowing correspondence losses to keep training Q/K.
+    """
+    height, width = int(height), int(width)
+    if key.shape[-2] != height * width or valid.shape != (query.shape[0], height * width):
+        raise ValueError("Attention keys, validity mask and garment grid do not match")
+    with torch.autocast(device_type=query.device.type, enabled=False):
+        logits = query.float() @ key.float().transpose(-1, -2) / math.sqrt(query.shape[-1])
+        logits = logits.masked_fill(~valid[:, None, None], float("-inf"))
+        probability = logits.softmax(-1)
+    rows = (torch.arange(height, device=query.device, dtype=torch.float32) + 0.5) / height
+    columns = (torch.arange(width, device=query.device, dtype=torch.float32) + 0.5) / width
+    y, x = torch.meshgrid(rows, columns, indexing="ij")
+    coordinates = torch.stack((x.mul(2).sub(1), y.mul(2).sub(1)), -1).reshape(-1, 2)
+    soft = probability @ coordinates
+    hard = coordinates[logits.argmax(-1)]
+    return hard + soft - soft.detach()
+
+
+def upsample_displacement_grid(coarse_grid, coarse_size, fine_size):
+    """Upsample coarse displacement rather than UV, preserving the identity warp."""
+    coarse_height, coarse_width = (int(value) for value in coarse_size)
+    fine_height, fine_width = (int(value) for value in fine_size)
+    batch, heads, tokens, coordinates = coarse_grid.shape
+    if tokens != coarse_height * coarse_width or coordinates != 2:
+        raise ValueError("Coarse sampling grid shape does not match its spatial size")
+
+    def identity(height, width):
+        rows = (torch.arange(height, device=coarse_grid.device, dtype=torch.float32) + 0.5) / height
+        columns = (torch.arange(width, device=coarse_grid.device, dtype=torch.float32) + 0.5) / width
+        y, x = torch.meshgrid(rows, columns, indexing="ij")
+        return torch.stack((x.mul(2).sub(1), y.mul(2).sub(1)), -1)
+
+    coarse_identity = identity(coarse_height, coarse_width)
+    displacement = coarse_grid.float().reshape(batch, heads, coarse_height, coarse_width, 2)
+    displacement = displacement - coarse_identity[None, None]
+    displacement = displacement.permute(0, 1, 4, 2, 3).reshape(
+        batch * heads, 2, coarse_height, coarse_width
+    )
+    displacement = F.interpolate(
+        displacement, (fine_height, fine_width), mode="bilinear", align_corners=False
+    )
+    displacement = displacement.reshape(batch, heads, 2, fine_height, fine_width).permute(
+        0, 1, 3, 4, 2
+    )
+    output = displacement + identity(fine_height, fine_width)[None, None]
+    limit = output.new_tensor((1 - 1 / fine_width, 1 - 1 / fine_height))
+    return output.clamp(-limit, limit).reshape(batch, heads, fine_height * fine_width, 2)
+
+
+def local_attention_sampling_grid(query, key, valid, base_grid, height, width, radius):
+    """Search only a small residual window around a coherent coarse correspondence."""
+    height, width, radius = int(height), int(width), int(radius)
+    batch, heads, queries, channels = query.shape
+    if radius < 0 or key.shape != query.shape or queries != height * width:
+        raise ValueError("Local routing expects equal-grid Q/K and a non-negative radius")
+    if valid.shape != (batch, queries) or base_grid.shape != (batch, heads, queries, 2):
+        raise ValueError("Local routing masks/base grid do not match Q/K")
+    dy, dx = torch.meshgrid(
+        torch.arange(-radius, radius + 1, device=query.device, dtype=torch.float32),
+        torch.arange(-radius, radius + 1, device=query.device, dtype=torch.float32),
+        indexing="ij",
+    )
+    offsets = torch.stack((dx.flatten().mul(2 / width), dy.flatten().mul(2 / height)), -1)
+    candidate = base_grid.float()[..., None, :] + offsets[None, None, None]
+    limit = candidate.new_tensor((1 - 1 / width, 1 - 1 / height))
+    inside = (candidate.abs() <= limit).all(-1)
+    count = offsets.shape[0]
+    sampling = candidate.reshape(batch * heads, height, width * count, 2)
+
+    key_map = key.transpose(-1, -2).reshape(batch * heads, channels, height, width)
+    sampled_key = F.grid_sample(
+        key_map.float(), sampling, mode="bilinear", padding_mode="zeros", align_corners=False
+    )
+    sampled_key = sampled_key.reshape(batch, heads, channels, queries, count).permute(0, 1, 3, 4, 2)
+    valid_map = valid[:, None].expand(-1, heads, -1).reshape(
+        batch * heads, 1, height, width
+    ).float()
+    sampled_valid = F.grid_sample(
+        valid_map, sampling, mode="nearest", padding_mode="zeros", align_corners=False
+    ).reshape(batch, heads, queries, count) > 0.5
+    candidate_valid = inside & sampled_valid
+    empty = ~candidate_valid.any(-1)
+    if empty.any():
+        candidate_valid = candidate_valid.clone()
+        candidate_valid[..., count // 2] |= empty
+    logits = torch.einsum("bhqd,bhqcd->bhqc", query.float(), sampled_key) / math.sqrt(channels)
+    probability = logits.masked_fill(~candidate_valid, float("-inf")).softmax(-1)
+    return (probability[..., None] * candidate).sum(-2).clamp(-limit, limit)
+
+
+def sample_attention_heads(values, sampling_grid, valid, height, width):
+    """Bilinearly sample each value head once at its routed garment coordinate."""
+    batch, heads, tokens, head_width = values.shape
+    height, width = int(height), int(width)
+    if tokens != height * width or sampling_grid.shape != (batch, heads, tokens, 2):
+        raise ValueError("Per-head values and sampling grid do not match garment grid")
+    source = values.transpose(-1, -2).reshape(batch, heads, head_width, height, width)
+    source = source * valid[:, None, None].reshape(batch, 1, 1, height, width).to(source.dtype)
+    source = source.reshape(batch * heads, head_width, height, width)
+    grid = sampling_grid.reshape(batch * heads, height, width, 2).to(source.dtype)
+    sampled = F.grid_sample(
+        source, grid, mode="bilinear", padding_mode="zeros", align_corners=False,
+    )
+    return sampled.reshape(batch, heads, head_width, height, width).permute(
+        0, 1, 3, 4, 2
+    ).reshape(batch, heads, tokens, head_width)
+
+
 class GarmentLatentRefiner(nn.Module):
     """Equal-grid cross-attention with a separate output at every VAE latent cell.
 
@@ -19,13 +151,20 @@ class GarmentLatentRefiner(nn.Module):
     """
 
     def __init__(self, backbone_dim, channels=4, width=256, heads=8, patch_size=2,
-                 qk_norm=False, cosine_scale=10.0):
+                 qk_norm=False, cosine_scale=10.0, dense_pose_channels=0,
+                 local_radius=2):
         super().__init__()
         if width < 1 or heads < 1 or width % heads or width // heads < 2:
             raise ValueError("Refiner width must be divisible by heads with at least two channels per head")
         self.heads = heads
         self.width = width
         self.patch_size = patch_size
+        self.dense_pose_channels = int(dense_pose_channels)
+        self.local_radius = int(local_radius)
+        if self.local_radius < 0:
+            raise ValueError("Fine refiner local radius must be non-negative")
+        if self.dense_pose_channels not in (0, channels):
+            raise ValueError("Fine DensePose channels must be zero or equal latent channels")
         self.qk_norm = bool(qk_norm)
         self.cosine_scale = float(cosine_scale)
         if not math.isfinite(self.cosine_scale) or not 0 < self.cosine_scale <= 30:
@@ -40,7 +179,7 @@ class GarmentLatentRefiner(nn.Module):
         # Zero-initialised, so a loaded refiner keeps its routing on the first step.
         # Unlike a zero velocity head, this zero sits on an input branch whose
         # downstream path is already non-zero, so it receives gradient immediately.
-        self.state = nn.Conv2d(channels * 2, width, 3, padding=1)
+        self.state = nn.Conv2d(channels * 2 + self.dense_pose_channels, width, 3, padding=1)
         nn.init.zeros_(self.state.weight)
         nn.init.zeros_(self.state.bias)
         # The fine decoder must correct the velocity that will actually be integrated,
@@ -57,6 +196,10 @@ class GarmentLatentRefiner(nn.Module):
         self.key = nn.Linear(backbone_dim, width)
         self.value = nn.Linear(backbone_dim, width)
         self.attention_out = nn.Linear(width, width)
+        # Zero keeps the coherent local warp. The adapter can learn to mix global
+        # context back in, but washed-out global A@V is no longer the warm-start path.
+        self.warp_mix = nn.Linear(width, width)
+        self.reset_warp_mix()
         self.local = nn.Sequential(
             nn.GroupNorm(1, width),
             nn.Conv2d(width, width, 3, padding=1, groups=width, bias=False),
@@ -71,7 +214,12 @@ class GarmentLatentRefiner(nn.Module):
         nn.init.zeros_(self.velocity_condition.weight)
         nn.init.zeros_(self.velocity_condition.bias)
 
-    def route(self, tokens, noisy, agnostic, values, position, garment_mask):
+    def reset_warp_mix(self):
+        """Neutralize deformable transport for a function-preserving warm start."""
+        nn.init.zeros_(self.warp_mix.weight)
+        nn.init.zeros_(self.warp_mix.bias)
+
+    def route(self, tokens, noisy, agnostic, values, position, garment_mask, dense_pose=None):
         """Transport garment-detail values and return their supervised routing.
 
         Person/backbone features construct Q -- including the noisy and agnostic latents
@@ -85,7 +233,19 @@ class GarmentLatentRefiner(nn.Module):
         ph, pw = height // self.patch_size, width // self.patch_size
         query = self.query_expand(tokens).transpose(1, 2).reshape(batch, -1, ph, pw)
         query = F.pixel_shuffle(query, self.patch_size)
-        query = query + self.state(torch.cat((noisy, agnostic.to(noisy.dtype)), dim=1))
+        state_inputs = (noisy, agnostic.to(noisy.dtype))
+        if self.dense_pose_channels:
+            if dense_pose is None:
+                raise ValueError("Fine refiner requires DensePose latent")
+            dense_pose = F.interpolate(
+                dense_pose, size=(height, width), mode="bilinear", align_corners=False
+            ).to(noisy.dtype)
+            if dense_pose.shape[1] != self.dense_pose_channels:
+                raise ValueError("Fine refiner DensePose channels do not match configuration")
+            state_inputs = (*state_inputs, dense_pose)
+        elif dense_pose is not None:
+            raise ValueError("Fine refiner received DensePose with dense_pose_channels=0")
+        query = query + self.state(torch.cat(state_inputs, dim=1))
         query = query.flatten(2).transpose(1, 2)
         pos = self.position(position)
         if self.qk_norm:
@@ -114,17 +274,52 @@ class GarmentLatentRefiner(nn.Module):
             gain = math.sqrt(self.cosine_scale * math.sqrt(q.shape[-1]))
             q = (F.normalize(q.float(), dim=-1, eps=1e-6) * gain).to(q.dtype)
             k = (F.normalize(k.float(), dim=-1, eps=1e-6) * gain).to(k.dtype)
-        transported = F.scaled_dot_product_attention(
+        attended = F.scaled_dot_product_attention(
             q, k, v, attn_mask=valid[:, None, None, :], dropout_p=0.0,
-        ).transpose(1, 2).reshape(batch, height * width, self.width)
-        transported = self.attention_out(transported)
+        )
+        coarse_height, coarse_width = ph, pw
+        def pool_heads(tensor):
+            source = tensor.transpose(-1, -2).reshape(
+                batch * self.heads, tensor.shape[-1], height, width
+            )
+            pooled = F.avg_pool2d(source, self.patch_size, self.patch_size)
+            return pooled.reshape(
+                batch, self.heads, tensor.shape[-1], coarse_height * coarse_width
+            ).transpose(-1, -2)
+
+        coarse_q, coarse_k = pool_heads(q), pool_heads(k)
+        if self.qk_norm:
+            gain = math.sqrt(self.cosine_scale * math.sqrt(coarse_q.shape[-1]))
+            coarse_q = (F.normalize(coarse_q.float(), dim=-1, eps=1e-6) * gain).to(q.dtype)
+            coarse_k = (F.normalize(coarse_k.float(), dim=-1, eps=1e-6) * gain).to(k.dtype)
+        coarse_valid = F.max_pool2d(
+            valid.reshape(batch, 1, height, width).float(),
+            self.patch_size, self.patch_size,
+        ).flatten(1) > 0
+        coarse_sampling_grid = hard_attention_sampling_grid(
+            coarse_q, coarse_k, coarse_valid, coarse_height, coarse_width
+        )
+        base_grid = upsample_displacement_grid(
+            coarse_sampling_grid, (coarse_height, coarse_width), (height, width)
+        )
+        sampling_grid = local_attention_sampling_grid(
+            q, k, valid, base_grid, height, width, self.local_radius
+        )
+        warped = sample_attention_heads(v, sampling_grid, valid, height, width)
+        attended = attended.transpose(1, 2).reshape(batch, height * width, self.width)
+        warped = warped.transpose(1, 2).reshape(batch, height * width, self.width)
+        transported = self.attention_out(warped + self.warp_mix(attended - warped))
         features = transported.transpose(1, 2).reshape(
             batch, self.width, height, width
         )
         return features, {
             "scale": "refiner", "query": q, "key": k,
-            "output": transported, "key_valid": valid,
+            "output": transported, "sampling_grid": sampling_grid, "key_valid": valid,
             "grid": (height, width), "query_grid": (height, width),
+            "coarse_query": coarse_q, "coarse_key": coarse_k,
+            "coarse_key_valid": coarse_valid,
+            "coarse_sampling_grid": coarse_sampling_grid,
+            "coarse_grid": (coarse_height, coarse_width),
         }, active
 
     def refine(self, features, preliminary_velocity, preliminary_clean, edit, active):
@@ -149,10 +344,11 @@ class GarmentLatentRefiner(nn.Module):
         return residual * gate * active[:, None, None, None].to(residual.dtype)
 
     def forward(self, tokens, noisy, agnostic, values, position, edit, garment_mask,
-                return_supervision=False, preliminary_velocity=None, preliminary_clean=None):
+                return_supervision=False, preliminary_velocity=None, preliminary_clean=None,
+                dense_pose=None):
         """Return the garment-only correction, optionally with compact loss tensors."""
         features, supervision, active = self.route(
-            tokens, noisy, agnostic, values, position, garment_mask
+            tokens, noisy, agnostic, values, position, garment_mask, dense_pose
         )
         if (preliminary_velocity is None) != (preliminary_clean is None):
             raise ValueError("Both preliminary_velocity and preliminary_clean must be provided together")
@@ -179,9 +375,9 @@ class GarmentHighFrequencyControl(nn.Module):
     garment's base colour and must be kept, the HF mean carries no information.
 
     Two further things differ from the first revision, both forced by measurement. The
-    values are frozen pretrained VAE half-resolution features of the Canny map -- the same
-    basis the refiner's garment keys and values already live in -- instead of a randomly
-    initialised pixel encoder. And the zero initialisation sits on the encoder output
+    values are frozen pretrained VAE half-resolution features of the cloth detail maps --
+    the same basis the refiner's garment keys and values already live in -- instead of a
+    randomly initialised pixel encoder. And the zero initialisation sits on the encoder output
     rather than on the velocity head: a zero head makes every upstream gradient
     identically zero, and over 3500 steps that left the old encoder's first convolution
     at exactly its initialisation rms (0.072657 against a theoretical 0.07217) while the
@@ -205,6 +401,7 @@ class GarmentHighFrequencyControl(nn.Module):
             nn.Conv2d(width, width, 1, bias=False),
         )
         self.output = nn.Conv2d(width, channels, 1)
+        self.warp_mix = nn.Conv2d(width, width, 1)
         self.reset_zero_gate()
 
     def reset_zero_gate(self):
@@ -217,8 +414,15 @@ class GarmentHighFrequencyControl(nn.Module):
         nn.init.zeros_(self.encoder.weight)
         nn.init.zeros_(self.encoder.bias)
         nn.init.zeros_(self.output.bias)
+        self.reset_warp_mix()
 
-    def forward(self, high_frequency, query, key, valid, edit, garment_mask):
+    def reset_warp_mix(self):
+        """Zero starts from the shared coherent warp; global context is optional."""
+        nn.init.zeros_(self.warp_mix.weight)
+        nn.init.zeros_(self.warp_mix.bias)
+
+    def forward(self, high_frequency, query, key, valid, edit, garment_mask,
+                sampling_grid=None):
         batch, channels, source_height, source_width = high_frequency.shape
         height = source_height // self.patch_size
         width = source_width // self.patch_size
@@ -231,14 +435,14 @@ class GarmentHighFrequencyControl(nn.Module):
             )
         # Garment dropout and CFG zero these features, so an exact-zero test still
         # identifies a dropped sample. An empty cloth mask is caught separately: the VAE
-        # of an all-black Canny map is not itself zero.
+        # of a neutral detail map is not itself zero unless its baseline was subtracted.
         active = high_frequency.flatten(1).ne(0).any(1)
         if garment_mask is not None:
             active = active & garment_mask.flatten(1).ne(0).any(1)
         features = self.encoder(high_frequency)
         values = features.flatten(2).transpose(1, 2)
-        # Centre the values across the valid keys. A Canny map is mostly black with a few
-        # thin strokes, so its VAE features carry a large global mean: measured 0.5591
+        # Centre the values across the valid keys. A sparse edge map can otherwise give
+        # its VAE features a large global mean: measured 0.5591 for the former Canny input
         # against -0.0102 for the garment features. Attention that is anywhere near
         # diffuse then returns that mean, and the branch injects a spatially constant
         # offset into the latent -- a flat colour shift once decoded. At step 1000 that
@@ -252,10 +456,19 @@ class GarmentHighFrequencyControl(nn.Module):
         mean = (values * key_mask).sum(1, keepdim=True) / key_mask.sum(1, keepdim=True).clamp_min(1)
         values = values - mean
         values = values.reshape(batch, height * width, self.heads, -1).transpose(1, 2)
-        transported = F.scaled_dot_product_attention(
+        attended = F.scaled_dot_product_attention(
             query, key, values.to(query.dtype), attn_mask=valid[:, None, None, :], dropout_p=0.0,
-        ).transpose(1, 2).reshape(batch, height * width, -1)
-        features = transported.transpose(1, 2).reshape(batch, -1, height, width)
+        )
+        if sampling_grid is None:
+            sampling_grid = attention_sampling_grid(query, key, valid, height, width)
+        warped = sample_attention_heads(
+            values.to(query.dtype), sampling_grid, valid, height, width
+        )
+        attended = attended.transpose(1, 2).reshape(batch, height * width, -1)
+        warped = warped.transpose(1, 2).reshape(batch, height * width, -1)
+        attended = attended.transpose(1, 2).reshape(batch, -1, height, width)
+        warped = warped.transpose(1, 2).reshape(batch, -1, height, width)
+        features = warped + self.warp_mix(attended - warped)
         residual = self.output(features + self.local(features))
         gate = F.interpolate(edit.float(), (height, width), mode="area").clamp(0, 1)
         return residual * gate.to(residual.dtype) * active[:, None, None, None].to(residual.dtype)
@@ -395,6 +608,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         garment_refiner_heads=8,
         garment_refiner_qk_norm=False,
         garment_refiner_cosine_scale=10.0,
+        garment_refiner_local_radius=2,
         pretrained_ckpt=None,
         pretrained_use_ema=True,
         **kwargs,
@@ -515,18 +729,14 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 self.hidden_size, self.state_channels, garment_refiner_width,
                 garment_refiner_heads, self.patch_size,
                 qk_norm=garment_refiner_qk_norm, cosine_scale=garment_refiner_cosine_scale,
+                dense_pose_channels=self.dense_pose_channels,
+                local_radius=garment_refiner_local_radius,
             )
 
         self.garment_high_frequency_control = None
         if garment_high_frequency_channels:
             if self.garment_refiner is None:
                 raise ValueError("HF control requires garment_latent_refiner for supervised spatial routing")
-            if garment_high_frequency_channels != self.garment_detail_channels:
-                raise ValueError(
-                    "HF control consumes frozen VAE half-resolution features, so "
-                    "garment_high_frequency_channels must equal garment_detail_channels "
-                    f"({self.garment_detail_channels})"
-                )
             self.garment_high_frequency_control = GarmentHighFrequencyControl(
                 garment_refiner_width, garment_refiner_heads, self.state_channels,
                 source_channels=garment_high_frequency_channels,
@@ -856,7 +1066,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             route_args = (
                 x, noisy_latent, person_agnostic, fine_values,
                 self._grid_position_embedding(height, width, x.dtype, x.device),
-                garment_mask,
+                garment_mask, dense_pose,
             )
             if self.gradient_checkpointing and self.training:
                 fine_features, fine_entry, fine_active = checkpoint(
@@ -866,6 +1076,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 fine_features, fine_entry, fine_active = self.garment_refiner.route(*route_args)
             if return_refiner_supervision:
                 attention_maps.append(fine_entry)
+            pre_hf_velocity = velocity
             if self.garment_high_frequency_control is not None:
                 # Reuse the detail refiner's RGB/correspondence-supervised routing, but
                 # do not let the auxiliary HF residual rewrite that routing.  The same
@@ -873,12 +1084,19 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 # gradients remain enabled for the HF value encoder and output path.
                 hf_args = (garment_high_frequency, fine_entry["query"].detach(),
                            fine_entry["key"].detach(),
-                           fine_entry["key_valid"], edit_mask, garment_mask)
+                           fine_entry["key_valid"], edit_mask, garment_mask,
+                           fine_entry["sampling_grid"].detach())
                 if self.gradient_checkpointing and self.training:
                     hf_velocity = checkpoint(self.garment_high_frequency_control, *hf_args, use_reentrant=False)
                 else:
                     hf_velocity = self.garment_high_frequency_control(*hf_args)
                 velocity = velocity + hf_velocity
+                if return_refiner_supervision:
+                    # The trainer detaches pre_hf_velocity and gives this component a
+                    # latent detail objective of its own. This prevents the backbone or
+                    # final refiner from absorbing the logo loss while HF stays idle.
+                    fine_entry["pre_hf_velocity"] = pre_hf_velocity
+                    fine_entry["hf_velocity"] = hf_velocity
 
             token_height = height // self.patch_size
             token_width = width // self.patch_size

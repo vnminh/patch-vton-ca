@@ -133,6 +133,24 @@ class VTONTests(unittest.TestCase):
         torch.testing.assert_close(similarity[0], torch.tensor([0.0, 1.0]), atol=1e-6, rtol=1e-6)
         torch.testing.assert_close(weight[0], torch.tensor([0.0, 1.0]))
 
+    def test_ambiguous_top_two_dino_matches_are_not_reliable_anchors(self):
+        garment = torch.tensor([[[[1.0, .999]], [[0.0, .045]]]])
+        person = torch.tensor([1.0, 0.0]).view(1, 2, 1, 1)
+        _, permissive, _ = correspondence_targets(person, garment, (1, 2))
+        _, reliable, _ = correspondence_targets(person, garment, (1, 2), min_margin=.01)
+        self.assertEqual(permissive.item(), 1)
+        self.assertEqual(reliable.item(), 0)
+
+    def test_local_displacement_consistency_rejects_isolated_part_swap(self):
+        garment = torch.eye(5).T.reshape(1, 5, 1, 5)
+        # Identity everywhere except the centre person token, which chooses key 4.
+        person = garment.clone()
+        person[..., 2] = garment[..., 4]
+        _, weight, _ = correspondence_targets(
+            person, garment, (1, 5), local_consistency_tolerance=.5
+        )
+        torch.testing.assert_close(weight[0], torch.tensor([1., 1., 0., 1., 1.]))
+
     def test_mutual_check_rejects_one_sided_matches(self):
         # Two person tokens both match garment token 0 best; only the closer one survives
         # cycle consistency.

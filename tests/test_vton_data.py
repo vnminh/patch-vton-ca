@@ -46,6 +46,26 @@ class VTONDataTests(unittest.TestCase):
             self.assertFalse(high_frequency.masked_select(unpaired["garment_mask"] == 0).any())
             self.assertFalse(paired["garment_high_frequency"].any())
 
+            rgb_hf = VTONHDDataset(
+                root,
+                image_size=32,
+                paired=False,
+                garment_high_frequency=True,
+                garment_high_frequency_mode="rgb_dog_gradient",
+            )[0]["garment_high_frequency"]
+            self.assertEqual(tuple(rgb_hf.shape), (6, 32, 32))
+            # Signed RGB detail has both polarities around its neutral value. The
+            # gradient group is nonnegative and responds to the logo boundary.
+            self.assertLess(rgb_hf[:3].min().item(), 0.5)
+            self.assertGreater(rgb_hf[:3].max().item(), 0.5)
+            self.assertGreater(rgb_hf[3:].sum().item(), 0)
+            outside = unpaired["garment_mask"].expand(3, -1, -1) == 0
+            torch.testing.assert_close(
+                rgb_hf[:3].masked_select(outside),
+                torch.full_like(rgb_hf[:3].masked_select(outside), 0.5),
+            )
+            self.assertFalse(rgb_hf[3:].masked_select(outside).any())
+
     def test_stable_viton_shift_scale_is_independent_and_keeps_masks_aligned(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)

@@ -1,0 +1,28 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384-detail-cascade
+  - _self_
+
+name: vton/pft-xl-512x384-detail-warp
+
+trainer:
+  params:
+    # DINO remains a coarse geometric anchor. It is not trusted as a character-level
+    # 64x48 flow target, so the old local-mass NLL is reduced rather than strengthened.
+    fine_correspondence_weight: 0.05
+
+    # The actual fine transport is a per-head soft-argmax grid followed by bilinear
+    # sampling. Paired RGB/VAE feature losses refine it below DINO's 16-pixel patches.
+    fine_warp_coordinate_weight: 0.10
+    fine_warp_smoothness_weight: 0.02
+    fine_warp_mask_weight: 0.05
+
+    # These now supervise the coherently warped values over every paired garment pixel,
+    # including regions where DINO rejected its nearest-neighbour match.
+    fine_value_weight: 0.25
+    fine_rgb_weight: 0.20
+
+    # A fresh optimizer is required for the appended DensePose state slice and the two
+    # zero-initialized warp adapters. Do not reapply the previous head rebalance.
+    warm_start_refiner_output_gain: 1.0
+    warm_start_high_frequency_output_gain: 1.0

@@ -1,0 +1,41 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384-detail-warp
+  - _self_
+
+name: vton/pft-xl-512x384-detail-anchor-flow
+
+model:
+  params:
+    # First choose one coherent coarse garment cell, then learn only a small fine
+    # residual. This prevents a global soft-argmax from averaging distant garment parts.
+    garment_refiner_local_radius: 2
+
+trainer:
+  params:
+    # DINOv3 supplies sparse geometric anchors, not dense 64x48 correspondence.
+    # Raw similarity alone is permissive on repeated colours, so require top-1
+    # uniqueness and agreement with the displacement of neighbouring anchors.
+    # Measured on real train batches: 0.002 retains ~57% of garment tokens after
+    # cycle/local checks; 0.02 retained only ~1.2% and was too sparse to propagate.
+    correspondence_min_margin: 0.002
+    correspondence_local_consistency_tolerance: 3.0
+
+    # Fill rejected garment tokens from reliable displacement anchors. Propagated
+    # positions have lower confidence and are never counted as DINO observations.
+    correspondence_propagation_steps: 16
+    correspondence_propagation_decay: 0.9
+    correspondence_propagated_weight: 0.25
+
+    # Reliable coarse anchors own the NLL. Dense propagated flow plus paired RGB/HF
+    # reconstruction teach the fine local residual.
+    fine_correspondence_weight: 0.10
+    fine_warp_coordinate_weight: 0.15
+    fine_warp_smoothness_weight: 0.05
+
+    save_validation_previews: true
+    preview_every_n_validations: 1
+
+train_params:
+  # Fixed paired/unpaired preview inference every 50 optimizer steps.
+  val_check_interval: 50

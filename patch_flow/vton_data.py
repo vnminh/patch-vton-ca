@@ -63,6 +63,10 @@ class VTONHDDataset(Dataset):
         dense_pose_dir=None,
         garment_high_frequency=False,
         garment_high_frequency_canny_thresholds=(100, 200),
+        garment_high_frequency_mode="canny",
+        garment_high_frequency_dog_sigmas=(0.8, 2.4),
+        garment_high_frequency_dog_gain=4.0,
+        garment_high_frequency_gradient_gain=2.0,
     ):
         self.root = os.path.abspath(root)
         self.split = split
@@ -99,6 +103,24 @@ class VTONHDDataset(Dataset):
                 "0 <= low < high <= 255"
             )
         self.garment_high_frequency_canny_thresholds = thresholds
+        self.garment_high_frequency_mode = str(garment_high_frequency_mode).lower()
+        if self.garment_high_frequency_mode not in ("canny", "rgb_dog_gradient"):
+            raise ValueError(
+                "garment_high_frequency_mode must be 'canny' or 'rgb_dog_gradient'"
+            )
+        sigmas = tuple(float(value) for value in garment_high_frequency_dog_sigmas)
+        if len(sigmas) != 2 or not 0 < sigmas[0] < sigmas[1]:
+            raise ValueError(
+                "garment_high_frequency_dog_sigmas must contain two increasing positive values"
+            )
+        self.garment_high_frequency_dog_sigmas = sigmas
+        self.garment_high_frequency_dog_gain = float(garment_high_frequency_dog_gain)
+        self.garment_high_frequency_gradient_gain = float(garment_high_frequency_gradient_gain)
+        if min(
+            self.garment_high_frequency_dog_gain,
+            self.garment_high_frequency_gradient_gain,
+        ) <= 0:
+            raise ValueError("High-frequency gains must be positive")
         if self.garment_parse_labels is not None and not os.path.isdir(self.person_parse_dir):
             raise FileNotFoundError(f"Garment supervision requires parsing labels: {self.person_parse_dir}")
         pair_list = pair_list or os.path.join(self.root, f"{split}_pairs.txt")
@@ -141,9 +163,64 @@ class VTONHDDataset(Dataset):
         return translate, scale
 
     def _garment_high_frequency_map(self, garment, garment_mask):
-        """Canny detail from the transformed target cloth, restricted to its mask."""
+        """Detail from the transformed cloth only, restricted to its own mask.
+
+        ``canny`` is retained solely so old experiment configs remain reproducible.
+        ``rgb_dog_gradient`` returns two RGB-like groups for the frozen VAE:
+        signed RGB high-pass/DoG in channels 0:3 and luma/chroma/RGB gradient
+        magnitudes in channels 3:6. Fixed gains retain absolute edge strength; unlike
+        per-image normalisation they do not turn compression noise into a strong logo.
+        """
         rgb = np.asarray(garment, dtype=np.uint8)
         mask = np.asarray(garment_mask, dtype=np.uint8) > 127
+        if self.garment_high_frequency_mode == "rgb_dog_gradient":
+            image = rgb.astype(np.float32) / 255.0
+            sigma_fine, sigma_coarse = self.garment_high_frequency_dog_sigmas
+            blur_fine = cv2.GaussianBlur(image, (0, 0), sigmaX=sigma_fine, sigmaY=sigma_fine)
+            blur_coarse = cv2.GaussianBlur(
+                image, (0, 0), sigmaX=sigma_coarse, sigmaY=sigma_coarse
+            )
+            # Preserve the sign independently in R/G/B. This is essential for coloured
+            # text and colour-block boundaries, which grayscale Canny aliases together.
+            signed_detail = 0.65 * (image - blur_fine) + 0.35 * (
+                blur_fine - blur_coarse
+            )
+            signed_detail = np.clip(
+                signed_detail * self.garment_high_frequency_dog_gain, -1.0, 1.0
+            )
+
+            def gradient(channel):
+                dx = cv2.Sobel(channel, cv2.CV_32F, 1, 0, ksize=3) / 8.0
+                dy = cv2.Sobel(channel, cv2.CV_32F, 0, 1, ksize=3) / 8.0
+                return np.sqrt(np.square(dx) + np.square(dy))
+
+            luma = 0.2126 * image[..., 0] + 0.7152 * image[..., 1] + 0.0722 * image[..., 2]
+            # Two opponent-colour axes retain isoluminant boundaries (e.g. red/green
+            # blocks) which disappear from a luma-only edge detector.
+            red_green = 0.5 * (image[..., 0] - image[..., 1])
+            yellow_blue = 0.5 * (0.5 * (image[..., 0] + image[..., 1]) - image[..., 2])
+            chroma = np.sqrt(
+                np.square(gradient(red_green)) + np.square(gradient(yellow_blue))
+            )
+            rgb_gradient = np.maximum.reduce([gradient(image[..., channel]) for channel in range(3)])
+            gradients = np.stack((gradient(luma), chroma, rgb_gradient), axis=-1)
+            gradients = np.clip(
+                gradients * self.garment_high_frequency_gradient_gain, 0.0, 1.0
+            )
+
+            # Do not spend branch capacity on the garment silhouette. Its geometry is
+            # already supplied by garment_mask and the supervised warp; a two-pixel
+            # interior keeps blur/Sobel support away from letterbox/background colours.
+            interior = cv2.erode(mask.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+            if not interior.any():
+                interior = mask
+            signed_detail[~interior] = 0.0
+            gradients[~interior] = 0.0
+            # Signed absence is neutral 0.5 before the trainer maps it back to [-1, 1].
+            signed_detail = 0.5 * (signed_detail + 1.0)
+            features = np.concatenate((signed_detail, gradients), axis=-1)
+            return torch.from_numpy(features.transpose(2, 0, 1).copy()).float()
+
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         low, high = self.garment_high_frequency_canny_thresholds
         edges = cv2.Canny(gray, low, high)
@@ -262,7 +339,11 @@ class VTONValidationDataset(Dataset):
 
     def __init__(self, root, image_size=(512, 384), garment_parse_labels=(5, 6, 7),
                  dense_pose_dir=None, garment_high_frequency=False,
-                 garment_high_frequency_canny_thresholds=(100, 200), test_samples=8,
+                 garment_high_frequency_canny_thresholds=(100, 200),
+                 garment_high_frequency_mode="canny",
+                 garment_high_frequency_dog_sigmas=(0.8, 2.4),
+                 garment_high_frequency_dog_gain=4.0,
+                 garment_high_frequency_gradient_gain=2.0, test_samples=8,
                  train_samples=4, preview_sample_id=None):
         if test_samples < 2 or train_samples < 0:
             raise ValueError("Validation needs at least two test samples and nonnegative train_samples")
@@ -277,6 +358,10 @@ class VTONValidationDataset(Dataset):
                 dense_pose_dir=dense_pose_dir,
                 garment_high_frequency=garment_high_frequency,
                 garment_high_frequency_canny_thresholds=garment_high_frequency_canny_thresholds,
+                garment_high_frequency_mode=garment_high_frequency_mode,
+                garment_high_frequency_dog_sigmas=garment_high_frequency_dog_sigmas,
+                garment_high_frequency_dog_gain=garment_high_frequency_dog_gain,
+                garment_high_frequency_gradient_gain=garment_high_frequency_gradient_gain,
                 preview_sample_id=preview_sample_id if split == "test" else None,
             )
             if count > len(dataset):

@@ -7,7 +7,15 @@ import torch
 import torch.nn as nn
 from hydra import compose, initialize_config_dir
 
-from patch_flow.models.pf_transformer_vton import GarmentLatentRefiner, VTONPatchForcingDiT
+from patch_flow.models.pf_transformer_vton import (
+    GarmentLatentRefiner,
+    VTONPatchForcingDiT,
+    attention_sampling_grid,
+    hard_attention_sampling_grid,
+    local_attention_sampling_grid,
+    sample_attention_heads,
+    upsample_displacement_grid,
+)
 from patch_flow.trainer_vton import LatentVTONPatchForcingTrainer
 from test_vton_supervision import trainer, batch
 
@@ -50,6 +58,7 @@ def test_equal_query_key_grids_and_fine_output_neutral_initialization():
     assert maps[-1]['query'].shape == (2,4,48,8)
     assert maps[-1]['key'].shape == (2,4,48,8)
     assert maps[-1]['output'].shape == (2,48,32)
+    assert maps[-1]['sampling_grid'].shape == (2,4,48,2)
     data['garment_detail'] = torch.randn(2,8,24,32)
     with pytest.raises(ValueError, match='identical resolution'):
         new(**data)
@@ -179,10 +188,8 @@ def test_garment_gradient_norms_cover_every_conditioning_branch():
     assert metrics['garment_grad/hf/output'] == 0
 
 
-def test_hf_values_are_centred_across_valid_keys_so_diffuse_attention_gives_zero():
-    """A Canny map's VAE features carry a large global mean (measured 0.5591 against
-    -0.0102 for garment features). Uniform attention over uncentred values returns that
-    mean as a spatially constant latent offset -- a flat colour shift once decoded."""
+def test_hf_values_follow_the_shared_coherent_sampling_grid():
+    """HF must copy the RGB route instead of falling back to diffuse global A@V."""
     net = model(refiner=True, garment_high_frequency_channels=8).eval()
     control = net.garment_high_frequency_control
     nn.init.normal_(control.encoder.weight, std=.1)
@@ -192,20 +199,15 @@ def test_hf_values_are_centred_across_valid_keys_so_diffuse_attention_gives_zero
     valid[:, 24:] = False                                  # only some keys are garment
     query = torch.zeros(2, 4, 48, 8)                       # uniform attention
     key = torch.zeros(2, 4, 48, 8)
+    identity = LatentVTONPatchForcingTrainer._identity_sampling_grid(
+        (8,6), query.device
+    ).reshape(1,1,48,2).expand(2,4,-1,-1)
+    shifted = identity.roll(1, dims=2)
     with torch.no_grad():
-        residual = control(hf, query, key, valid,
-                           torch.ones(2, 1, 8, 6), torch.ones(2, 1, 64, 48))
-    # Uniform attention over centred values retrieves the mean of the centred values,
-    # which is zero by construction. Any surviving residual is the DC leak.
-    assert residual.abs().max() < 1e-4, residual.abs().max()
-
-    # The deviations must still survive: a different edge map must give a different
-    # residual once attention is not uniform.
-    sharp = torch.randn(2, 4, 48, 8) * 5
-    with torch.no_grad():
-        a = control(hf, sharp, sharp, valid, torch.ones(2, 1, 8, 6), torch.ones(2, 1, 64, 48))
-        b = control(hf.roll(7, -1), sharp, sharp, valid,
-                    torch.ones(2, 1, 8, 6), torch.ones(2, 1, 64, 48))
+        a = control(hf, query, key, valid, torch.ones(2, 1, 8, 6),
+                    torch.ones(2, 1, 64, 48), identity)
+        b = control(hf, query, key, valid, torch.ones(2, 1, 8, 6),
+                    torch.ones(2, 1, 64, 48), shifted)
     assert a.abs().sum() > 0 and not torch.allclose(a, b)
 
 
@@ -406,6 +408,35 @@ def test_existing_hf_checkpoint_warm_starts_zero_cascade_adapter():
     assert not module.model.garment_refiner.velocity_condition.bias.any()
 
 
+def test_cascade_checkpoint_migrates_dense_query_and_zero_warp_adapters():
+    net = model(refiner=True, dense_pose_channels=4, garment_high_frequency_channels=8)
+    module = LatentVTONPatchForcingTrainer(
+        model=net, first_stage=torch.nn.Identity(), ema_rate=0,
+        flow={'target': 'patch_flow.flow_vton.VTONPatchFlowForcing', 'params': {'patch_size': 2}},
+        compute_validation_metrics=False, correspondence_center_weight=0,
+        correspondence_nll_weight=0, correspondence_entropy_weight=0,
+        correspondence_photometric_weight=0, allow_new_garment_refiner=True,
+        allow_new_garment_high_frequency=True,
+    )
+    legacy = module.state_dict()
+    state_key = 'model.garment_refiner.state.weight'
+    old_state = torch.randn_like(legacy[state_key][:, :8])
+    legacy[state_key] = old_state
+    for prefix in (
+        'model.garment_refiner.warp_mix.',
+        'model.garment_high_frequency_control.warp_mix.',
+    ):
+        for key in [name for name in legacy if name.startswith(prefix)]:
+            del legacy[key]
+    with pytest.warns(UserWarning):
+        module.load_state_dict(legacy, strict=True)
+    migrated = module.model.garment_refiner.state.weight
+    torch.testing.assert_close(migrated[:, :8], old_state)
+    assert not migrated[:, 8:].any()
+    assert not module.model.garment_refiner.warp_mix.weight.any()
+    assert not module.model.garment_high_frequency_control.warp_mix.weight.any()
+
+
 def test_refiner_is_garment_transport_only_and_preserves_fine_phase():
     refiner = GarmentLatentRefiner(32, width=32, heads=4)
     nn.init.normal_(refiner.output.weight, std=.1)
@@ -472,41 +503,35 @@ def test_fine_correspondence_empty_positive_and_fractional_accuracy(empty):
 
 def test_fine_teacher_never_blends_rejected_or_disconnected_matches():
     module = trainer()
+    module.correspondence_propagation_steps = 4
+    module.correspondence_propagated_weight = .25
     data = batch()
     data['person_garment_mask'].fill_(1)
     encoded = {'target':torch.zeros(3,4,4,4)}
     uv = torch.tensor([[[.1,.1],[.9,.9],[.2,.2],[.8,.8]]]).expand(3,-1,-1)
     teacher = torch.tensor([[1.,0.,1.,1.]]).expand(3,-1)
-    target, weight = module._fine_targets(uv,teacher,data,encoded,None)
+    target, anchor_weight, dense_weight = module._fine_targets(uv,teacher,data,encoded,None)
     target = target.reshape(3,4,4,2)
-    # The accepted match is carried intact -- no blending with the rejected neighbour --
-    # but the four subpixels of a patch are separated by their phase, so the mean over
-    # the patch is the teacher's coarse match and no two subpixels coincide.
-    block = target[0,:2,:2].reshape(4,2)
-    torch.testing.assert_close(block.mean(0), uv[0,0])
-    assert len({tuple(row.tolist()) for row in block}) == 4
-    # Half a fine cell on a 4x4 fine grid, in both axes.
-    torch.testing.assert_close((block - uv[0,0]).abs(), torch.full((4,2), .125))
-    assert not weight.reshape(3,4,4)[0,:2,2:].any()
-    assert not weight[2].any()  # unpaired
+    # Only the accepted DINO cells are anchors. The rejected top-right cell receives a
+    # lower-confidence propagated displacement, never its raw (.9,.9) DINO match.
+    assert not anchor_weight.reshape(3,4,4)[0,:2,2:].any()
+    assert dense_weight.reshape(3,4,4)[0,:2,2:].any()
+    assert target[0,:2,2:].mean() < .8
+    assert not anchor_weight[2].any() and not dense_weight[2].any()  # unpaired
 
 
-def test_subpixel_phase_target_lands_on_the_matching_garment_subpixel():
-    """The contract: phase (dy, dx) of a person token must resolve to key p*g + dy.
-
-    ``_fine_correspondence_chunk`` converts a normalised target to a key index with
-    ``round(target * key_size - 0.5)``, so the offset added by ``_fine_targets`` has to
-    survive that round trip exactly, for every coarse cell and every phase.
-    """
+def test_identity_coarse_displacement_upsamples_to_identity_fine_flow():
+    """Upsampling displacement, not absolute UV, must preserve every fine phase."""
     module = trainer()
     data = batch()
+    data = {name: value[:1] for name, value in data.items()}
     data['person_garment_mask'].fill_(1)
     encoded = {'target': torch.zeros(1, 4, 8, 8)}
     coarse, fine = 4, 8
     gy, gx = torch.meshgrid(torch.arange(coarse), torch.arange(coarse), indexing='ij')
     uv = torch.stack(((gx.flatten() + .5) / coarse, (gy.flatten() + .5) / coarse), -1)[None]
     teacher = torch.ones(1, coarse * coarse)
-    target, _ = module._fine_targets(uv, teacher, data, encoded, None)
+    target, _, _ = module._fine_targets(uv, teacher, data, encoded, None)
     centre_x = (target[0, :, 0] * fine - .5).round().long().reshape(fine, fine)
     centre_y = (target[0, :, 1] * fine - .5).round().long().reshape(fine, fine)
     expected = torch.arange(fine)
@@ -528,7 +553,9 @@ def test_qk_normalization_bounds_scores_and_matches_inference_transport():
     scores = q @ k.transpose(-1,-2) / q.shape[-1]**.5
     assert scores.abs().max() <= 10.00001
     v = refiner.value(args[3]).reshape(1,48,4,8).transpose(1,2)
-    expected = (scores.softmax(-1) @ v).transpose(1,2).reshape(1,48,32)
+    expected = sample_attention_heads(
+        v, entry['sampling_grid'], entry['key_valid'], 8, 6
+    ).transpose(1,2).reshape(1,48,32)
     torch.testing.assert_close(entry['output'],refiner.attention_out(expected),rtol=1e-5,atol=1e-6)
     entry['output'].square().mean().backward()
     assert all(torch.isfinite(p.grad).all() for p in refiner.parameters() if p.grad is not None)
@@ -550,9 +577,82 @@ def test_fine_position_changes_routing_but_never_value_input():
         refiner(*args)
         args[4] = torch.randn_like(args[4])
         refiner(*args)
+    # SDPA is now only the optional global-context value path. Hierarchical hard-coarse
+    # plus local-residual routing is computed explicitly and transports content-only V.
+    assert len(calls) == 2
     assert not torch.allclose(calls[0][0],calls[1][0])
     assert not torch.allclose(calls[0][1],calls[1][1])
     torch.testing.assert_close(calls[0][2],calls[1][2],rtol=0,atol=0)
+
+
+def test_per_head_sampling_grid_preserves_exact_spatial_values():
+    # Strong diagonal attention should recover each cell, not average its neighbours.
+    query = torch.eye(4).reshape(1, 1, 4, 4) * 20
+    key = query.clone()
+    valid = torch.ones(1, 4, dtype=torch.bool)
+    values = torch.tensor([[[[1.], [2.], [3.], [4.]]]])
+    grid = attention_sampling_grid(query, key, valid, 2, 2)
+    sampled = sample_attention_heads(values, grid, valid, 2, 2)
+    torch.testing.assert_close(sampled, values, rtol=0, atol=1e-5)
+
+
+def test_hard_coarse_route_and_local_residual_cannot_average_distant_modes():
+    query = torch.eye(4).reshape(1,1,4,4).requires_grad_(True)
+    key = query.detach().clone().requires_grad_(True)
+    valid = torch.ones(1,4,dtype=torch.bool)
+    coarse = hard_attention_sampling_grid(query,key,valid,2,2)
+    identity = LatentVTONPatchForcingTrainer._identity_sampling_grid(
+        (2,2), query.device
+    ).reshape(1,1,4,2)
+    torch.testing.assert_close(coarse, identity, rtol=0, atol=1e-6)
+    coarse.sum().backward()
+    assert query.grad is not None and key.grad is not None
+
+    # A fine query prefers the far-right key globally, but a radius-one residual around
+    # the identity base cannot jump there or average it with an unrelated garment part.
+    q = torch.tensor([[[[1.,0.]] * 5]])
+    k = torch.tensor([[[[-1.,0.],[-1.,0.],[-1.,0.],[-1.,0.],[1.,0.]]]])
+    base = LatentVTONPatchForcingTrainer._identity_sampling_grid(
+        (1,5), q.device
+    ).reshape(1,1,5,2)
+    local = local_attention_sampling_grid(q,k,torch.ones(1,5,dtype=torch.bool),base,1,5,1)
+    assert local[0,0,0,0] <= -.4 + 1e-6  # no farther than key 1
+
+    upsampled = upsample_displacement_grid(identity, (2,2), (4,4))
+    expected = LatentVTONPatchForcingTrainer._identity_sampling_grid(
+        (4,4), q.device
+    ).reshape(1,1,16,2)
+    torch.testing.assert_close(upsampled, expected, rtol=0, atol=1e-6)
+
+
+def test_fine_dense_pose_and_warp_adapters_are_zero_initialized():
+    refiner = GarmentLatentRefiner(32, width=32, heads=4, dense_pose_channels=4)
+    assert refiner.state.weight.shape[1] == 12
+    assert not refiner.state.weight.any()
+    assert not refiner.warp_mix.weight.any()
+    args = (
+        torch.randn(1, 12, 32), torch.randn(1, 4, 8, 6),
+        torch.randn(1, 4, 8, 6), torch.randn(1, 48, 32),
+        torch.randn(1, 48, 32), torch.ones(1, 1, 8, 6),
+        torch.ones(1, 1, 64, 48),
+    )
+    with pytest.raises(ValueError, match='requires DensePose'):
+        refiner(*args)
+    _, entry = refiner(*args, dense_pose=torch.randn(1, 4, 8, 6), return_supervision=True)
+    assert entry['sampling_grid'].shape == (1, 4, 48, 2)
+
+
+def test_fine_warp_helpers_identity_and_affine_bending():
+    module = trainer()
+    identity = module._identity_sampling_grid((2, 3), torch.device('cpu'))
+    sampling = identity.reshape(1, 1, 6, 2).requires_grad_(True)
+    source = torch.arange(12, dtype=torch.float32).reshape(1, 6, 2)
+    sampled = module._sample_fine_tokens(sampling, source, (2, 3))
+    torch.testing.assert_close(sampled[:, 0], source, rtol=0, atol=1e-6)
+    sampled.sum().backward()
+    assert sampling.grad is not None and torch.isfinite(sampling.grad).all()
+    weight = torch.ones(1, 6)
+    assert module._fine_warp_bending_loss(sampling.detach(), weight, (2, 3)) == 0
 
 
 def test_fixed_rgb_transport_penalizes_wrong_colour_and_has_qk_gradient():
@@ -636,6 +736,17 @@ def test_hf_control_experiment_is_separate_and_enabled_for_paired_and_swapped_da
     assert cfg.name.endswith('hf-control')
 
 
+def test_rgb_hf_experiment_uses_two_baseline_subtracted_vae_streams():
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
+        cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-512x384-detail-rgb-hf'])
+    assert cfg.model.params.garment_high_frequency_channels == 256
+    assert cfg.trainer.params.hf_detail_loss_weight > 0
+    assert cfg.data.params.train.params.garment_high_frequency_mode == 'rgb_dog_gradient'
+    assert cfg.data.params.validation.params.garment_high_frequency_mode == 'rgb_dog_gradient'
+    assert cfg.train_params.val_check_interval == 50
+    assert cfg.name.endswith('detail-rgb-hf')
+
+
 def test_cascade_experiment_does_not_repeat_previous_head_rebalance():
     with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
         cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-512x384-detail-cascade'])
@@ -646,6 +757,17 @@ def test_cascade_experiment_does_not_repeat_previous_head_rebalance():
     assert cfg.trainer.params.warm_start_refiner_output_gain == 1.0
     assert cfg.trainer.params.warm_start_high_frequency_output_gain == 1.0
     assert cfg.name.endswith('detail-cascade')
+
+
+def test_warp_experiment_enables_coherent_transport_losses():
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
+        cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-512x384-detail-warp'])
+    assert cfg.model.params.dense_pose_channels == 4
+    assert cfg.trainer.params.fine_correspondence_weight == .05
+    assert cfg.trainer.params.fine_warp_coordinate_weight > 0
+    assert cfg.trainer.params.fine_warp_smoothness_weight > 0
+    assert cfg.trainer.params.fine_warp_mask_weight > 0
+    assert cfg.name.endswith('detail-warp')
 
 
 class TinyDecoder(nn.Module):
