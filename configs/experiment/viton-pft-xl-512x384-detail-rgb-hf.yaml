@@ -13,8 +13,9 @@ model:
 
 trainer:
   params:
-    # A loss on the clean latent predicted from backbone.detach() + hf_velocity.
-    # Therefore this objective cannot be absorbed by the backbone or final refiner.
+    # A loss on the clean latent predicted from backbone.detach() + the ONE fine
+    # velocity decoded from fused RGB-warped + HF-warped features. The backbone
+    # cannot absorb this auxiliary objective; the joint refiner is intentionally trained.
     hf_detail_loss_weight: 0.5
     hf_detail_edge_weight: 5.0
     allow_new_garment_high_frequency: true

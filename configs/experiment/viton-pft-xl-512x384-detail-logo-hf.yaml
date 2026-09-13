@@ -1,0 +1,59 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384-detail-semantic-hf
+  - _self_
+
+name: vton/pft-xl-512x384-detail-logo-hf
+
+model:
+  params:
+    # Character strokes must follow the single coherent deformation grid. A second
+    # global A@V path averages unrelated cloth locations and turns text into glyph-like
+    # texture. The parameter remains checkpoint-compatible but is frozen and unused.
+    garment_high_frequency_global_attention: false
+
+trainer:
+  params:
+    # DINO remains a teacher only. Run it at 48x36 patches and preserve that denser cloth
+    # key grid instead of asking a 32x24 observation to identify tiny logo regions.
+    correspondence_teacher_input_size: [768, 576]
+    correspondence_garment_grid: [48, 36]
+
+    # Preserve the existing broad routing objective, but normalize an additional loss
+    # over active RGB-DoG/gradient pixels so a small logo cannot vanish inside a shirt.
+    hf_source_consistency_weight: 0.5
+    hf_source_sparse_weight: 1.0
+    hf_sparse_activity_threshold: 0.04
+    hf_sparse_support_radius: 3
+
+    # HF is fused into the coherently warped RGB garment features, then the ONE refiner
+    # velocity head reconstructs the residual. Keep this auxiliary latent term below the
+    # main flow loss; the previous weight 1.0 made the former standalone HF velocity
+    # dominate training and grow into an edge overlay.
+    hf_detail_loss_weight: 0.25
+
+    # Decode the joint RGB+HF refiner estimate. RGB keeps ink colour, opponent chroma
+    # keeps colour blocks, and edge keeps letter boundaries. One sample caps frozen-VAE
+    # activation memory on a 24 GB GPU.
+    hf_decoded_rgb_weight: 0.5
+    hf_decoded_chroma_weight: 0.5
+    hf_decoded_edge_weight: 0.5
+    hf_decoded_max_samples: 1
+
+    # This is a warm restart from a trained checkpoint, so only ramp the denser DINO
+    # route briefly instead of suppressing it for another thousand optimizer steps.
+    correspondence_warmup_steps: 100
+
+data:
+  params:
+    # Higher-resolution teacher features plus two checkpointed VAE decodes need the
+    # smaller micro-batch. Accumulation below keeps effective batch size at 32.
+    batch_size: 1
+
+lr_scheduler:
+  params:
+    num_warmup_steps: 100
+
+train_params:
+  accumulate_grad_batches: 32
+  val_check_interval: 50

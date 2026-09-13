@@ -10,6 +10,37 @@ from .pf_transformer import PatchForcingDiT, pf_modulate
 GARMENT_SCALES = ("coarse", "middle", "detail")
 
 
+def chunked_scaled_dot_product_attention(query, key, value, valid, chunk_size=512):
+    """Exact SDPA with a bounded query-axis working set.
+
+    At 1024x768 the latent detail grid contains 12,288 queries and keys. A boolean
+    padding mask makes some CUDA kernels materialise a multi-GiB score buffer. Query
+    chunks preserve the exact softmax (every chunk still sees every key) while capping
+    that temporary allocation. Concatenation is differentiable for Q, K and V.
+    """
+    chunk_size = int(chunk_size)
+    if chunk_size < 1:
+        raise ValueError("Attention query chunk size must be positive")
+    mask = valid[:, None, None, :]
+    if query.shape[-2] <= chunk_size:
+        return F.scaled_dot_product_attention(
+            query, key, value, attn_mask=mask, dropout_p=0.0,
+        )
+    return torch.cat(
+        [
+            F.scaled_dot_product_attention(
+                query[:, :, start : start + chunk_size],
+                key,
+                value,
+                attn_mask=mask,
+                dropout_p=0.0,
+            )
+            for start in range(0, query.shape[-2], chunk_size)
+        ],
+        dim=-2,
+    )
+
+
 def attention_sampling_grid(query, key, valid, height, width):
     """Return per-head soft-argmax garment coordinates without storing attention."""
     height, width = int(height), int(width)
@@ -152,7 +183,7 @@ class GarmentLatentRefiner(nn.Module):
 
     def __init__(self, backbone_dim, channels=4, width=256, heads=8, patch_size=2,
                  qk_norm=False, cosine_scale=10.0, dense_pose_channels=0,
-                 local_radius=2):
+                 local_radius=2, attention_query_chunk_size=512):
         super().__init__()
         if width < 1 or heads < 1 or width % heads or width // heads < 2:
             raise ValueError("Refiner width must be divisible by heads with at least two channels per head")
@@ -161,8 +192,11 @@ class GarmentLatentRefiner(nn.Module):
         self.patch_size = patch_size
         self.dense_pose_channels = int(dense_pose_channels)
         self.local_radius = int(local_radius)
+        self.attention_query_chunk_size = int(attention_query_chunk_size)
         if self.local_radius < 0:
             raise ValueError("Fine refiner local radius must be non-negative")
+        if self.attention_query_chunk_size < 1:
+            raise ValueError("Fine attention query chunk size must be positive")
         if self.dense_pose_channels not in (0, channels):
             raise ValueError("Fine DensePose channels must be zero or equal latent channels")
         self.qk_norm = bool(qk_norm)
@@ -182,9 +216,9 @@ class GarmentLatentRefiner(nn.Module):
         self.state = nn.Conv2d(channels * 2 + self.dense_pose_channels, width, 3, padding=1)
         nn.init.zeros_(self.state.weight)
         nn.init.zeros_(self.state.bias)
-        # The fine decoder must correct the velocity that will actually be integrated,
-        # not predict an independent residual in parallel. The first half is the
-        # backbone+HF preliminary velocity and the second half is its x1 estimate.
+        # The fine decoder corrects the backbone velocity that will be integrated. The
+        # first half is that preliminary velocity and the second half is its x1 estimate;
+        # RGB and HF garment evidence are fused in ``features`` instead of in velocity.
         # Zero initialisation makes this architecture checkpoint-compatible: before
         # the adapter learns, the old and new velocity sums are exactly identical.
         self.velocity_condition = nn.Conv2d(channels * 2, width, 3, padding=1)
@@ -274,8 +308,8 @@ class GarmentLatentRefiner(nn.Module):
             gain = math.sqrt(self.cosine_scale * math.sqrt(q.shape[-1]))
             q = (F.normalize(q.float(), dim=-1, eps=1e-6) * gain).to(q.dtype)
             k = (F.normalize(k.float(), dim=-1, eps=1e-6) * gain).to(k.dtype)
-        attended = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=valid[:, None, None, :], dropout_p=0.0,
+        attended = chunked_scaled_dot_product_attention(
+            q, k, v, valid, self.attention_query_chunk_size
         )
         coarse_height, coarse_width = ph, pw
         def pool_heads(tensor):
@@ -323,7 +357,7 @@ class GarmentLatentRefiner(nn.Module):
         }, active
 
     def refine(self, features, preliminary_velocity, preliminary_clean, edit, active):
-        """Decode a fine correction conditioned on the backbone+HF provisional flow.
+        """Decode fused RGB+HF garment features into one fine velocity correction.
 
         The caller stop-gradients the provisional tensors. The adapter learns how to
         correct the current state without using this conditioning shortcut to rewrite
@@ -364,12 +398,13 @@ class GarmentLatentRefiner(nn.Module):
 
 
 class GarmentHighFrequencyControl(nn.Module):
-    """Cloth HF control whose values come from the frozen pretrained SD-VAE encoder.
+    """High-resolution cloth-detail transport for fusion into the RGB refiner.
 
     Routing comes from the supervised detail refiner. Only HF content enters V; person
     features and position affect routing, never bypassing it into the output.
 
-    Values are centred across keys so the branch can only transport deviations from the
+    Values stay at the VAE 1/2-resolution until after the coherent spatial warp. They are
+    centred across keys so the branch can only transport deviations from the
     garment-mean edge response, which is what "high frequency" has to mean for a residual
     driven by attention that is not yet sharp. Unlike the refiner, whose value mean is the
     garment's base colour and must be kept, the HF mean carries no information.
@@ -383,37 +418,62 @@ class GarmentHighFrequencyControl(nn.Module):
     at exactly its initialisation rms (0.072657 against a theoretical 0.07217) while the
     head's own gradient decayed from 0.0146 to 0.0017 instead of growing. Zeroing the
     encoder keeps the branch's contribution exactly zero on the first step while leaving
-    ``output`` at standard initialisation, so gradient reaches the encoder immediately.
+    ``feature_out`` at standard initialisation, so gradient reaches the encoder immediately.
+    This module never predicts a four-channel velocity. Its output has ``width`` channels
+    and is added to the coherently warped RGB garment feature before the single refiner
+    velocity head. That prevents HF from degenerating into an independent edge overlay.
     """
 
-    def __init__(self, width, heads, channels=4, source_channels=128, patch_size=4):
+    def __init__(self, width, heads, channels=4, source_channels=128, patch_size=4,
+                 attention_query_chunk_size=512, use_global_attention=True):
         super().__init__()
         self.heads = heads
         self.width = width
         self.source_channels = int(source_channels)
         self.patch_size = int(patch_size)
-        self.encoder = nn.Conv2d(
-            self.source_channels, width, self.patch_size, stride=self.patch_size
+        self.attention_query_chunk_size = int(attention_query_chunk_size)
+        self.use_global_attention = bool(use_global_attention)
+        if self.attention_query_chunk_size < 1:
+            raise ValueError("HF attention query chunk size must be positive")
+        # Project without spatial decimation. The old kernel-4/stride-4 projection
+        # destroyed character strokes before routing. Zero-init here preserves the
+        # loaded model on step one while the nonzero downstream path supplies gradient.
+        self.encoder = nn.Conv2d(self.source_channels, width, 1)
+        self.high_local = nn.Sequential(
+            nn.GroupNorm(1, width), nn.SiLU(),
+            nn.Conv2d(width, width, 3, padding=1, groups=width, bias=False),
+        )
+        # Learn how each routed 4x4 high-resolution neighbourhood becomes one SD latent
+        # cell only after the warp has put its sub-cell phases in person coordinates.
+        self.downsample = nn.Conv2d(
+            width, width, self.patch_size, stride=self.patch_size
         )
         self.local = nn.Sequential(
             nn.GroupNorm(1, width), nn.SiLU(),
             nn.Conv2d(width, width, 3, padding=1, groups=width, bias=False), nn.SiLU(),
             nn.Conv2d(width, width, 1, bias=False),
         )
-        self.output = nn.Conv2d(width, channels, 1)
+        # Feature residual, not a standalone latent-velocity head. The zero gate remains
+        # on ``encoder`` so the warm-started RGB refiner is function-preserving while
+        # gradients reach the HF path on its first update.
+        self.feature_out = nn.Conv2d(width, width, 1)
         self.warp_mix = nn.Conv2d(width, width, 1)
         self.reset_zero_gate()
+        # Preserve state-dict compatibility while excluding an intentionally disabled
+        # global mixer from the optimizer.
+        self.warp_mix.requires_grad_(self.use_global_attention)
 
     def reset_zero_gate(self):
         """Make the branch contribute exactly zero without disabling its gradient.
 
         ``local`` is bias-free and GroupNorm's bias starts at zero, so zero encoder
-        output propagates as exact zero up to ``output``'s bias, which is zeroed too.
-        ``output.weight`` deliberately keeps its standard initialisation.
+        output propagates as exact zero up to ``feature_out``'s bias, which is zeroed too.
+        ``feature_out.weight`` deliberately keeps its standard initialisation.
         """
         nn.init.zeros_(self.encoder.weight)
         nn.init.zeros_(self.encoder.bias)
-        nn.init.zeros_(self.output.bias)
+        nn.init.zeros_(self.downsample.bias)
+        nn.init.zeros_(self.feature_out.bias)
         self.reset_warp_mix()
 
     def reset_warp_mix(self):
@@ -440,7 +500,6 @@ class GarmentHighFrequencyControl(nn.Module):
         if garment_mask is not None:
             active = active & garment_mask.flatten(1).ne(0).any(1)
         features = self.encoder(high_frequency)
-        values = features.flatten(2).transpose(1, 2)
         # Centre the values across the valid keys. A sparse edge map can otherwise give
         # its VAE features a large global mean: measured 0.5591 for the former Canny input
         # against -0.0102 for the garment features. Attention that is anywhere near
@@ -452,24 +511,54 @@ class GarmentHighFrequencyControl(nn.Module):
         # leaves the component shared by every token untouched, which measured 88.3% of
         # the signal before and 93.3% after. The mean has to be removed across keys, and
         # only over valid ones so background tokens do not drag it.
-        key_mask = valid[..., None].to(values.dtype)
-        mean = (values * key_mask).sum(1, keepdim=True) / key_mask.sum(1, keepdim=True).clamp_min(1)
-        values = values - mean
-        values = values.reshape(batch, height * width, self.heads, -1).transpose(1, 2)
-        attended = F.scaled_dot_product_attention(
-            query, key, values.to(query.dtype), attn_mask=valid[:, None, None, :], dropout_p=0.0,
+        high_mask_source = (
+            valid.reshape(batch, 1, height, width).float()
+            if garment_mask is None else garment_mask.float()
         )
+        high_valid = F.interpolate(
+            high_mask_source, (source_height, source_width), mode="nearest"
+        ) > 0.5
+        key_mask = high_valid.to(features.dtype)
+        mean = (features * key_mask).sum((2, 3), keepdim=True) / key_mask.sum(
+            (2, 3), keepdim=True
+        ).clamp_min(1)
+        features = (features - mean) * key_mask
+        features = features + self.high_local(features)
+        values = features.flatten(2).transpose(1, 2)
+        values = values.reshape(
+            batch, source_height * source_width, self.heads, -1
+        ).transpose(1, 2)
+        attended = None
+        if self.use_global_attention:
+            low_values = F.avg_pool2d(
+                features, self.patch_size, self.patch_size
+            ).flatten(2).transpose(1, 2)
+            low_values = low_values.reshape(
+                batch, height * width, self.heads, -1
+            ).transpose(1, 2)
+            attended = chunked_scaled_dot_product_attention(
+                query, key, low_values.to(query.dtype), valid,
+                self.attention_query_chunk_size,
+            )
         if sampling_grid is None:
             sampling_grid = attention_sampling_grid(query, key, valid, height, width)
-        warped = sample_attention_heads(
-            values.to(query.dtype), sampling_grid, valid, height, width
+        high_sampling_grid = upsample_displacement_grid(
+            sampling_grid, (height, width), (source_height, source_width)
         )
-        attended = attended.transpose(1, 2).reshape(batch, height * width, -1)
-        warped = warped.transpose(1, 2).reshape(batch, height * width, -1)
-        attended = attended.transpose(1, 2).reshape(batch, -1, height, width)
-        warped = warped.transpose(1, 2).reshape(batch, -1, height, width)
-        features = warped + self.warp_mix(attended - warped)
-        residual = self.output(features + self.local(features))
+        warped_high = sample_attention_heads(
+            values.to(query.dtype), high_sampling_grid,
+            high_valid.flatten(1), source_height, source_width,
+        )
+        warped_high = warped_high.transpose(1, 2).reshape(
+            batch, source_height * source_width, self.width
+        ).transpose(1, 2).reshape(batch, self.width, source_height, source_width)
+        warped = self.downsample(warped_high)
+        features = warped
+        if attended is not None:
+            attended = attended.transpose(1, 2).reshape(batch, height * width, -1)
+            attended = attended.transpose(1, 2).reshape(batch, -1, height, width)
+            features = warped + self.warp_mix(attended - warped)
+        residual = self.feature_out(features + self.local(features))
         gate = F.interpolate(edit.float(), (height, width), mode="area").clamp(0, 1)
         return residual * gate.to(residual.dtype) * active[:, None, None, None].to(residual.dtype)
 
@@ -573,7 +662,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
     ``detail``  VAE encoder 1/2-resolution feature map, the finest appearance carrier
 
     A 4-channel DensePose VAE latent can be appended to the input projection.
-    Optional target-cloth HF conditioning uses a separate zero-output velocity branch.
+    Optional target-cloth HF conditioning is fused into the RGB garment refiner.
 
     Every branch's tokens are LayerNormed before the positional embedding is added
     (``garment_token_norm``), so key magnitude is set by the model rather than by the SD
@@ -609,6 +698,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         garment_refiner_qk_norm=False,
         garment_refiner_cosine_scale=10.0,
         garment_refiner_local_radius=2,
+        garment_refiner_attention_chunk_size=512,
+        garment_high_frequency_global_attention=True,
         pretrained_ckpt=None,
         pretrained_use_ema=True,
         **kwargs,
@@ -731,6 +822,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 qk_norm=garment_refiner_qk_norm, cosine_scale=garment_refiner_cosine_scale,
                 dense_pose_channels=self.dense_pose_channels,
                 local_radius=garment_refiner_local_radius,
+                attention_query_chunk_size=garment_refiner_attention_chunk_size,
             )
 
         self.garment_high_frequency_control = None
@@ -740,6 +832,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             self.garment_high_frequency_control = GarmentHighFrequencyControl(
                 garment_refiner_width, garment_refiner_heads, self.state_channels,
                 source_channels=garment_high_frequency_channels,
+                attention_query_chunk_size=garment_refiner_attention_chunk_size,
+                use_global_attention=garment_high_frequency_global_attention,
             )
 
         if pretrained_ckpt is not None:
@@ -1053,9 +1147,9 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 )
             else:
                 x = output
-        # Decode the backbone first. HF alters that provisional flow, then the fine
-        # branch sees and corrects the result. This replaces the old blind parallel sum
-        # (backbone + fine + HF) with backbone -> HF -> fine refinement.
+        # Decode the backbone first. Fine and HF both reuse the supervised coherent
+        # route, but fine is deliberately conditioned on the backbone alone: otherwise
+        # it can learn to cancel the sparse HF residual without improving reconstruction.
         prediction = self.final_layer(x, cond)
         prediction = self._unpatchify_rectangular(prediction, height, width)
         logvar_theta = prediction[:, -1:, :, :]
@@ -1076,7 +1170,9 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 fine_features, fine_entry, fine_active = self.garment_refiner.route(*route_args)
             if return_refiner_supervision:
                 attention_maps.append(fine_entry)
-            pre_hf_velocity = velocity
+            backbone_velocity = velocity
+            rgb_warped_features = fine_features
+            hf_warped_features = None
             if self.garment_high_frequency_control is not None:
                 # Reuse the detail refiner's RGB/correspondence-supervised routing, but
                 # do not let the auxiliary HF residual rewrite that routing.  The same
@@ -1087,16 +1183,14 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                            fine_entry["key_valid"], edit_mask, garment_mask,
                            fine_entry["sampling_grid"].detach())
                 if self.gradient_checkpointing and self.training:
-                    hf_velocity = checkpoint(self.garment_high_frequency_control, *hf_args, use_reentrant=False)
+                    hf_warped_features = checkpoint(
+                        self.garment_high_frequency_control, *hf_args, use_reentrant=False
+                    )
                 else:
-                    hf_velocity = self.garment_high_frequency_control(*hf_args)
-                velocity = velocity + hf_velocity
-                if return_refiner_supervision:
-                    # The trainer detaches pre_hf_velocity and gives this component a
-                    # latent detail objective of its own. This prevents the backbone or
-                    # final refiner from absorbing the logo loss while HF stays idle.
-                    fine_entry["pre_hf_velocity"] = pre_hf_velocity
-                    fine_entry["hf_velocity"] = hf_velocity
+                    hf_warped_features = self.garment_high_frequency_control(*hf_args)
+                # HF augments the RGB/VAE garment representation. There is deliberately
+                # no independent HF velocity that could appear as an edge overlay.
+                fine_features = rgb_warped_features + hf_warped_features
 
             token_height = height // self.patch_size
             token_width = width // self.patch_size
@@ -1104,9 +1198,13 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             time_latent = time_latent.repeat_interleave(
                 self.patch_size, -2
             ).repeat_interleave(self.patch_size, -1).to(velocity.dtype)
-            preliminary_clean = noisy_latent + (1 - time_latent) * velocity
+            # A single refiner decodes the fused RGB + HF garment representation into
+            # one fine velocity residual. Its state condition remains backbone-only;
+            # garment appearance reaches the output only through transported features.
+            refiner_velocity = backbone_velocity
+            preliminary_clean = noisy_latent + (1 - time_latent) * refiner_velocity
             refine_args = (
-                fine_features, velocity.detach(), preliminary_clean.detach(),
+                fine_features, refiner_velocity.detach(), preliminary_clean.detach(),
                 edit_mask, fine_active,
             )
             if self.gradient_checkpointing and self.training:
@@ -1115,7 +1213,13 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 )
             else:
                 fine_velocity = self.garment_refiner.refine(*refine_args)
-            velocity = velocity + fine_velocity
+            velocity = backbone_velocity + fine_velocity
+            if return_refiner_supervision:
+                fine_entry["pre_refiner_velocity"] = backbone_velocity
+                fine_entry["fine_velocity"] = fine_velocity
+                fine_entry["rgb_warped_features"] = rgb_warped_features
+                if hf_warped_features is not None:
+                    fine_entry["hf_warped_features"] = hf_warped_features
         if return_garment_attention:
             if return_uncertainty:
                 return velocity, logvar_theta, attention_maps

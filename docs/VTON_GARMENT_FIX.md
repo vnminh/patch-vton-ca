@@ -1,5 +1,9 @@
 # Garment supervision fixes
 
+> **Phạm vi:** đây là revision nền về mask và supervision. Các invariant mask
+> vẫn được dùng, nhưng experiment/lệnh resume bên dưới là lịch sử. Kiến trúc và
+> lệnh hiện tại nằm tại [`ARCHITECTURE_VI.md`](ARCHITECTURE_VI.md).
+
 Use `experiment=viton-pft-xl-512x384-garment-fix`. The existing 512x384
 experiment is retained as a baseline. The new experiment preserves the model's
 parameter shapes and optimizer groups, so the existing full checkpoint can resume.

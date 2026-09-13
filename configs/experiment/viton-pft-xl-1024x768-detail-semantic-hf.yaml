@@ -1,0 +1,50 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384-detail-semantic-hf
+  - _self_
+
+name: vton/pft-xl-1024x768-detail-semantic-hf
+
+model:
+  params:
+    # The final accumulation micro-batch also carries synchronization/gradient state.
+    # 128-query chunks cap each masked SDPA score workspace near 48 MiB instead of
+    # the 192 MiB required by the default 512-query chunk.
+    garment_refiner_attention_chunk_size: 128
+
+data:
+  params:
+    # A 1024x768 image produces a 128x96 VAE latent and 64x48 routed tokens.
+    # Batch one is the safe starting point on the 24 GB RTX 3090.
+    batch_size: 1
+    val_batch_size: 1
+    train:
+      params:
+        image_size: [1024, 768]
+    validation:
+      params:
+        image_size: [1024, 768]
+        # Keep the full-resolution preview panel bounded: four test identities each
+        # emit paired/unpaired rows, plus two paired training examples.
+        test_samples: 4
+        train_samples: 2
+
+trainer:
+  params:
+    # At full resolution scale=1 already supervises a 128x96 detail grid, equal in
+    # absolute size to scale=2 in the 512x384 experiment and substantially cheaper
+    # than an unnecessary 256x192 source-consistency grid.
+    hf_source_consistency_scale: 1
+    max_validation_previews: 10
+    # The trainable model, flow/HF objectives and generated result stay 1024x768.
+    # Decode only the auxiliary whole-edit RGB/edge loss at half resolution so its
+    # backward also fits after gradients already exist during accumulation.
+    decoded_supervision_image_size: [512, 384]
+
+train_params:
+  # Preserve the effective global batch of 32 with a one-image micro-batch.
+  accumulate_grad_batches: 32
+  # Generation at 1024x768 is expensive, so avoid interrupting training every 50
+  # updates while retaining frequent-enough visual checks.
+  val_check_interval: 100
+  limit_val_batches: 10

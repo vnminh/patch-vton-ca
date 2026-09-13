@@ -195,17 +195,38 @@ You can use `scripts/t2i_sample.py` to sample images based on a text prompt.
 
 ### Virtual Try-On
 
-The VTON extension fine-tunes the released PFT-XL checkpoint with a mask-constrained flow, a zero-initialized agnostic-person condition, and routed garment cross-attention. The edit mask is applied before VAE encoding, and only the agnostic latent is used as model context; the complete paired image is used only as the supervised target and final RGB reference. `experiment=viton-pft-xl` uses the native 256x256 PFT latent grid; `experiment=viton-pft-xl-512x384` trains at 512x384.
+The VTON extension fine-tunes the released PFT-XL checkpoint with mask-constrained
+flow, agnostic-person and DensePose conditions, multiscale garment attention, and a
+full-latent detail refiner. The current logo experiment is
+`viton-pft-xl-512x384-detail-logo-hf`. Start with the ordered
+[`docs index`](docs/README.md), then read the current
+[`architecture guide`](docs/ARCHITECTURE_VI.md). Older experiment names below are
+retained for reproducibility and do not describe the complete fused-HF graph.
 
-Garment appearance travels on three SD-VAE branches, routed one per cross-attention block: the garment latent, the encoder's 1/4-resolution map, and its 1/2-resolution map. These are what make logos, printed text, and colour blocking reproducible, because they are reconstruction-faithful rather than appearance-invariant. Configure the assignment with `model.params.garment_scale_routes`.
+The edit mask is applied before VAE encoding, and only the agnostic latent is used
+as person-image context; the complete paired image is used as supervised target and
+final RGB reference, never as inference conditioning.
 
-Garment/body correspondence is supervised rather than conditioned on, by four losses on the cross-attention maps themselves. A frozen DINOv3 teacher matches each editable person token to a garment token by cosine similarity on the ground-truth pair; a **target-mass** term (the primary one) maximises the attention mass landing within a radius of that key, a **centre-of-mass** term adds a smooth long-range pull, and an **entropy** term removes diffuse answers. A fourth **photometric** term needs no teacher at all: the mass-weighted garment colour a person token retrieves must match the colour that token has in the ground-truth worn image. All of this is training-time only — the teacher never feeds the network, and inference needs nothing but the SD VAE.
+Garment appearance travels on three SD-VAE branches, routed one per cross-attention
+block: garment latent, encoder 1/4-resolution, and encoder 1/2-resolution detail.
+After the DiT, coherent RGB and signed-RGB HF transports are fused at 64x48 before
+one shared refiner predicts `fine_velocity`. There is no standalone HF velocity head.
+Configure backbone assignment with `model.params.garment_scale_routes`.
+
+Garment/body correspondence is supervised rather than supplied as an inference
+condition. A frozen DINOv3 teacher provides sparse geometric anchors during training;
+paired RGB/VAE transport, coordinate, mask and smoothness losses refine the coherent
+grid below DINO resolution. At inference the teacher and ground-truth person garment
+mask are absent; the model uses person agnostic, DensePose, in-shop garment, garment
+mask, and HF computed from that same garment.
 
 The barycentre term alone is not enough, and measurably so: a map can be sharp (3.8 effective keys of 768) and barycentre-correct (1.7 tokens off) while placing its peak 4.5 tokens away with 5% of its mass on the target. That straddling map retrieves a *blend* of two fabrics, which is how a navy-and-lavender garment renders as uniform violet. See [`docs/VTON_PFT_DESIGN.md`](docs/VTON_PFT_DESIGN.md) §10.4.
 
 The edit mask is the token-grid rounding of the supplied agnostic mask, with no dilation, and dilation is not configurable. On VITON-HD, one token of dilation grew the editable region from 37.6% to 60.0% of the frame and left ~15% of it regenerated with no pixel conditioning, which cost identity around the jaw, neck, and hair.
 
-See [`docs/VTON_PFT_DESIGN.md`](docs/VTON_PFT_DESIGN.md) for the complete timestep equations, architecture, conditioning paths, losses, leakage analysis, and adaptive sampler design.
+See [`docs/ARCHITECTURE_VI.md`](docs/ARCHITECTURE_VI.md) for the current graph and
+[`docs/VTON_PFT_DESIGN.md`](docs/VTON_PFT_DESIGN.md) for the baseline flow equations,
+leakage analysis, and adaptive sampler design.
 
 Prepare VITON-HD with `image`, `cloth`, `agnostic-mask`, and `cloth-mask` directories under each split, then set the dataset and pretrained checkpoint paths:
 
@@ -292,6 +313,13 @@ python train.py experiment=viton-pft-xl-smoke16gb \
 `checkpoint_params.save_top_k` controls checkpoint retention. Its default value of `1` keeps only the newest numbered checkpoint, with `checkpoints/last.ckpt` pointing to it.
 
 The 512-by-384 experiment encodes garments online with the VAE pyramid. Three settings there are worth knowing about:
+
+The current logo-HF variant uses a single detail residual: coherently warped RGB/VAE
+features are added to warped signed-RGB HF features, then one shared refiner predicts
+`fine_velocity`; the final output is `backbone_velocity + fine_velocity`. HF is neither
+an `x_embedder` input channel nor an independent velocity head. See
+[`docs/VTON_HF_CONTROL.md`](docs/VTON_HF_CONTROL.md) for the graph, checkpoint migration,
+supervision boundaries, and restart command.
 
 - **Batch size 8 with four-step accumulation** (global batch 32). The `detail` branch contributes 3072 garment keys per routed block instead of 768, so activation memory is high. This is a conservative starting point — measure peak memory and raise it if there is headroom. If it does not fit, halve the batch and double the accumulation before changing the routing.
 - **`correspondence_scales: [coarse, detail]`.** Correspondence supervision needs the full attention matrix, which disables fused attention for the blocks it touches, so not every branch can be supervised at once. `detail` must be one of them: routed to 6 of 14 blocks and the largest single contributor to garment influence (15.6% of the predicted velocity), it was measured spreading its attention over 500–1060 of 3072 keys with 0.4–0.7% of mass on target — a near-uniform average of the garment, i.e. the mean-colour path itself. `middle` is dropped instead, being the least region-separable of the three branches. `correspondence_warmup_steps: 1000` ramps the losses in so attention is not pinned before the freshly initialised garment embedders produce anything worth pointing at.

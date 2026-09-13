@@ -119,7 +119,7 @@ def test_high_frequency_control_preserves_13_inputs_and_warm_starts(ema_rate):
     # The zero sits on the encoder, not the head: the head must keep a usable
     # initialisation or nothing upstream of it ever receives gradient.
     assert not new.model.garment_high_frequency_control.encoder.weight.any()
-    assert new.model.garment_high_frequency_control.output.weight.any()
+    assert new.model.garment_high_frequency_control.feature_out.weight.any()
     if ema_rate:
         assert not new.ema_model.garment_high_frequency_control.encoder.weight.any()
 
@@ -144,7 +144,7 @@ def test_high_frequency_control_preserves_13_inputs_and_warm_starts(ema_rate):
     torch.testing.assert_close(new.model.x_embedder.proj.weight, old_weight, rtol=0, atol=0)
     new.load_state_dict(new.state_dict(), strict=True)
     partial = new.state_dict()
-    del partial['model.garment_high_frequency_control.output.bias']
+    del partial['model.garment_high_frequency_control.feature_out.bias']
     with pytest.raises(RuntimeError, match='Missing key'):
         new.load_state_dict(partial, strict=True)
 
@@ -174,7 +174,7 @@ def test_garment_gradient_norms_cover_every_conditioning_branch():
     # zero and every gradient with it. Regress against a target instead.
     (velocity - torch.randn_like(velocity)).square().mean().backward()
     metrics = module.garment_gradient_norms()
-    for key in ('garment_grad/hf/encoder', 'garment_grad/hf/output',
+    for key in ('garment_grad/hf/encoder', 'garment_grad/hf/feature_out',
                 'garment_grad/refiner/state', 'garment_grad/refiner/velocity_condition',
                 'garment_grad/refiner/query',
                 'garment_grad/embedder_detail'):
@@ -185,7 +185,7 @@ def test_garment_gradient_norms_cover_every_conditioning_branch():
     assert metrics['garment_grad/hf/encoder'] > 0
     assert metrics['garment_grad/refiner/state'] > 0
     assert metrics['garment_grad/refiner/velocity_condition'] > 0
-    assert metrics['garment_grad/hf/output'] == 0
+    assert metrics['garment_grad/hf/feature_out'] == 0
 
 
 def test_hf_values_follow_the_shared_coherent_sampling_grid():
@@ -212,7 +212,7 @@ def test_hf_values_follow_the_shared_coherent_sampling_grid():
 
 
 @pytest.mark.parametrize('gains', [(1., 1.), (10., .25)])
-def test_warm_start_velocity_head_gains_are_explicit_and_weight_only(gains):
+def test_warm_start_refiner_and_hf_feature_gains_are_explicit_and_weight_only(gains):
     refiner_gain, hf_gain = gains
     net = model(refiner=True, garment_high_frequency_channels=8)
     module = LatentVTONPatchForcingTrainer(
@@ -225,9 +225,9 @@ def test_warm_start_velocity_head_gains_are_explicit_and_weight_only(gains):
         warm_start_high_frequency_output_gain=hf_gain,
     )
     state = module.state_dict()
-    # A trained-looking pair of heads, as a real checkpoint would carry.
+    # A trained-looking velocity head and HF feature projection.
     for key, value in (('model.garment_refiner.output.weight', .000792),
-                       ('model.garment_high_frequency_control.output.weight', .031433)):
+                       ('model.garment_high_frequency_control.feature_out.weight', .031433)):
         state[key] = torch.full_like(state[key], value)
     state['model.garment_refiner.output.bias'] = torch.full_like(
         state['model.garment_refiner.output.bias'], .5)
@@ -235,9 +235,9 @@ def test_warm_start_velocity_head_gains_are_explicit_and_weight_only(gains):
     torch.testing.assert_close(module.model.garment_refiner.output.weight,
                                torch.full_like(state['model.garment_refiner.output.weight'],
                                                .000792 * refiner_gain))
-    torch.testing.assert_close(module.model.garment_high_frequency_control.output.weight,
+    torch.testing.assert_close(module.model.garment_high_frequency_control.feature_out.weight,
                                torch.full_like(
-                                   state['model.garment_high_frequency_control.output.weight'],
+                                   state['model.garment_high_frequency_control.feature_out.weight'],
                                    .031433 * hf_gain))
     # Biases are never touched, and a zero head stays zero under any gain.
     torch.testing.assert_close(module.model.garment_refiner.output.bias,
@@ -274,16 +274,19 @@ def test_previous_hf_revision_checkpoint_loads_by_discarding_the_whole_branch():
     # Its bias-carrying local block, which the current revision dropped.
     legacy[prefix + 'local.2.bias'] = torch.randn(32)
     legacy[prefix + 'local.4.bias'] = torch.randn(32)
-    # Colliding tensors that must not keep the branch alive.
-    nn.init.normal_(module.model.garment_high_frequency_control.output.bias, std=.1)
-    legacy[prefix + 'output.bias'] = module.model.garment_high_frequency_control.output.bias.clone()
+    # Replace the current feature projection with the previous four-channel velocity
+    # head. Its incompatible state must reset the whole HF feature branch.
+    for key in [name for name in legacy if name.startswith(prefix + 'feature_out.')]:
+        del legacy[key]
+    legacy[prefix + 'output.weight'] = torch.randn(4, 32, 1, 1)
+    legacy[prefix + 'output.bias'] = torch.randn(4)
 
     with pytest.warns(UserWarning):
         module.load_state_dict(legacy, strict=True)
     control = module.model.garment_high_frequency_control
     assert not control.encoder.weight.any() and not control.encoder.bias.any()
-    assert not control.output.bias.any()
-    assert control.output.weight.any()
+    assert not control.feature_out.bias.any()
+    assert control.feature_out.weight.any()
 
     data = inputs()
     module.model.eval()
@@ -296,8 +299,9 @@ def test_previous_hf_revision_checkpoint_loads_by_discarding_the_whole_branch():
     assert not residual[0].any()
 
 
-def test_hf_control_adds_velocity_only_and_trains_encoder_from_first_step():
+def test_hf_features_fuse_into_the_single_refiner_velocity():
     net = model(refiner=True, garment_high_frequency_channels=8).train()
+    nn.init.normal_(net.garment_refiner.output.weight, std=.05)
     data = inputs()
     data['edit_mask'] = torch.ones(2, 1, 8, 6)
     data['edit_mask'][0, :, :, 3:] = 0
@@ -322,17 +326,19 @@ def test_hf_control_adds_velocity_only_and_trains_encoder_from_first_step():
             baseline, baseline_logvar = net(
                 **data, garment_high_frequency=torch.zeros_like(hf), return_uncertainty=True
             )
-        torch.testing.assert_close(velocity, baseline + captured[0])
+        if step == 0:
+            torch.testing.assert_close(velocity, baseline)
+        else:
+            assert not torch.allclose(velocity, baseline)
         torch.testing.assert_close(logvar, baseline_logvar, rtol=0, atol=0)
+        assert captured[0].shape[1] == net.garment_refiner.width
         assert not captured[0][0, :, :, 3:].any()
         (velocity - torch.randn_like(velocity)).square().mean().backward()
-        # The point of moving the zero off the head: the encoder is trainable from the
-        # very first step instead of waiting for a zero head that never grew. The head's
-        # weight has no gradient until the encoder output is non-zero, which costs one
-        # step; its bias carries gradient immediately.
+        # The zero sits on the feature encoder; the trained RGB refiner sends gradient
+        # through the standard-initialized feature projection immediately.
         assert control.encoder.weight.grad.abs().sum() > 0
-        assert control.output.bias.grad.abs().sum() > 0
-        assert (control.output.weight.grad.abs().sum() > 0) == bool(step)
+        assert control.feature_out.bias.grad.abs().sum() > 0
+        assert (control.feature_out.weight.grad.abs().sum() > 0) == bool(step)
         optimizer.step()
         net.zero_grad(set_to_none=True)
     assert not torch.allclose(control.encoder(hf), control.encoder(hf.roll(1, -1)))
@@ -346,8 +352,8 @@ def test_hf_control_adds_velocity_only_and_trains_encoder_from_first_step():
     assert all(not value.any() for value in args)
 
 
-def test_hf_velocity_conditions_fine_refiner_as_a_cascade():
-    """HF must change the fine correction, not remain a blind parallel addend."""
+def test_hf_features_change_only_the_single_fused_refiner_output():
+    """HF must augment RGB features before, not velocity after, the refiner."""
     torch.manual_seed(9)
     net = model(refiner=True, garment_high_frequency_channels=8).eval()
     data = inputs()
@@ -375,16 +381,13 @@ def test_hf_velocity_conditions_fine_refiner_as_a_cascade():
 
     assert len(condition_inputs) == len(fine_outputs) == len(hf_outputs) == 2
     assert not hf_outputs[0].any() and hf_outputs[1].abs().sum() > 0
-    # velocity_condition receives [backbone + HF velocity, provisional clean x1].
+    # The state condition stays backbone-only, while HF changes the one refiner output.
+    torch.testing.assert_close(condition_inputs[1], condition_inputs[0])
+    assert hf_outputs[1].shape[1] == net.garment_refiner.width
+    assert not torch.allclose(fine_outputs[1], fine_outputs[0])
     torch.testing.assert_close(
-        condition_inputs[1][:, :4] - condition_inputs[0][:, :4], hf_outputs[1]
+        output_with_hf - output_without_hf, fine_outputs[1] - fine_outputs[0]
     )
-    torch.testing.assert_close(
-        condition_inputs[1][:, 4:] - condition_inputs[0][:, 4:], .5 * hf_outputs[1]
-    )
-    assert not torch.allclose(fine_outputs[0], fine_outputs[1])
-    # The final change is HF plus an HF-conditioned fine correction, not HF alone.
-    assert not torch.allclose(output_with_hf - output_without_hf, hf_outputs[1])
 
 
 def test_existing_hf_checkpoint_warm_starts_zero_cascade_adapter():
@@ -745,6 +748,49 @@ def test_rgb_hf_experiment_uses_two_baseline_subtracted_vae_streams():
     assert cfg.data.params.validation.params.garment_high_frequency_mode == 'rgb_dog_gradient'
     assert cfg.train_params.val_check_interval == 50
     assert cfg.name.endswith('detail-rgb-hf')
+
+
+def test_semantic_hf_experiment_enables_pretrained_encoder_and_source_transport():
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
+        cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-512x384-detail-semantic-hf'])
+    assert cfg.trainer.params.learnable_hf_condition_encoder
+    assert 0 < cfg.trainer.params.hf_condition_encoder_lr_multiplier < 1
+    assert cfg.trainer.params.hf_source_consistency_weight > 0
+    assert cfg.trainer.params.hf_source_consistency_scale == 2
+    assert cfg.name.endswith('detail-semantic-hf')
+
+
+def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
+        cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-512x384-detail-logo-hf'])
+    assert not cfg.model.params.garment_high_frequency_global_attention
+    assert cfg.trainer.params.hf_source_sparse_weight > 0
+    assert cfg.trainer.params.hf_decoded_rgb_weight > 0
+    assert cfg.trainer.params.hf_decoded_chroma_weight > 0
+    assert cfg.trainer.params.hf_decoded_edge_weight > 0
+    assert list(cfg.trainer.params.correspondence_teacher_input_size) == [768, 576]
+    assert list(cfg.trainer.params.correspondence_garment_grid) == [48, 36]
+    assert cfg.data.params.batch_size == 1
+    assert cfg.train_params.accumulate_grad_batches == 32
+    assert cfg.data.params.batch_size * cfg.train_params.accumulate_grad_batches == 32
+    assert cfg.lr_scheduler.params.num_warmup_steps == 100
+    assert cfg.name.endswith('detail-logo-hf')
+
+
+def test_full_resolution_semantic_hf_experiment_preserves_effective_batch():
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
+        cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-1024x768-detail-semantic-hf'])
+    assert list(cfg.data.params.train.params.image_size) == [1024, 768]
+    assert list(cfg.data.params.validation.params.image_size) == [1024, 768]
+    assert cfg.data.params.batch_size == 1
+    assert cfg.train_params.accumulate_grad_batches == 32
+    assert cfg.data.params.batch_size * cfg.train_params.accumulate_grad_batches == 32
+    assert cfg.model.params.garment_refiner_attention_chunk_size == 128
+    assert cfg.trainer.params.hf_source_consistency_scale == 1
+    assert list(cfg.trainer.params.decoded_supervision_image_size) == [512, 384]
+    assert cfg.data.params.validation.params.test_samples == 4
+    assert cfg.data.params.validation.params.train_samples == 2
+    assert cfg.name.endswith('1024x768-detail-semantic-hf')
 
 
 def test_cascade_experiment_does_not_repeat_previous_head_rebalance():

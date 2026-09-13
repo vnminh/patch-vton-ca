@@ -1,396 +1,208 @@
-# Luồng dữ liệu chi tiết của mô hình VTON-PFT
+# Tensor flow và shape reference
 
-Tài liệu mô tả **shape thực tế** của từng tensor đi qua mô hình, lấy theo cấu hình
-đang chạy: `configs/experiment/viton-pft-xl-512x384-detail.yaml`
-(kế thừa `...-garment-fix` → `...-512x384`).
+Đây là bảng tra cứu shape cho kiến trúc hiện tại. Đọc mô hình tổng thể tại
+[`ARCHITECTURE_VI.md`](ARCHITECTURE_VI.md) trước khi dùng tài liệu này.
 
-Ký hiệu chung:
+Config tham chiếu:
 
-| Tên | Giá trị | Nguồn |
-|---|---|---|
-| `B` | batch (1/GPU, `accumulate_grad_batches: 32`) | `configs/experiment/viton-pft-xl-512x384-detail.yaml` |
-| Ảnh | `512 x 384` (H x W, letterbox) | `configs/data/vitonhd512x384-garment.yaml` |
-| Latent | `64 x 48`, 4 kênh (VAE stride 8) | `sd_ae` |
-| `p` (patch) | 2 | `configs/model/vton-pft-xl.yaml` |
-| Lưới token | `32 x 24` = **768 token** | latent / p |
-| `D` (hidden) | 1152, `depth` 28, `heads` 16 | PFT-XL |
-
----
-
-## 1. Dataset → batch
-
-`patch_flow/vton_data.py::VTONHDDataset.__getitem__`
-
-Người và áo được letterbox độc lập, rồi **shift/scale ngẫu nhiên riêng biệt**
-(kiểu StableVITON) để correspondence không suy biến thành toạ độ tuyệt đối.
-
-| Khoá | Shape | Miền giá trị |
-|---|---|---|
-| `image` / `person` | `(B,3,512,384)` | `[-1,1]` |
-| `person_agnostic` | `(B,3,512,384)` | `person * (1 - agnostic_mask)` |
-| `garment` | `(B,3,512,384)` | `[-1,1]` |
-| `agnostic_mask` | `(B,1,512,384)` | `{0,1}` — vùng cần sinh |
-| `garment_mask` | `(B,1,512,384)` | `{0,1}` — pixel áo hợp lệ |
-| `person_garment_mask` | `(B,1,512,384)` | parse label `[5,6,7]`, **chỉ dùng cho loss** |
-| `has_ground_truth` | `(B,)` bool | `person_name == garment_name` |
-
----
-
-## 2. Encode VAE
-
-`patch_flow/trainer_vton.py::_encode_batch` + `patch_flow/vae_features.py::encode_vae_pyramid`
-
-### 2.1 Nhánh người
-
-```
-image           (B,3,512,384) --VAE.encode--> target          (B,4,64,48)
-person_agnostic (B,3,512,384) --VAE.encode--> agnostic_latent (B,4,64,48)
-person_context = agnostic_latent * (1 - masks.latent)          (B,4,64,48)
+```text
+viton-pft-xl-512x384-detail-logo-hf
 ```
 
-### 2.2 Kim tự tháp VAE của áo (`encode_vae_pyramid`)
+Ký hiệu: `B` là microbatch; config hiện tại dùng `B=1`, accumulation 32.
 
-Tap trực tiếp vào `encoder.down[*]` của SD-VAE, **một lần forward**:
+## 1. Dataset output
 
-```
-garment (B,3,512,384)
-  ├── sau down[0]  → detail  (B,128,256,192)   # 1/2 độ phân giải
-  ├── sau down[1]  → middle  (B,256,128, 96)   # 1/4 độ phân giải
-  └── mid + conv_out + quant_conv
-                   → garment_latent (B,4,64,48)  # đã (x + shift) * scale
-```
+| Key | Shape | Range / vai trò |
+|---|---:|---|
+| `image`, `person` | `B x 3 x 512 x 384` | `[-1,1]`, target paired khi train |
+| `person_agnostic` | `B x 3 x 512 x 384` | người đã xoá vùng edit |
+| `garment` | `B x 3 x 512 x 384` | ảnh garment in-shop |
+| `agnostic_mask` | `B x 1 x 512 x 384` | vùng được chỉnh |
+| `garment_mask` | `B x 1 x 512 x 384` | foreground của garment in-shop |
+| `person_garment_mask` | `B x 1 x 512 x 384` | mask supervision, không feed model |
+| `dense_pose` | `B x 3 x 512 x 384` | DensePose RGB đã transform cùng person |
+| `garment_high_frequency` | `B x 6 x 512 x 384` | signed RGB DoG + gradient |
+| `person_high_frequency` | `B x 6 x 512 x 384` | paired target cho source-consistency |
 
-### 2.3 Ba loại mask (`patch_flow/vton_utils.py::prepare_vton_masks`)
+`person_high_frequency` và `person_garment_mask` chỉ phục vụ loss khi paired.
 
-```
-agnostic_mask (B,1,512,384)
-  ├── masks.token     (B,768)      bool   — adaptive_max_pool → 32x24, token nào có pixel mask
-  ├── masks.latent    (B,1,64,48)  float  — token nở lại lưới latent (repeat_interleave)
-  └── masks.condition (B,1,64,48)  float  — area-pool, làm mềm biên bằng avg_pool 3x3
-```
+## 2. Sau encoder
 
-Không dilate quá lưới token: nới rộng sẽ buộc mô hình tổng hợp lại bằng chứng
-danh tính (hàm, cổ, tóc) mà lẽ ra chỉ cần copy.
+| Tensor | Shape | Nguồn |
+|---|---:|---|
+| `target` | `B x 4 x 64 x 48` | frozen VAE của `image` |
+| `person_context` | `B x 4 x 64 x 48` | VAE agnostic, zero trong edit mask |
+| `dense_pose` | `B x 4 x 64 x 48` | frozen VAE của DensePose |
+| `garment_latent` | `B x 4 x 64 x 48` | coarse garment VAE |
+| `garment_middle` | `B x 256 x 128 x 96` | tap VAE 1/4 |
+| `garment_detail` | `B x 128 x 256 x 192` | tap VAE 1/2 |
+| `garment_high_frequency` | `B x 256 x 256 x 192` | hai HF VAE stream 128 kênh |
 
----
+HF response blank được trừ trước concat, nên map detail rỗng có condition zero.
 
-## 3. Flow / interpolant
+## 3. Mask sau resize
 
-`patch_flow/flow_vton.py::VTONPatchFlowForcing.get_interpolants`
+| Mask | Shape | Cách tạo |
+|---|---:|---|
+| `masks.token` | `B x 768` | edit coverage trên lưới 32x24 |
+| `masks.latent` | `B x 1 x 64 x 48` | hard generated/update region |
+| `masks.condition` | `B x 1 x 64 x 48` | soft/edit conditioning mask |
 
-### 3.1 Lấy mẫu timestep **theo từng token**
+## 4. Rectified-flow tensor
 
-```
-t ~ LogitNormalTruncatedGaussian(loc=0.5, scale=1.0, std=0.25)   (B,768)
-  ├── 35%  batch → t = 0 toàn bộ  (garment forcing: nhiễu thuần, buộc đọc áo)
-  ├── 25%  batch → t = 1 - |N(0,1)|*0.25  (chế độ tinh chỉnh chi tiết t≈1)
-  └── 40%  batch → giữ nguyên
-```
-
-### 3.2 Nội suy
-
-```
-t_effective = where(masks.token, t, 1)                (B,768)
-t_latent    = t_effective → (B,1,32,24) → repeat 2x2  (B,1,64,48)
-
-interpolated = t_latent * x1 + (1 - t_latent) * x0     x0 ~ N(0,I)
-xt = masks.latent * interpolated + (1 - masks.latent) * person_context   (B,4,64,48)
-ut = x1 - x0                                                            (B,4,64,48)
-```
-
-Ngoài vùng edit: `t = 1`, latent = pixel người thật → mô hình chỉ học sinh trong mask.
-
-### 3.3 Garment dropout (CFG)
-
-`_drop_garment`: 10% mẫu bị **zero hoá cả 3 nhánh áo + garment_mask**, và cờ `keep`
-được trả về để mọi loss giám sát áo bỏ qua mẫu đó.
-
----
-
-## 4. Backbone: `VTONPatchForcingDiT.forward`
-
-`patch_flow/models/pf_transformer_vton.py:494`
-
-### 4.1 Nhánh truy vấn (person query)
-
-```
-x               (B,4,64,48)   noisy latent
-person_agnostic (B,4,64,48)   → interpolate về (64,48)
-person_mask     (B,1,64,48)   = masks.condition
-concat          (B,9,64,48)                       # 4 state + 4 agnostic + 1 mask
-  → PatchEmbed(k=2,s=2, 9→1152)  → (B,768,1152)
-  → + pos_embed                                     (1,768,1152)  bicubic từ 32x32 gốc
+```text
+t                 B x 768
+t_latent          B x 1 x 64 x 48
+z_noise           B x 4 x 64 x 48
+z_t               B x 4 x 64 x 48
+u_target           B x 4 x 64 x 48
 ```
 
-`x_embedder.proj.weight`: 5 kênh mới init **0**, 4 kênh đầu copy từ PFT pretrained →
-khởi động bằng đúng hành vi backbone gốc.
-
-### 4.2 Điều kiện `cond`
-
-```
-t (B,768) → t_embedder(t[...,None]) → (B,768,1152)
-y (B,)    → y_embedder              → (B,1,1152)  broadcast
-cond = t_emb + y_emb                              (B,768,1152)
+```text
+z_t = t_latent * target + (1-t_latent) * noise
+u_target = target - noise
 ```
 
-### 4.3 Ba nhánh key/value của áo (`_garment_branches`)
+Ngoài `masks.latent`, `z_t` được thay bằng `person_context`.
 
-| Nhánh | Nguồn | Embedder | Lưới gốc | Token |
-|---|---|---|---|---|
-| `coarse` | `garment_latent (B,4,64,48)` | `PatchEmbed(k=2,s=2, 4→1152)` (copy từ pretrained) | `32x24` | 768 |
-| `middle` | `(B,256,128,96)` | `Conv2d(256→1152, k=4, s=4)` | `32x24` | 768 |
-| `detail` | `(B,128,256,192)` | `Conv2d(128→1152, k=4, s=4)` | `64x48` | 3072 |
+## 5. DiT input và token
 
-Mỗi nhánh:
+```text
+concat input:
+  z_t              B x 4 x 64 x 48
+  person_context   B x 4 x 64 x 48
+  person mask      B x 1 x 64 x 48
+  dense pose       B x 4 x 64 x 48
+                   ----------------
+                   B x 13 x 64 x 48
 
-```
-values[s] = LayerNorm_s(embedded)      (B,N_s,1152)   # nội dung thuần, dùng cho V
-keys[s]   = values[s] + pos_embed_s    (B,N_s,1152)   # vị trí chỉ nằm ở K
-```
-
-> LayerNorm là bắt buộc: đo tại 512x384, độ lớn token thô là 25 (coarse) / 143
-> (middle) / 68 (detail) so với query đã LayerNorm ~34 → vải tối tự động sinh key lớn hơn.
-
-### 4.4 `garment_match_query_grid: true` (chỉ có ở config *detail*)
-
-```
-detail:  (B,3072,1152) --adaptive_avg_pool2d(32,24)--> (B,768,1152)
-keys/values/grids của MỌI scale ≡ lưới query 32x24
+PatchEmbed(kernel=2,stride=2)
+  x                B x 768 x 1152
+  position         1 x 768 x 1152
+  cond             B x 768 x 1152
 ```
 
-⚠️ Biến cục bộ `fine_values` được **giữ trước khi pool**, nên refiner vẫn nhận
-`detail` nguyên bản `(B,3072,1152)`.
+## 6. Garment branch trong backbone
 
-### 4.5 Padding mask theo áo
+Trước `garment_match_query_grid`:
 
-`_garment_padding_masks`: `garment_mask` → max_pool về từng lưới → `(B,N_s)` bool.
-Mẫu bị dropout (mask rỗng) được ép `keep[:,0]=True` để SDPA không ra NaN.
+| Scale | Source | Embedded grid | Hidden |
+|---|---|---:|---:|
+| coarse | `4 x 64 x 48` | `32 x 24` | 1152 |
+| middle | `256 x 128 x 96` | theo embedder, sau đó pool | 1152 |
+| detail | `128 x 256 x 192` | `64 x 48`, sau đó pool | 1152 |
 
-### 4.6 Vòng 28 block
+Trong 28 backbone block, cả ba route dùng:
 
-`cross_attention_every: 2` → 14 block có cross-attn (block 2,4,…,28).
-`garment_scale_routes` = `[coarse, middle, detail] x4 + [detail, detail]`
-→ **4 coarse / 4 middle / 6 detail**.
-
-Mỗi `VTONPatchForcingBlock`:
-
-```
-shift,scale,gate (x6) = adaLN_modulation(cond)          (B,768,1152) mỗi cái
-
-x = x + gate_msa * SelfAttn(modulate(LN1(x)))           (B,768,1152)
-
-# chỉ block có route:
-cross, A = MultiheadAttention(
-      query = garment_norm(x)          (B,768,1152)
-      key   = keys[s]                  (B,N_s,1152)
-      value = values[s]                (B,N_s,1152)     # KHÔNG cộng pos
-      key_padding_mask                 (B,N_s)
-      average_attn_weights=False)      → cross (B,768,1152), A (B,16,768,N_s)
-cross = cross * edit_token_mask[...,None]                # chỉ ghi vào vùng edit
-x = x + cross                                            # residual không gate
-
-x = x + gate_mlp * MLP(modulate(LN2(x)))                 (B,768,1152)
+```text
+Q_person       B x 768 x 1152
+K_garment      B x 768 x 1152 = content + PE
+V_garment      B x 768 x 1152 = content only
+attention      16 heads
 ```
 
-`out_proj` init `std = 1.3e-2` (~0.45x init chuẩn) — đủ nhỏ để không phá backbone,
-đủ lớn để Q/K/V học được ngay từ bước đầu.
+`fine_values` giữ bản detail **trước pool**:
 
-`gradient_checkpointing: true` → mỗi block bọc `torch.utils.checkpoint`.
-
-Khi `return_garment_attention=True`, mỗi block route trả về dict:
-
-```python
-{"block": i, "scale": s, "weights": A (B,16,768,N_s),
- "output": cross (B,768,1152), "grid": (H_s,W_s),
- "query_grid": (32,24), "key_padding": (B,N_s)}
+```text
+B x 3072 x 1152  <=>  64 x 48 garment grid
 ```
 
-### 4.7 `GarmentLatentRefiner` (nhánh tinh, `garment_latent_refiner: true`)
+## 7. Backbone output
 
-`pf_transformer_vton.py:14` — chạy **sau** 28 block, ở **độ phân giải latent đầy đủ 64x48**
-(mỗi ô = 1 vùng ảnh 8x8), `width=256`, `heads=8`.
-
-```
-tokens x       (B,768,1152) → Linear(1152 → 256*4) → (B,1024,32,24)
-                            → pixel_shuffle(2)      → (B,256,64,48)
-query → flatten                                                       (B,3072,256)
-
-pos = Linear(1152→256, no bias)(pos_embed 64x48)                      (3072,256)
-q = Linear(LN(query)) + pos                                           (B,3072,256)
-k = LN(Linear(fine_values)) + pos      fine_values (B,3072,1152)      (B,3072,256)
-v = Linear(fine_values)                                               (B,3072,256)
-
-SDPA(heads=8, head_dim=32, attn_mask = garment valid (B,1,1,3072))    (B,3072,256)
-features = out_proj(transported) → (B,256,64,48)  # không có shortcut từ person query
-residual = Conv2d(256→4, zero-init)(features + local(features))       (B,4,64,48)
-residual *= gate(edit_mask, area-pool) * active                       (B,4,64,48)
+```text
+x_after_block_28     B x 768 x 1152
+final token output   B x 768 x 20
+unpatchify           B x 5 x 64 x 48
+  backbone_velocity  B x 4 x 64 x 48
+  logvar             B x 1 x 64 x 48
 ```
 
-Khi train, refiner trả thêm Q/K và `out_proj(A@V)` để giám sát correspondence/value
-trực tiếp. Loss QxK chạy theo chunk 256 query, không giữ toàn bộ ma trận 3072x3072.
+## 8. Fine RGB route
 
-### 4.8 Đầu ra
+```text
+query_expand(x)              B x (256*4) x 32 x 24
+pixel_shuffle(2)             B x 256 x 64 x 48
+state[z_t,agnostic,dense]    B x 256 x 64 x 48
 
-```
-x → final_layer(x, cond)     (B,768, p*p*5) = (B,768,20)
-  → unpatchify_rectangular   (B,5,64,48)
-      ├── velocity  = x[:, :-1]   (B,4,64,48)
-      └── logvar    = x[:, -1:]   (B,1,64,48)
-
-velocity = velocity + fine_velocity        # cộng residual của refiner
+Q                            B x 8 x 3072 x 32
+K_detail                     B x 8 x 3072 x 32
+V_detail                     B x 8 x 3072 x 32
 ```
 
----
+Coherent grid:
 
-## 5. Các thành phần loss (`trainer_vton.py::forward`)
-
-```
-loss = flow_loss
-     + 0.01  * outside_velocity_loss
-     + 0.01  * sigma_loss
-     + 0.5   * detail_loss
-     + ramp  * correspondence_loss
-     + 0.2   * ramp * fine_correspondence_loss
-     + 0.25  * ramp * fine_value_loss
-     + 0.2   * decoded_rgb + 0.5 * decoded_edge
+```text
+coarse Q/K                   B x 8 x 768 x 32
+coarse hard grid             B x 8 x 768 x 2
+upsampled base grid          B x 8 x 3072 x 2
+local fine sampling grid     B x 8 x 3072 x 2
+warped RGB values            B x 8 x 3072 x 32
+rgb_warped_feature           B x 256 x 64 x 48
 ```
 
-`ramp = min(1, step / 1000)` (`correspondence_warmup_steps: 1000`).
+## 9. HF route
 
-### 5.1 Loss cốt lõi
+HF dùng cùng `Q/K/key_valid/sampling_grid` nhưng V riêng:
 
-| Loss | Công thức | Mask |
-|---|---|---|
-| `flow_loss` | `mean((velocity - ut)^2)` | `masks.latent` |
-| `outside_velocity_loss` | `mean(velocity^2)` | `1 - masks.latent` |
-| `sigma_loss` | `DiagonalGaussian(velocity.detach(), logvar).nll(ut)` | `masks.latent` |
-
-### 5.2 `detail_loss` (weight 0.5)
-
-```
-predicted_clean = xt + (1 - t_latent) * velocity            (B,4,64,48)
-importance = 1 + 5 * clamp(edge(target)/mean_edge, 0, 1)    (B,1,64,48)
-detail_loss = L1 của sai phân bậc nhất (ngang + dọc) giữa predicted_clean và target
+```text
+HF input                     B x 256 x 256 x 192
+1x1 zero-init encoder        B x 256 x 256 x 192
+high-resolution warp         B x 256 x 256 x 192
+stride-4 downsample          B x 256 x 64 x 48
+local + feature_out          B x 256 x 64 x 48
+                            = hf_warped_feature
 ```
 
-Mask: `person_garment_mask` (coverage ≥ 0.8) ∧ `masks.latent` ∧ (t=0 thuần **hoặc**
-`0.3 ≤ t ≤ 0.95`) ∧ `keep` ∧ `has_ground_truth`.
+Đầu ra HF là 256 feature channel, không phải velocity 4 channel.
 
-### 5.3 Correspondence / CORAL (`patch_flow/correspondence.py`)
+## 10. Fusion/refiner output
 
-**Teacher DINOv3 chỉ tồn tại khi train** — không có gì của nó được đưa vào mạng.
+```text
+fused_feature = rgb_warped_feature + hf_warped_feature
+              = B x 256 x 64 x 48
 
-```
-person  (B,3,512,384) --DINOv3 ViT-S/16--> (B,384,32,24) → resize về person_grid 32x24
-garment (B,3,512,384) --DINOv3-----------> (B,384,32,24)
-similarity = cosine  (B,768,768)
-best_index → target uv (B,768,2) ∈ [-1,1]
-weight (B,768): (sim ≥ 0.35) ∧ cycle-consistency ≤ 1.5 token ∧ coverage ≥ 0.8
-                ∧ keep ∧ has_ground_truth ∧ garment_mask khác rỗng
-```
+velocity_condition(
+  backbone_velocity,
+  preliminary_clean
+)             = B x 256 x 64 x 48
 
-Áp lên **từng head riêng** (`average_attn_weights=False`), cho từng entry trong
-`attention_maps`:
-
-| Term | Weight | Shape / mô tả |
-|---|---|---|
-| `nll` | 0.1 | `-log(mass trong bán kính)`; radius theo scale: coarse 0.04 / middle 0.03 / detail 0.025 |
-| `center` | 0.05 | `‖A @ coords − target‖²`, `A (B,16,768,N_s) @ coords (N_s,2)` |
-| `entropy` | 0.0 | tắt ở experiment này |
-| `photometric` | 0.1 | `mean_heads(A) @ pool(garment RGB → lưới key)` phải khớp RGB thật của token đó trong ảnh mặc |
-| `value` | 0.1 | `0.5*cosine + 0.5*huber` giữa `cross = out_proj(A@V)` và đặc trưng SD-VAE của **người đích**, qua embedder EMA (`decay 0.999`) đóng băng |
-
-`value` là term **duy nhất** huấn luyện trực tiếp `V` và `out_proj` (mang logo/hoạ tiết);
-mọi term còn lại chỉ dạy Q/K định tuyến.
-
-### 5.4 Fine refiner supervision
-
-DINO target 32x24 đáng tin cậy được nội suy lên person grid 64x48. Mỗi head phải đặt
-mass vào lân cận 3x3 của garment key đích (`fine_correspondence_loss`). Đồng thời
-`out_proj(A@V)` 256 chiều phải khớp đặc trưng VAE người đích 64x48 qua projector EMA
-đóng băng (`fine_value_loss`). Không còn ATV/attention-TV vì loss đó cho phép mọi query
-collapse về cùng một key.
-
-### 5.5 `decoded_*` loss (rgb 0.2 / edge 0.5)
-
-Giải mã **mọi** mẫu hợp lệ (`decoded_max_samples: 0`) có `0.3 ≤ t ≤ 0.95`, tuần tự
-từng ảnh để giữ peak memory thấp. `predicted_clean` đi qua decoder SD-VAE có gradient
-(`_decode_with_grad`, bọc checkpoint), rồi so L1 + L1-sai-phân với ảnh người thật
-trong mask áo.
-
-### 5.6 Optimizer
-
-```
-adapter  (tên chứa "garment_" hoặc ".x_embedder")  → lr 1e-4
-backbone (còn lại)                                  → lr 1e-4 * 0.1
-AdamW, weight_decay 0, ema_rate 0 (tắt ở config garment-fix)
+fine_velocity = B x 4 x 64 x 48
+final_velocity= B x 4 x 64 x 48
 ```
 
----
-
-## 6. Sampling / inference
-
-`patch_flow/flow_vton.py::generate` — `num_steps 30`, `cfg_scale 1.5`, `adaptive False`.
-
-```
-xt = masks.latent * noise + (1 - masks.latent) * person_context     (B,4,64,48)
-token_times = 0 trong mask, 1 ngoài mask                            (B,768)
-
-for (t_cur, t_next) in linspace(0,1,31) theo cặp:
-    velocity = _predict(...)                                        (B,4,64,48)
-    xt = xt + (t_next - t_cur) * velocity * masks.latent
-    token_times += delta * masks.token
-    xt = masks.latent * xt + (1 - masks.latent) * person_context    # re-anchor mỗi bước
+```text
+preliminary_clean = z_t + (1-t) * backbone_velocity
+final_velocity = backbone_velocity + fine_velocity
 ```
 
-**CFG**: nhân đôi batch, nhánh uncond nhận `garment/garment_middle/garment_detail`
-và `garment_mask` **zero hoá** (đúng phân phối dropout khi train):
+## 11. Clean prediction dùng cho loss
 
-```
-velocity = v_uncond + 1.5 * (v_cond - v_uncond)
-```
+Flow/main detail:
 
-Chế độ `adaptive=True`: dùng `logvar` chọn `uncertain_fraction=0.3` token khó nhất,
-chạy `inner_steps` bước Euler nhỏ hơn chỉ cho các token đó.
-
-Cuối cùng:
-
-```
-samples (B,4,64,48) --VAE.decode--> generated (B,3,512,384)
-composed = compose_vton(generated, person, mask nở, feather 8)
+```text
+predicted_clean = z_t + (1-t) * final_velocity
 ```
 
----
+Joint HF/refiner auxiliary:
 
-## 7. Sơ đồ tổng quát
+```text
+fused_predicted_clean = z_t.detach()
+  + (1-t) * (backbone_velocity.detach() + fine_velocity)
+```
 
+Sau frozen VAE decoder, supervision image trở lại `B x 3 x 512 x 384` hoặc
+resolution phụ được cấu hình riêng để giảm memory.
+
+## 12. Inference
+
+Mỗi sampler step:
+
+```text
+velocity = model(z_t, token_t, person/garment conditions)
+z_next = z_t + (t_next-t_current) * velocity * masks.latent
+z_next = z_next * masks.latent + person_context * (1-masks.latent)
 ```
-                  person ─┐
-             agnostic_mask┤
-                          ▼
-   person_agnostic ─VAE─► person_context (B,4,64,48) ──┐
-                                                        │
-   noise x0 ──┐                                         │
-   target x1 ─┴─ interpolant(t theo token) ─► xt (B,4,64,48)
-                                                        │
-                        concat[xt | agnostic | mask] (B,9,64,48)
-                                     │ PatchEmbed p=2
-                                     ▼
-                              x (B,768,1152) + pos
-                                     │
-   garment ─VAE pyramid─┬─ coarse (B,4,64,48)  ─PatchEmbed─► (B,768,1152)
-                        ├─ middle (B,256,128,96)─Conv4x4───► (B,768,1152)
-                        └─ detail (B,128,256,192)─Conv4x4──► (B,3072,1152)
-                                     │  LayerNorm → V ; V+pos → K
-                                     ▼
-        ┌──────────── 28 x VTONPatchForcingBlock ─────────────┐
-        │  SelfAttn(adaLN) → [CrossAttn áo mỗi 2 block] → MLP │
-        └──────────────────────┬──────────────────────────────┘
-                               │ x (B,768,1152)
-              ┌────────────────┴──────────────────┐
-              ▼                                   ▼
-     final_layer → unpatchify          GarmentLatentRefiner
-     (B,5,64,48)                       q: 64x48 x 256, k/v: detail 3072
-       ├── velocity (B,4,64,48) ◄──── + residual (B,4,64,48)
-       └── logvar   (B,1,64,48)
-```
+
+Với CFG, conditional và unconditional có cùng person/DensePose; nửa unconditional
+nhận garment RGB, garment mask và HF bằng zero.

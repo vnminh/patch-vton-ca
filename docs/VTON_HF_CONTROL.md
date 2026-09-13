@@ -1,169 +1,208 @@
-# Target-cloth high-frequency control
+# Garment high-frequency feature fusion
 
-Experiment: `viton-pft-xl-512x384-detail-rebalance-hf`.
-Logs: `vton/pft-xl-512x384-detail-rebalance-hf-control`.
-The stable and rebalance experiments do not enable HF by default.
+Tài liệu này giải thích riêng nhánh HF của config
+`viton-pft-xl-512x384-detail-logo-hf`. Đọc [`ARCHITECTURE_VI.md`](ARCHITECTURE_VI.md)
+trước để biết vị trí của nhánh này trong toàn model.
 
-The main DiT input has 13 channels: noisy latent (4), agnostic latent (4),
-person mask (1), DensePose latent (4). HF never enters `x_embedder`.
+## 1. Vai trò của HF
 
-The dataset computes Canny from the transformed target cloth image and restricts
-edges to its cloth mask. The same procedure applies to paired and unpaired data.
-The map must remain at full image resolution, eight times the latent dimensions.
+Garment RGB/VAE mang màu, vùng logo và texture nhưng các stroke nhỏ có thể suy giảm
+qua VAE/attention. HF bổ sung signed detail và gradient màu để refiner biết nơi cần
+tái tạo biên, nét chữ và color-block.
 
-The trainer encodes that map with the frozen pretrained SD-VAE, taking the
-half-resolution encoder tap (256x192, 128 channels) -- the same features the
-`detail` garment branch uses. `garment_high_frequency_channels` must therefore
-equal `garment_detail_channels`.
+HF **không tự sinh ảnh RGB**. Nó bổ sung thông tin cho RGB warped feature; refiner
+chung mới học cách chuyển thông tin kết hợp thành residual RGB/latent hợp lệ.
 
-The separate `garment_high_frequency_control` branch performs:
+```text
+rgb_warped_feature + hf_warped_feature
+  -> shared detail refiner
+  -> fine_velocity
 
-1. A learned 4x4 stride-4 convolution embeds those 128-channel VAE features into
-   256-channel HF values on the 64x48 person grid, mirroring
-   `garment_detail_embedder`. This convolution is zero-initialized.
-2. Cross-attention uses the detail refiner's existing supervised Q/K and garment
-   key mask to transport HF values to person coordinates. V contains HF content
-   only. No positional embedding or person shortcut is added to these values.
-3. A local residual block and a 1x1 convolution produce four velocity channels on
-   the 64x48 person grid. The person edit mask bounds output. That convolution
-   keeps its standard weight initialization; only its bias is zeroed.
+final_velocity = backbone_velocity + fine_velocity
+```
 
-`velocity = backbone_velocity + detail_velocity + hf_velocity`
+Không có `hf_velocity` bốn channel cộng độc lập.
 
-Uncertainty output is unchanged. This is ControlNet-inspired conditioning, not a
-full copied/frozen ControlNet backbone. It trains with the existing flow and
-decoded reconstruction losses. Routing continues to use the existing fine
-correspondence/RGB supervision; no extra HF loss is introduced.
+## 2. Vì sao không dùng grayscale Canny
 
-Where the zero initialization sits is the whole design. The first revision put it
-on the velocity head over a randomly initialized pixel encoder, on the assumption
-that "the zero head receives gradients immediately; the encoder starts receiving
-reconstruction gradients after the head has updated". That assumption is wrong,
-and measurably so. Every path from the encoder to the residual passes through the
-head, so a zero head makes the encoder gradient identically zero. Across 3500
-steps of `detail-rebalance-hf-control`, `garment_grad/hf/encoder` never left
-0.00000-0.00001, the checkpointed encoder rms stayed at 0.072657 against its
-theoretical initialization value of 0.07217, and the head's own gradient decayed
-from 0.0146 to 0.0017 rather than growing, because random features gave it no
-consistent direction. The branch contributed nothing.
+Canny chỉ cho biết có biên hay không. Nó làm mất:
 
-Zeroing the encoder instead inverts the dependency. The branch still contributes
-exactly zero on the first step: `local` is bias-free and GroupNorm's bias starts
-at zero, so a zero encoder output propagates as exact zero to the head's zeroed
-bias. But the head keeps a usable weight, so gradient reaches the encoder from
-step zero. The head's own weight has no gradient until the encoder output is
-non-zero, which costs one step. Pretrained VAE features matter for the same
-reason: the head now has a meaningful, spatially aligned signal to latch onto.
+- dấu sáng/tối của stroke;
+- kênh màu tạo nên chữ/logo;
+- isoluminant color boundary, ví dụ đỏ/xanh cùng độ sáng;
+- màu bên trong logo và color-block.
 
-Existing global LR warmup still applies. The HF encoder and head have adapter
-learning rates and gradients logged as `garment_grad/hf/encoder` and
-`garment_grad/hf/output`. `garment_grad/hf/encoder` rising above zero within the
-first few hundred steps is the check that this branch is alive at all.
+Revision hiện tại dùng sáu channel:
 
-Garment dropout zeros HF as well as garment conditions. CFG uses a zero HF map
-for its unconditional half. Empty HF maps or cloth masks contribute exactly zero,
-even after output biases have trained. The HF branch uses checkpointing and SDPA.
-It adds another fine-grid attention operation, so full-model GPU cost must be
-measured separately from small-model CPU smoke tests.
+| Channel | Nội dung |
+|---|---|
+| `0:3` | signed RGB high-pass/DoG đa tỉ lệ |
+| `3` | luma gradient magnitude |
+| `4` | opponent-chroma gradient magnitude |
+| `5` | max RGB gradient magnitude |
 
-Decoded RGB and edge reconstruction use the complete agnostic edit mask. This
-directly supervises arms and hands erased by agnostic preprocessing. Garment
-correspondence, value, fine RGB, and latent detail losses continue to use the
-parsed garment-only mask, so anatomy is never treated as garment appearance.
+Map được tính **sau** flip/shift/scale của garment và bị giới hạn trong eroded
+garment mask. Như vậy RGB, mask và HF luôn cùng hệ tọa độ.
 
-Warm-start with `load_weights=...` and a fresh optimizer. The experiment enables
-`allow_new_garment_high_frequency`: a wholly absent HF branch is allowed with a
-zero encoder; partial missing branch weights remain strict errors. A 13-channel
-checkpoint keeps its initial function. The explicitly reverted 14-channel version
-can also load: only its last input slice is discarded, so any contribution learned
-by that removed slice is lost. Original checkpoint files are never changed.
-After a checkpoint from this architecture exists, use `resume_checkpoint=...`
-to restore its optimizer and step, without also specifying `load_weights`.
+## 3. Tại sao HF chỉ lấy từ garment
 
-This branch cannot recover details absent from the Canny map and depends on the
-quality of the existing detail attention, which is its binding constraint: it
-transports HF values with the refiner's Q/K, and `fine_top1_accuracy` has sat
-between 5.8% and 6.7%. Restoring the refiner's `state` convolution addresses that
-separately. RGB garment features still carry colors. Compare held-out paired and
-swapped previews before claiming a quality improvement.
+Inference unpaired không có ground-truth người mặc garment đích. Vì vậy model
+condition chỉ dùng:
 
-Warm-start discards the previous revision's `garment_high_frequency_control`
-tensors outright: they are renamed and reshaped, and the measurements above show
-they carry no learned information.
+```text
+in-shop garment + garment mask -> garment HF
+```
 
-Validation (2026-09-09, this revision): 97 tests plus 7 subtests passed on CPU,
-including BF16 backward/validation, prediction parity against a nonzero pretrained
-output, EMA loading, partial-checkpoint rejection, masked/empty HF residuals, CFG,
-and the new gradient ordering (encoder from step 0, head weight from step 1).
-Against the real `detail-rebalance-hf-control` step-2000 checkpoint the schema
-matched 415 existing model tensors, with 4 new tensors (`garment_refiner.state`
-and the rebuilt HF encoder), 8 discarded obsolete tensors, no input migration and
-the input still at 13 channels. With real 512x384 paired images and the frozen
-SD-VAE and DINO, two CPU optimizer steps ran with finite gradients throughout,
-non-zero HF encoder gradients, decoder gradient parity, and finite unpaired CFG
-generation. Full-XL GPU peak memory and generated-logo quality are not measured
-here; the previous revision's HF branch also passed its own smoke test while
-being inert in training, so `garment_grad/hf/encoder` on the real run is the check
-that matters.
+`person_high_frequency` có thể tồn tại trong paired batch nhưng chỉ làm target cho
+source-consistency loss. Nó không đi vào forward condition và không cần ở inference.
 
-## Refiner query (2026-09-09)
+## 4. HF encoder
 
-Unrelated to HF but changed in the same revision. `GarmentLatentRefiner` regained
-the `state` convolution over `cat(noisy, agnostic)` at full 64x48 latent
-resolution, added to the query before `query_norm`.
+Sáu input channel được tách thành hai ảnh ba channel:
 
-Commit `be7102d` removed it together with the person residual around `A @ V`.
-Those are different things. Removing the residual from the output path closes a
-shortcut that let the branch ignore garment content, and it stays removed. The
-query never bypasses attention into the output, so nothing about that argument
-applied to `state`, and removing it left the four subpixel queries inside a patch
-differing only by a learned constant slice of `query_expand` and by their
-positional embedding -- both content-independent. Nothing could tell one subpixel
-which garment cell it needed except absolute position, which is the wrong cue for
-a logo that moves with the garment. `fine_top1_accuracy` stayed near 6% while
-`fine_correspondence_weight` was tripled from 0.05 to 0.15, which is what a
-capacity ceiling looks like rather than an under-weighted loss.
+1. signed RGB DoG;
+2. luma/chroma/RGB gradients.
 
-`state` is zero-initialized so a loaded refiner keeps its routing on the first
-step. Unlike the old HF head, this zero sits on an input branch whose downstream
-path is already non-zero, so it receives gradient immediately. Checkpoints
-without it load under `allow_new_garment_refiner`; any other partially missing
-refiner weight is still a strict error.
+Mỗi ảnh đi qua cùng kiểu SD-VAE half-resolution stem, tạo 128 feature channel tại
+256x192. Response VAE của blank input tương ứng được trừ riêng, sau đó concat:
 
-## Value centring and head balance (2026-09-09, second revision)
+```text
+signed VAE detail      B x 128 x 256 x 192
+gradient VAE detail    B x 128 x 256 x 192
+------------------------------------------------
+HF condition           B x 256 x 256 x 192
+```
 
-Step-1000 of `detail-rebalance-hf-control`, measured inside the edit mask on a real
-paired sample: backbone velocity rms 0.7416, refiner 0.00613 (0.8%), HF 0.06309
-(8.5%). 82.7% of the HF residual was spatially constant, per-channel means
-[0.0991, -0.0244, 0.0047, 0.0211] -- a flat colour shift in latent space, and the
-visible cause of garments desaturating and colour blocks flattening across the run.
+HF condition stem được init từ pretrained VAE và được phép học với LR multiplier
+0.05. Target VAE và decoder VAE chính vẫn frozen.
 
-Two separate mistakes produced that.
+## 5. Shared correspondence, different value
 
-A Canny map is mostly black with thin strokes, so its VAE features carry a large
-global mean: 0.5591, against -0.0102 for the garment features. Attention that is
-anywhere near diffuse returns that mean. LayerNorm does not help -- it normalises
-each token across channels and leaves the component shared by every token intact,
-measured at 88.3% of the HF value signal before and 93.3% after. The mean has to be
-removed across keys, over valid keys only. The refiner keeps its mean, which is the
-garment's base colour and is wanted; the HF mean carries nothing.
+RGB refiner đã tạo:
 
-The velocity heads were also inverted. Moving the zero initialisation from the HF
-head to the HF encoder left that head at full standard init (rms 0.031433) while the
-refiner's stayed at 0.000792, so the branch with a near-untrained encoder (rms
-0.000165 against a 0.0128 standard init) had 40x the authority of the branch that
-has to carry logos. `warm_start_refiner_output_gain` and
-`warm_start_high_frequency_output_gain` rescale the loaded heads explicitly; the
-experiment uses 10.0 and 0.25, putting both at rms ~0.0079.
+- Q từ person/DiT state;
+- K từ garment detail;
+- `key_valid` từ garment mask;
+- coherent `sampling_grid` từ coarse anchor + local residual.
 
-Measured after both changes on the same checkpoint and sample: refiner 6.5%, HF
-1.7%, HF DC share 33.1%, per-channel means [0.0027, 0.0003, 0.0015, -0.0079]. Total
-velocity rms moved 0.74855 to 0.74170, so the two changes roughly cancel and the
-model is not shocked overall. DC injection fell from 7.0% of velocity to 0.56%.
+HF dùng lại đúng bốn tensor trên. Q/K/grid được detach trên HF path:
 
-`detail_loss` is reverted to 0.5 on [0.3, 0.95] in the rebalance config. It is the
-only term rewarding a velocity that carries fine structure, so it is the only reason
-the refiner's velocity head has to grow; cutting it to 0.15 on [0.85, 1.0] is why
-that head sat at 2% of standard init for 3000 steps while logos had no channel to
-arrive through.
+```text
+RGB: shared Q/K/grid + RGB V -> rgb_warped_feature
+HF : shared Q/K/grid + HF  V -> hf_warped_feature
+```
 
+Điều này bảo đảm nét HF và RGB được lấy từ cùng garment location. Auxiliary edge
+loss không thể tự bẻ attention map sang nơi có biên mạnh nhưng sai logo.
+
+## 6. High-resolution transport
+
+`GarmentHighFrequencyControl` thực hiện:
+
+1. `encoder`: 1x1, 256 -> 256, zero-init;
+2. trừ spatial mean trên valid garment pixels;
+3. local high-resolution processing ở 256x192;
+4. upsample displacement grid và warp HF value tại 256x192;
+5. stride-4 downsample sau warp về 64x48;
+6. local block + `feature_out` tạo 256 channel;
+7. edit/active gate ép vùng không hợp lệ về zero.
+
+Warp trước rồi mới downsample giữ các phase nhỏ của stroke tốt hơn downsample HF
+trước correspondence.
+
+Spatial mean được loại chỉ ở nhánh HF. RGB refiner giữ garment mean vì đó là màu
+nền thật; HF mean chủ yếu là VAE/DC bias và từng gây flat colour shift.
+
+Global HF attention bị tắt trong config logo. Nó có xu hướng trung bình các vùng xa
+nhau và tạo glyph-like texture; coherent grid là route duy nhất đang hoạt động.
+
+## 7. Zero initialization
+
+Zero-init nằm tại HF `encoder`, không nằm tại output head.
+
+- Bước đầu: HF feature bằng đúng zero, checkpoint cũ giữ nguyên prediction.
+- `feature_out.weight` vẫn non-zero theo standard initialization.
+- Gradient từ refiner đi xuyên `feature_out/downsample` đến encoder ngay update đầu.
+
+Nếu zero cả output weight, gradient encoder cũng bằng zero cho tới khi output head
+đã thay đổi; revision cũ từng gần như không học vì vấn đề này.
+
+Empty garment, garment dropout và unconditional CFG đều bị `active` gate ép HF
+output chính xác zero, kể cả khi bias đã được train.
+
+## 8. Fusion/refiner
+
+Sau routing:
+
+```text
+fused = rgb_warped_feature + hf_warped_feature  # 256 x 64 x 48
+fine_velocity = garment_refiner.refine(fused, detached backbone state)
+final_velocity = backbone_velocity + fine_velocity
+```
+
+Đây là một refiner duy nhất. HF không có quyền viết trực tiếp vào latent velocity,
+nên muốn giảm decoded RGB/chroma loss nó phải giúp refiner reconstruct appearance.
+
+## 9. Loss cho HF
+
+### Source consistency
+
+Trên paired sample, shared grid được dùng để warp garment HF và so với person HF.
+Sparse weighting tăng trọng số vùng có detail thật để logo nhỏ không biến mất trong
+trung bình toàn áo. Loss này giám sát `sampling_grid`/Q/K bằng raw six-channel map;
+nó không đi qua HF feature encoder hay `feature_out`.
+
+### Joint latent/decoded supervision
+
+Clean estimate cho HF loss là:
+
+```text
+z_t.detach() + (1-t) * (
+  backbone_velocity.detach() + fine_velocity
+)
+```
+
+Loss gồm latent detail và decoded RGB/chroma/edge. Nó cập nhật HF encoder và shared
+refiner, nhưng không cập nhật backbone qua auxiliary objective này.
+
+HF decoded supervision chỉ dùng sparse support bên trong `person_garment_mask`.
+Decoded RGB/edge **chính** của trainer dùng toàn edit region để tái tạo cả tay/pose.
+Correspondence, source consistency và garment feature loss cũng giới hạn ở garment.
+
+## 10. Checkpoint migration
+
+Checkpoint của revision cũ chứa `garment_high_frequency_control.output.*` bốn
+channel. Graph hiện tại cần `feature_out.*` 256 channel. Loader sẽ:
+
+- bỏ toàn bộ old HF control branch nếu thấy tensor không tương thích;
+- reset branch mới về zero-output;
+- giữ DiT, RGB routing, refiner và pretrained/learned HF condition stem;
+- yêu cầu warm-start bằng `load_weights` với optimizer mới.
+
+Sau khi graph fused đã lưu checkpoint riêng, có thể dùng `resume_checkpoint` để
+khôi phục cả optimizer và step. Không truyền hai lựa chọn cùng lúc.
+
+## 11. Metric và cách đọc
+
+| Metric | Câu hỏi nó trả lời |
+|---|---|
+| `garment_grad/hf/encoder` | zero-init encoder có nhận gradient không? |
+| `garment_grad/hf/feature_out` | projection HF có học không? |
+| `hf_feature_rms` | HF feature có authority hay vẫn zero? |
+| `fine_velocity_rms` | joint refiner có đóng góp vào output không? |
+| `hf_source_sparse_loss` | logo/detail source có được copy đúng vị trí không? |
+| decoded RGB/chroma/edge | reconstructed detail có đúng màu và cấu trúc không? |
+
+Không kết luận logo đã học chỉ vì edge loss giảm. Preview held-out phải cho chữ/logo
+có nghĩa và RGB/chroma loss phải cải thiện cùng edge.
+
+## 12. Verification
+
+`scripts/verify_vton_rgb_hf.py` kiểm tra:
+
+- zero/empty HF không đổi output;
+- HF output có width 256 thay vì bốn velocity channel;
+- HF chỉ làm đổi shared `fine_velocity`;
+- hiệu final output đúng bằng hiệu fine output;
+- auxiliary HF loss không có gradient vào backbone final head;
+- gradient đến HF encoder, HF feature projection và RGB refiner.

@@ -304,10 +304,17 @@ class VTONHDDataset(Dataset):
         )
 
         garment_high_frequency = None
+        person_high_frequency = None
         if self.garment_high_frequency:
             # Compute after all garment augmentation: RGB, cloth mask and HF map then
             # describe the same target garment coordinates in paired and unpaired data.
             garment_high_frequency = self._garment_high_frequency_map(garment, garment_mask)
+            if person_garment_mask is not None:
+                # Training-only paired target for high-resolution source consistency.
+                # It is derived from the ground-truth worn image, never used at inference.
+                person_high_frequency = self._garment_high_frequency_map(
+                    person, person_garment_mask
+                )
 
         person = TF.to_tensor(person) * 2 - 1
         garment = TF.to_tensor(garment) * 2 - 1
@@ -331,6 +338,8 @@ class VTONHDDataset(Dataset):
             sample["dense_pose"] = TF.to_tensor(dense_pose) * 2 - 1
         if garment_high_frequency is not None:
             sample["garment_high_frequency"] = garment_high_frequency
+        if person_high_frequency is not None:
+            sample["person_high_frequency"] = person_high_frequency
         return sample
 
 

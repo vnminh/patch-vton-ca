@@ -21,6 +21,8 @@ def main():
     parser.add_argument('--height', type=int, default=128)
     parser.add_argument('--width', type=int, default=96)
     parser.add_argument('--checkpoint', help='Also audit the full XL checkpoint on CPU/meta, without optimizer loading')
+    parser.add_argument('--checkpoint-only', action='store_true',
+                        help='Stop after the CPU/meta checkpoint compatibility audit')
     parser.add_argument('--experiment', default='viton-pft-xl-512x384-detail')
     args = parser.parse_args()
     torch.set_num_threads(2)
@@ -72,6 +74,10 @@ def main():
               f"new_refiner_tensors={len(missing)}, obsolete_shortcut_tensors={len(obsolete)}, "
               f"input_migration={bool(allowed_mismatch)}, input_channels={expected[key].shape[1]}", flush=True)
         del saved, current, expected, full
+        if args.checkpoint_only:
+            return
+    elif args.checkpoint_only:
+        parser.error('--checkpoint-only requires --checkpoint')
     cfg.model.params.hidden_size = 64
     cfg.model.params.depth = 3
     cfg.model.params.num_heads = 4
@@ -94,7 +100,15 @@ def main():
                                     preview_sample_id='00055_00.jpg', garment_parse_labels=[5,6,7],
                                     dense_pose_dir='image-densepose' if cfg.model.params.get('dense_pose_channels',0) else None,
                                     garment_high_frequency=bool(cfg.model.params.get(
-                                        'garment_high_frequency_channels',0)))
+                                        'garment_high_frequency_channels',0)),
+                                    garment_high_frequency_mode=cfg.data.params.validation.params.get(
+                                        'garment_high_frequency_mode','canny'),
+                                    garment_high_frequency_dog_sigmas=cfg.data.params.validation.params.get(
+                                        'garment_high_frequency_dog_sigmas',(0.8,2.4)),
+                                    garment_high_frequency_dog_gain=cfg.data.params.validation.params.get(
+                                        'garment_high_frequency_dog_gain',4.0),
+                                    garment_high_frequency_gradient_gain=cfg.data.params.validation.params.get(
+                                        'garment_high_frequency_gradient_gain',2.0))
     data = default_collate([dataset[0]])
     optimizer = module.configure_optimizers()['optimizer']
     module.train()
@@ -109,10 +123,10 @@ def main():
         assert module.model.garment_refiner.query.weight.grad.abs().sum() > 0
         control = module.model.garment_high_frequency_control
         if control is not None:
-            # Zero sits on the encoder, so the encoder trains from step 0 and the head's
-            # weight follows one step later, once its input is non-zero.
-            assert control.encoder.weight.grad.abs().sum() > 0
-            assert control.output.bias.grad.abs().sum() > 0
+            # Production warm starts a trained RGB refiner, so its one velocity head
+            # sends the fused supervision into the zero-initialized HF feature encoder.
+            assert control.encoder.weight.grad is not None
+            assert control.feature_out.bias.grad is not None
         if step:
             assert module.model.garment_refiner.value.weight.grad.abs().sum() > 0
             if module.model.dense_pose_channels:
@@ -121,7 +135,8 @@ def main():
                 dense_gradient = module.model.x_embedder.proj.weight.grad[:, start:end]
                 assert dense_gradient.abs().sum() > 0
             if control is not None:
-                assert control.output.weight.grad.abs().sum() > 0
+                assert control.encoder.weight.grad.abs().sum() > 0
+                assert control.feature_out.bias.grad.abs().sum() > 0
         # train.py calls this every garment_grad_log_every_n_steps; a stale attribute
         # path here crashed a real run after 399 iterations.
         grad_metrics = module.garment_gradient_norms()
@@ -158,7 +173,7 @@ def main():
                 num_steps=2, cfg_scale=1.5, **module._garment_conditions(encoded),
             )
         assert samples.shape == encoded['target'].shape and torch.isfinite(samples).all()
-        print('HF CONTROL PASS: zero-output head and encoder gradients, unpaired CFG generation.', flush=True)
+        print('HF FUSION PASS: zero HF feature gate, joint refiner gradients, unpaired CFG generation.', flush=True)
     print(f'PASS: {args.height}x{args.width} real paired images, frozen SD-VAE and DINO, two optimizer steps, decoded gradient/parity and direct fine correspondence/value supervision. XL GPU peak memory and image quality are not tested.', flush=True)
 
 

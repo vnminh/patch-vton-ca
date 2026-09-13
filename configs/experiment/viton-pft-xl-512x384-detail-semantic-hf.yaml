@@ -1,0 +1,33 @@
+# @package _global_
+defaults:
+  - viton-pft-xl-512x384-detail-rgb-hf
+  - _self_
+
+name: vton/pft-xl-512x384-detail-semantic-hf
+
+data:
+  params:
+    # High-resolution warped features and the trainable VAE stem retain activations.
+    # Halve the micro-batch for the 24 GB RTX 3090; accumulation below keeps the same
+    # effective batch of 32 as the previous 4 x 8 run.
+    batch_size: 2
+
+trainer:
+  params:
+    # A separate copy of the pretrained SD-VAE stem encodes only the two HF streams.
+    # The target/decoder VAE remains frozen. 5e-6 at the inherited 1e-4 LR prevents
+    # pretrained detail features from drifting faster than the new control path.
+    learnable_hf_condition_encoder: true
+    hf_condition_encoder_lr_multiplier: 0.05
+
+    # Paired-only 128x96 source consistency: the shared deformation grid must copy the
+    # actual RGB-DoG/chroma strokes from cloth to the worn garment. Generic sharpening
+    # cannot satisfy this objective. hf_detail_loss remains the velocity-head objective.
+    hf_source_consistency_weight: 0.25
+    hf_source_consistency_scale: 2
+
+    allow_new_garment_high_frequency: true
+
+train_params:
+  accumulate_grad_batches: 16
+  val_check_interval: 50
