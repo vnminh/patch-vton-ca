@@ -886,6 +886,11 @@ class VTONTests(unittest.TestCase):
 
         trainer = object.__new__(LatentVTONPatchForcingTrainer)
         trainer.__dict__["model"] = model
+        # A real trainer always sets this in __init__ before any conditional return; the
+        # bare object here does not, and this metric function runs during training, so
+        # letting it AttributeError would hide exactly the class of crash it is meant to
+        # catch.
+        trainer.__dict__["hf_condition_encoder"] = None
         metrics = LatentVTONPatchForcingTrainer.garment_gradient_norms(trainer)
         for block_index, scale in enumerate(("coarse", "middle", "detail"), start=1):
             prefix = f"garment_grad/block_{block_index:02d}_{scale}"

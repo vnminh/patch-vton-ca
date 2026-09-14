@@ -286,9 +286,11 @@ def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detai
     loss.backward()
     if fine_detail:
         assert model.garment_refiner.output.weight.grad.abs().sum() > 0
-        # Zero init is on the encoder, so it is the module that must show gradient
-        # on the very first step; the head's weight follows once its input is non-zero.
-        assert model.garment_high_frequency_control.encoder.weight.grad.abs().sum() > 0
+        # A fully fresh toy model has two intentional warm-start gates: the refiner
+        # output and HF fusion. The output learns first; the dedicated fusion test opens
+        # that trained output and verifies fusion on step one and HF features on step two.
+        assert model.garment_refiner.hf_fusion.weight.grad.abs().sum() == 0
+        assert model.garment_high_frequency_control.encoder.weight.grad.abs().sum() == 0
         assert model.garment_refiner.query.weight.grad.abs().sum() > 0
         assert all(p.grad is None and not p.requires_grad for p in vae.parameters())
     for scale in ('coarse','middle','detail'):

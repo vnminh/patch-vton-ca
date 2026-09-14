@@ -7,6 +7,11 @@ name: vton/pft-xl-512x384-detail-logo-hf
 
 model:
   params:
+    # Scale 30 made the straight-through hard coarse route almost one-hot before it
+    # was correct: top-1 fell from 29.5% to 25.1% while the fine velocity collapsed.
+    # Scale 10 leaves the hard forward argmax unchanged, but gives losing locations a
+    # usable backward probability and keeps the 5x5 local refinement sub-pixel smooth.
+    garment_refiner_cosine_scale: 10.0
     # Character strokes must follow the single coherent deformation grid. A second
     # global A@V path averages unrelated cloth locations and turns text into glyph-like
     # texture. The parameter remains checkpoint-compatible but is frozen and unused.
@@ -49,36 +54,60 @@ trainer:
     # Decode the joint RGB+HF refiner estimate. RGB keeps ink colour, opponent chroma
     # keeps colour blocks, and edge keeps letter boundaries. One sample caps frozen-VAE
     # activation memory on a 24 GB GPU.
+    # Raised from 0.1. This term decodes the refiner's own estimate, so it is the most
+    # targeted place to charge the branch for growing in a smooth direction -- which is
+    # exactly how it grew: displacement and warp smoothness both rose with the velocity.
+    # decoded_edge_weight and detail_loss_weight are deliberately left alone; the RGB and
+    # chroma emphasis is the intended design and the velocity guard above is what
+    # actually bounds the magnitude.
     hf_decoded_rgb_weight: 1.0
     hf_decoded_chroma_weight: 1.0
-    hf_decoded_edge_weight: 0.1
+    hf_decoded_edge_weight: 0.3
     hf_decoded_max_samples: 1
 
-    # The failed run let fine velocity grow ~67x and dominate the backbone. Keep the
-    # residual below half the backbone RMS (with a small absolute floor).
-    fine_velocity_regularization_weight: 0.1
-    fine_velocity_max_backbone_ratio: 0.5
+    # Sized as a regulator, not a disaster catcher. Measured on T004330: fine velocity
+    # RMS sat at 0.062 while the LR was still ramping, then took off the moment warmup
+    # completed at step 500 -- 0.099 (471), 0.200 (518), 0.325 (565), doubling every
+    # ~50 steps. Every other fine metric degraded in lockstep, because they all measure
+    # the same growing residual: value loss 0.0313 -> 0.0388, warp smoothness 0.0137 ->
+    # 0.0145, warp mask 0.0088 -> 0.0148, displacement 0.840 -> 0.911, and it leaked
+    # into flow_loss 0.4354 -> 0.4520.
+    #
+    # The penalty is relu(rms - limit)^2, so it was exactly zero for all 561 steps: the
+    # limit was 0.5 * backbone_rms ~= 0.64 and the residual never reached it. Even at
+    # 0.15 the old weight of 0.1 would contribute 0.0018 against a total loss of 0.88.
+    # 0.15 puts the limit near 0.19 and the weight makes it bite: ~4% of the loss at the
+    # currently observed 0.325 and ~20% at 0.5. Quadratic, so it stays gentle just above
+    # the limit and firm beyond it.
+    fine_velocity_regularization_weight: 2.0
+    fine_velocity_max_backbone_ratio: 0.15
     fine_velocity_min_limit: 0.1
 
     # Both newly coupled branches were previously trained at 1e-4 while the backbone
     # used 1e-5. Use the stable rate for fusion/refinement as well.
-    garment_refiner_lr_multiplier: 0.1
+    # The router was receiving only 7e-6 at step 700 and its top-1 accuracy regressed.
+    # A quarter-rate adapter remains below the full garment attention LR while allowing
+    # the corrected, non-saturated routing signal to move Q/K during this warm restart.
+    garment_refiner_lr_multiplier: 0.25
     garment_high_frequency_lr_multiplier: 0.1
 
     # This is a warm restart from a trained checkpoint, so only ramp the denser DINO
     # route briefly instead of suppressing it for another thousand optimizer steps.
-    correspondence_warmup_steps: 1000
+    correspondence_warmup_steps: 250
 
 data:
   params:
     # Higher-resolution teacher features plus two checkpointed VAE decodes need the
     # smaller micro-batch. Accumulation below keeps effective batch size at 32.
-    batch_size: 1
+    batch_size: 4
 
 lr_scheduler:
   params:
-    num_warmup_steps: 1000
+    # All backbone weights are loaded; only the corrected routing/fusion needs a short
+    # optimizer warmup. Avoid multiplying a 1000-step LR ramp by another 1000-step
+    # correspondence ramp, which starved the fine route quadratically.
+    num_warmup_steps: 500
 
 train_params:
-  accumulate_grad_batches: 32
-  val_check_interval: 50
+  accumulate_grad_batches: 8
+  val_check_interval: 250

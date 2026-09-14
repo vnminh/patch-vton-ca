@@ -21,6 +21,25 @@ from patch_flow.vae_features import encode_vae_pyramid
 from patch_flow.vton_utils import compose_vton, masked_mean
 
 
+def stable_excess_rms_penalty(mean_square, limit):
+    """Exactly ``relu(sqrt(mean_square) - limit) ** 2`` without sqrt'(0).
+
+    Classifier-free garment dropout can make the fine velocity identically zero for a
+    whole micro-batch. The direct RMS expression then has an infinite derivative at
+    zero; multiplying that derivative by the inactive ReLU produces a NaN backward even
+    though the forward loss is finite. Rationalising the difference keeps the same
+    objective above the limit and a finite, zero gradient below it.
+    """
+    mean_square = mean_square.float().clamp_min(0)
+    limit = limit.float().clamp_min(0)
+    limit_square = limit.square()
+    excess_square = (mean_square - limit_square).clamp_min(0)
+    epsilon = torch.finfo(mean_square.dtype).eps
+    safe_floor = limit_square.clamp_min(epsilon * epsilon)
+    denominator = mean_square.clamp_min(safe_floor).sqrt() + limit
+    return (excess_square / denominator).square()
+
+
 class PretrainedVAEHalfEncoder(nn.Module):
     """Trainable copy of the pretrained SD-VAE stem through its first downsample.
 
@@ -2061,17 +2080,24 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             if len(fine_entries) != 1:
                 raise RuntimeError("Fine-velocity regularization requires one refiner entry")
             fine_entry = fine_entries[0]
-            fine_rms = masked_mean(
-                fine_entry["fine_velocity"].square(), masks.latent
-            ).sqrt()
-            backbone_rms = masked_mean(
-                fine_entry["pre_refiner_velocity"].detach().square(), masks.latent
-            ).sqrt()
+            fine_mean_square = masked_mean(
+                fine_entry["fine_velocity"].float().square(), masks.latent
+            )
+            backbone_mean_square = masked_mean(
+                fine_entry["pre_refiner_velocity"].detach().float().square(), masks.latent
+            )
+            # These detached values are logging/threshold statistics. Keeping the
+            # square root out of the differentiable fine path fixes the rare all-CFG-
+            # drop backward NaN.
+            fine_rms = fine_mean_square.detach().sqrt()
+            backbone_rms = backbone_mean_square.detach().sqrt()
             fine_limit = torch.maximum(
                 backbone_rms * self.fine_velocity_max_backbone_ratio,
                 backbone_rms.new_tensor(self.fine_velocity_min_limit),
             )
-            fine_velocity_regularization = (fine_rms - fine_limit).clamp_min(0).square()
+            fine_velocity_regularization = stable_excess_rms_penalty(
+                fine_mean_square, fine_limit
+            )
             loss = loss + (
                 self.fine_velocity_regularization_weight
                 * fine_velocity_regularization

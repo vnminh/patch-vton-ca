@@ -8,6 +8,7 @@ from torch.utils.checkpoint import checkpoint
 from .pf_transformer import PatchForcingDiT, pf_modulate
 
 GARMENT_SCALES = ("coarse", "middle", "detail")
+MASKED_LOGIT = -1e4
 
 
 def chunked_scaled_dot_product_attention(query, key, value, valid, chunk_size=512):
@@ -72,7 +73,10 @@ def hard_attention_sampling_grid(query, key, valid, height, width, shared_heads=
         raise ValueError("Attention keys, validity mask and garment grid do not match")
     with torch.autocast(device_type=query.device.type, enabled=False):
         logits = query.float() @ key.float().transpose(-1, -2) / math.sqrt(query.shape[-1])
-        logits = logits.masked_fill(~valid[:, None, None], float("-inf"))
+        # A finite sentinel is indistinguishable from -inf at these bounded score
+        # scales, while avoiding undefined softmax derivatives in mixed precision if
+        # a future mask regression ever produces an empty row.
+        logits = logits.masked_fill(~valid[:, None, None], MASKED_LOGIT)
         if shared_heads:
             # Values are split into channel heads, but a physical cloth point cannot
             # move to eight different person locations.  Average the routing evidence
@@ -169,7 +173,7 @@ def local_attention_sampling_grid(
         logits = logits.mean(dim=1, keepdim=True)
         candidate_valid = candidate_valid.all(dim=1, keepdim=True)
         candidate = candidate[:, :1]
-    probability = logits.masked_fill(~candidate_valid, float("-inf")).softmax(-1)
+    probability = logits.masked_fill(~candidate_valid, MASKED_LOGIT).softmax(-1)
     grid = (probability[..., None] * candidate).sum(-2).clamp(-limit, limit)
     if shared_heads:
         grid = grid.expand(-1, heads, -1, -1)
