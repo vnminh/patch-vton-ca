@@ -16,7 +16,10 @@ from patch_flow.models.pf_transformer_vton import (
     sample_attention_heads,
     upsample_displacement_grid,
 )
-from patch_flow.trainer_vton import LatentVTONPatchForcingTrainer
+from patch_flow.trainer_vton import (
+    LatentVTONPatchForcingTrainer,
+    stable_excess_rms_penalty,
+)
 from test_vton_supervision import trainer, batch
 
 
@@ -721,6 +724,26 @@ def test_hard_coarse_route_and_local_residual_cannot_average_distant_modes():
     torch.testing.assert_close(upsampled, expected, rtol=0, atol=1e-6)
 
 
+def test_fine_velocity_penalty_has_finite_zero_gradient_for_all_cfg_drop():
+    mean_square = torch.zeros((), requires_grad=True)
+    penalty = stable_excess_rms_penalty(mean_square, mean_square.new_tensor(.1))
+    assert penalty == 0
+    penalty.backward()
+    assert mean_square.grad == 0
+    assert torch.isfinite(mean_square.grad)
+
+    zero_limit = torch.zeros((), requires_grad=True)
+    stable_excess_rms_penalty(zero_limit, zero_limit.detach()).backward()
+    assert zero_limit.grad == 0 and torch.isfinite(zero_limit.grad)
+
+    # Above the limit this is mathematically the original RMS penalty.
+    mean_square = torch.tensor(.09, requires_grad=True)
+    penalty = stable_excess_rms_penalty(mean_square, mean_square.new_tensor(.1))
+    torch.testing.assert_close(penalty, (mean_square.sqrt() - .1).square())
+    penalty.backward()
+    assert torch.isfinite(mean_square.grad)
+
+
 def test_consensus_sampling_grid_is_shared_across_value_heads():
     query = torch.randn(1, 4, 4, 8)
     key = torch.randn_like(query)
@@ -855,7 +878,7 @@ def test_rgb_hf_experiment_uses_two_baseline_subtracted_vae_streams():
     assert cfg.trainer.params.hf_detail_loss_weight > 0
     assert cfg.data.params.train.params.garment_high_frequency_mode == 'rgb_dog_gradient'
     assert cfg.data.params.validation.params.garment_high_frequency_mode == 'rgb_dog_gradient'
-    assert cfg.train_params.val_check_interval == 50
+    assert cfg.train_params.val_check_interval == 250
     assert cfg.name.endswith('detail-rgb-hf')
 
 
@@ -893,7 +916,8 @@ def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
     assert cfg.data.params.batch_size * cfg.train_params.accumulate_grad_batches == 32
     assert cfg.trainer.params.hf_decoded_rgb_weight > cfg.trainer.params.hf_decoded_edge_weight
     assert cfg.trainer.params.hf_decoded_chroma_weight > cfg.trainer.params.hf_decoded_edge_weight
-    assert cfg.trainer.params.garment_refiner_lr_multiplier == .1
+    assert cfg.model.params.garment_refiner_cosine_scale == 10
+    assert cfg.trainer.params.garment_refiner_lr_multiplier == .25
     assert cfg.trainer.params.garment_high_frequency_lr_multiplier == .1
     assert cfg.trainer.params.garment_value_mix_lr_multiplier == 1
     assert cfg.trainer.params.adapter_lr_multiplier == .1

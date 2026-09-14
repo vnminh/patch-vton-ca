@@ -78,6 +78,12 @@ trainer:
     # Decode the joint RGB+HF refiner estimate. RGB keeps ink colour, opponent chroma
     # keeps colour blocks, and edge keeps letter boundaries. One sample caps frozen-VAE
     # activation memory on a 24 GB GPU.
+    # Raised from 0.1. This term decodes the refiner's own estimate, so it is the most
+    # targeted place to charge the branch for growing in a smooth direction -- which is
+    # exactly how it grew: displacement and warp smoothness both rose with the velocity.
+    # decoded_edge_weight and detail_loss_weight are deliberately left alone; the RGB and
+    # chroma emphasis is the intended design and the velocity guard above is what
+    # actually bounds the magnitude.
     hf_decoded_rgb_weight: 1.0
     hf_decoded_contrast_weight: 1.0
     hf_decoded_chroma_weight: 1.0
@@ -97,7 +103,10 @@ trainer:
 
     # Both newly coupled branches were previously trained at 1e-4 while the backbone
     # used 1e-5. Use the stable rate for fusion/refinement as well.
-    garment_refiner_lr_multiplier: 0.1
+    # The router was receiving only 7e-6 at step 700 and its top-1 accuracy regressed.
+    # A quarter-rate adapter remains below the full garment attention LR while allowing
+    # the corrected, non-saturated routing signal to move Q/K during this warm restart.
+    garment_refiner_lr_multiplier: 0.25
     garment_high_frequency_lr_multiplier: 0.1
     # Three bounded zero-init scalars are safe at the base 1e-4 LR; putting them in
     # the 1e-5 adapter group would open the corrected V payload only ~0.01 after 1k steps.
@@ -120,6 +129,9 @@ data:
 
 lr_scheduler:
   params:
+    # All backbone weights are loaded; only the corrected routing/fusion needs a short
+    # optimizer warmup. Avoid multiplying a 1000-step LR ramp by another 1000-step
+    # correspondence ramp, which starved the fine route quadratically.
     num_warmup_steps: 500
 
 train_params:

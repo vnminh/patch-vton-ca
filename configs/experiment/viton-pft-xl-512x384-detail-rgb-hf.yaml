@@ -38,4 +38,4 @@ data:
         garment_high_frequency_gradient_gain: 2.0
 
 train_params:
-  val_check_interval: 50
+  val_check_interval: 250

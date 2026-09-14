@@ -2294,6 +2294,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 backbone_rms * self.fine_velocity_max_backbone_ratio,
                 backbone_rms.new_tensor(self.fine_velocity_min_limit),
             )
+            # Regularize the pre-clamp magnitude the network actually produces, not the
+            # already-hard-limited output, so the penalty has a real gradient to act on.
             fine_velocity_regularization = stable_excess_rms_penalty(
                 raw_fine_mean_square, fine_limit
             )

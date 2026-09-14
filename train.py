@@ -120,6 +120,38 @@ def unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
         return model
 
 
+@torch.no_grad()
+def clip_grad_norm_finite(accelerator, module, optimizer, max_norm, step=None):
+    """Unscale, validate, then clip without allowing NaNs to touch the optimizer.
+
+    ``Accelerator.clip_grad_norm_`` delegates to PyTorch with
+    ``error_if_nonfinite=False``. A NaN total norm therefore creates a NaN clipping
+    coefficient and contaminates every otherwise-finite gradient before AdamW runs.
+    """
+    accelerator.unscale_gradients(optimizer)
+    parameters = [parameter for parameter in module.parameters() if parameter.grad is not None]
+    try:
+        return torch.nn.utils.clip_grad_norm_(
+            parameters,
+            max_norm=float(max_norm),
+            error_if_nonfinite=True,
+        )
+    except RuntimeError as error:
+        bad_names = [
+            name for name, parameter in module.named_parameters()
+            if parameter.grad is not None and not torch.isfinite(parameter.grad).all().item()
+        ]
+        optimizer.zero_grad()
+        location = "" if step is None else f" at optimizer step {step}"
+        preview = ", ".join(bad_names[:20]) or "unknown parameter"
+        if len(bad_names) > 20:
+            preview += f", ... (+{len(bad_names) - 20} more)"
+        raise FloatingPointError(
+            f"Non-finite gradient{location}; optimizer step was cancelled. "
+            f"Affected parameters: {preview}"
+        ) from error
+
+
 def repeat_dataloader(loader, max_epochs=-1, iterator_wrapper=None):
     """Iterate finite dataloaders across epochs without caching their batches."""
     epoch = 0
@@ -389,6 +421,13 @@ def main(cfg: DictConfig):
                         else:
                             loss_dict = {}
 
+                if not torch.isfinite(loss.detach()).item():
+                    optimizer.zero_grad()
+                    raise FloatingPointError(
+                        f"Non-finite forward loss at optimizer step {global_step}; "
+                        "backward and optimizer step were cancelled."
+                    )
+
                 # backward
                 with profile_record_fn(f"step_{global_step}/bwd"):
                     accelerator.backward(loss)
@@ -410,8 +449,12 @@ def main(cfg: DictConfig):
                 # optimizer step
                 with profile_record_fn(f"step_{global_step}/opt"):
                     if accelerator.sync_gradients:
-                        grad_norm = accelerator.clip_grad_norm_(
-                            module.parameters(), max_norm=cfg.train_params.clip_grad_norm
+                        grad_norm = clip_grad_norm_finite(
+                            accelerator,
+                            module,
+                            optimizer,
+                            max_norm=cfg.train_params.clip_grad_norm,
+                            step=global_step,
                         )
                     optimizer.step()
                     optimizer.zero_grad()
