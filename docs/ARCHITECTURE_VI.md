@@ -13,8 +13,8 @@ tạo được màu khối, logo, chữ nhỏ từ ảnh garment. Model kết h�
 ## 1. Mô hình trong một câu
 
 DiT tạo cấu trúc người và `backbone_velocity`; garment RGB/VAE được warp vào người,
-HF của garment được warp bằng cùng correspondence, hai feature được cộng trước một
-refiner duy nhất, và refiner sinh `fine_velocity` để cộng vào backbone.
+HF của garment được warp bằng cùng correspondence rồi đổi sang RGB feature basis qua
+một projection zero-init có giới hạn; refiner duy nhất sinh `fine_velocity`.
 
 ```text
 final_velocity = backbone_velocity + fine_velocity
@@ -61,7 +61,8 @@ same detached Q/K/grid + HF V ──> high-resolution warp/downsample
                                                    = hf_warped_feature
 
 FUSION AND OUTPUT
-fused_feature = rgb_warped_feature + hf_warped_feature
+hf_delta = RGB_RMS * tanh(zero_init_conv(group_norm(hf_warped_feature)))
+fused_feature = rgb_warped_feature + hf_delta
 fused_feature + detached backbone state ──> one shared refiner ──> fine_velocity
 final_velocity = backbone_velocity + fine_velocity
 ```
@@ -231,12 +232,17 @@ Refiner không lấy trung bình softmax toàn garment:
 
 1. pool Q/K xuống 32x24;
 2. hard attention chọn coarse garment anchor;
-3. upsample displacement về 64x48;
-4. chỉ tìm local residual trong bán kính cấu hình quanh anchor;
-5. dùng grid đó bilinear-sample từng attention head của V.
+3. lấy trung bình routing evidence của 8 head để chọn **một** coarse grid vật lý;
+4. upsample displacement về 64x48;
+5. tìm một local residual đồng thuận trong bán kính cấu hình quanh anchor;
+6. dùng cùng grid đó bilinear-sample tám nhóm channel của V.
 
 Kết quả qua `attention_out` là `rgb_warped_feature` kích thước
 `B x 256 x 64 x 48`.
+
+Global RGB `A@V/warp_mix` bị tắt trong config logo. Nó từng trộn các vị trí garment
+xa nhau; hơn nữa per-head grid cũ cho phép tám nhóm channel lấy từ tám vị trí khác
+nhau, nên feature concat có edge nhưng không còn là một logo/màu coherent.
 
 ## 9. GarmentHighFrequencyControl
 
@@ -245,21 +251,25 @@ detach trên đường HF để HF không tự bẻ correspondence nhằm giảm
 
 HF control:
 
-1. zero-init 1x1 encoder ánh xạ 256 HF channel sang width 256;
+1. 1x1 encoder học được ánh xạ 256 HF channel sang width 256;
 2. trừ spatial mean chỉ trên valid garment keys;
 3. warp feature ở 256x192 bằng displacement grid đã upsample;
 4. downsample sau warp về 64x48 để giữ sub-latent phase;
-5. local processing + `feature_out` tạo `hf_warped_feature` 256 channel.
+5. local processing + `feature_out` bias-free tạo `hf_warped_feature` 256 channel;
+6. trừ spatial DC lần cuối trong edit support để HF không đổi màu trung bình.
 
 Global HF attention bị tắt trong config logo vì đường global dễ trung bình hoá các
 vùng garment xa nhau. Xem [`VTON_HF_CONTROL.md`](VTON_HF_CONTROL.md).
 
 ## 10. Fusion và fine velocity
 
-Phép fusion là cộng feature cùng semantic width và cùng hệ tọa độ person:
+HF và RGB có cùng width nhưng không mặc nhiên cùng feature basis. Vì vậy không cộng
+raw trực tiếp. Fusion chuẩn hoá HF, đổi basis bằng convolution zero-init và giới hạn
+biên độ theo RMS của RGB:
 
 ```text
-fused = rgb_warped_feature + hf_warped_feature
+hf_delta = rms(stopgrad(rgb)) * tanh(Conv_zero(GroupNorm(hf_warped)))
+fused = rgb_warped_feature + hf_delta
 ```
 
 Refiner nhận thêm hai state đã stop-gradient:
@@ -274,6 +284,10 @@ output convolution sau đó tạo **một** `fine_velocity` bốn channel:
 fine_velocity = Refiner(fused, stopgrad(backbone state))
 final_velocity = backbone_velocity + fine_velocity
 ```
+
+Trainer thêm trust-region mềm: RMS của `fine_velocity` không được tăng tự do quá
+`max(0.1, 0.5 * backbone_velocity_rms)`. Đây là guard chống residual chiếm quyền
+backbone như run lỗi (fine RMS tăng khoảng 67 lần).
 
 Không có person-only additive shortcut qua refiner và không có HF velocity head.
 Garment-transported feature luôn là carrier của residual detail.
@@ -292,6 +306,7 @@ Garment-transported feature luôn là carrier của residual detail.
 | decoded RGB/edge chính | toàn edit region | reconstruction và tay/pose bị agnostic xoá |
 | HF decoded RGB/chroma/edge | sparse garment detail | logo/màu/biên tại vùng garment |
 | HF source consistency/sparse | paired garment detail | shared sampling grid copy HF đúng vị trí |
+| fine velocity trust-region | edit latent | không cho refiner lấn át backbone/màu |
 
 HF auxiliary clean prediction dùng:
 
@@ -300,7 +315,9 @@ z_clean_hf = z_t.detach()
              + (1-t) * (stopgrad(backbone_velocity) + fine_velocity)
 ```
 
-Do đó decoded HF/detail loss cập nhật joint refiner và HF encoder nhưng không kéo
+`hf_detail_loss` trùng với main `detail_loss` sau fusion nên bị tắt. Decoded
+RGB/chroma được ưu tiên hơn edge. Do đó decoded HF loss cập nhật joint refiner và HF
+encoder nhưng không kéo
 backbone velocity đến local optimum của auxiliary edge objective. Flow loss trên
 `final_velocity` vẫn cập nhật toàn graph theo cấu hình optimizer.
 
@@ -311,7 +328,7 @@ backbone velocity đến local optimum của auxiliary edge objective. Flow loss
 | DiT backbone | flow, backbone correspondence, decoded reconstruction chính |
 | garment K/Q routing | correspondence, RGB/value, coordinate/smoothness, HF source consistency |
 | garment RGB V/refiner | flow, fine RGB/value, joint decoded HF loss |
-| HF encoder/feature_out | flow, latent HF detail và joint decoded HF loss |
+| HF fusion/encoder/feature_out | flow và joint decoded RGB/chroma/edge |
 | uncertainty head | uncertainty NLL |
 
 HF Q/K được detach chỉ trên HF-value path; Q/K vẫn học bình thường từ các loss
@@ -336,7 +353,7 @@ Khi đổi từ kiến trúc `backbone + detail_velocity + hf_velocity` sang fus
 
 - giữ DiT, garment RGB routing, refiner và HF condition stem tương thích;
 - bỏ toàn bộ tensor HF control cũ có head 4 channel;
-- zero-init HF encoder mới nên output tại bước đầu không đổi;
+- init lại HF extractor bias-free, zero-init `hf_fusion` nên output bước đầu không đổi;
 - dùng `load_weights` với optimizer mới.
 
 Chỉ dùng `resume_checkpoint` sau khi checkpoint đã được tạo bởi chính graph fused
@@ -348,7 +365,9 @@ hiện tại. Không dùng đồng thời hai tùy chọn.
 
 - `x_embedder` có 13 input channel;
 - person và garment detail refiner cùng grid 64x48;
-- `hf_warped_feature` có 256 channel, không phải 4;
+- `hf_warped_feature` và bounded `hf_fusion_delta` có 256 channel, không phải 4;
+- tám attention head dùng cùng một `sampling_grid`;
+- RGB/HF global attention đều tắt trong config logo;
 - chỉ có một `fine_velocity` và một phép cộng velocity cuối;
 - zero garment/HF hoặc empty garment mask cho residual chính xác bằng zero.
 
@@ -357,7 +376,8 @@ hiện tại. Không dùng đồng thời hai tùy chọn.
 - routing: `fine_top1_accuracy`, `fine_rgb_loss`, `fine_warp_coordinate_loss`;
 - branch sống: `garment_grad/refiner/output`, `garment_grad/hf/encoder`,
   `garment_grad/hf/feature_out`;
-- authority: `fine_velocity_rms`, `hf_feature_rms`;
+- authority: `fine_velocity_rms`, `fine_velocity_limit`, `hf_feature_rms`,
+  `hf_fusion_delta_rms`;
 - reconstruction: `hf_decoded_rgb_loss`, `hf_decoded_chroma_loss`,
   `hf_decoded_edge_loss`;
 - chất lượng thật: preview paired và swapped cố định mỗi 50 optimizer step.

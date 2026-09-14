@@ -59,18 +59,18 @@ Soft attention toàn cục dễ trung bình hai vùng áo có màu/chữ khác n
 dùng một deformation grid nhất quán:
 
 1. Pool Q/K theo head từ 64x48 xuống 32x24.
-2. Hard coarse attention chọn một garment cell neo cho từng person cell.
+2. Trung bình score của 8 head rồi hard-select một garment anchor chung.
 3. Upsample coarse displacement, không upsample absolute coordinate trực tiếp.
-4. Tại 64x48, chỉ tìm fine residual trong bán kính `local_radius=2` quanh neo.
-5. Dùng grid cuối để bilinear-sample từng head của garment V.
+4. Tại 64x48, trung bình local score để chọn một residual chung trong radius 2.
+5. Dùng cùng grid vật lý để bilinear-sample tám nhóm channel của garment V.
 
 ```text
 warped = sample_attention_heads(V, sampling_grid)
 rgb_warped_feature = attention_out(warped)
 ```
 
-`warp_mix` là zero-init adapter giữa coherent warp và global `A@V`. Trong config
-logo, coherent warp là đường warm-start chính; HF global path bị tắt hoàn toàn.
+Trong config logo, global RGB `A@V/warp_mix` và global HF đều bị tắt. Chỉ coherent
+grid hoạt động; mỗi nhóm channel không còn được lấy từ một garment location khác.
 
 ## 5. Quan hệ với HF
 
@@ -80,7 +80,8 @@ Q/K/key mask/grid của RGB route, detach chúng trên HF path và chỉ thay V:
 ```text
 rgb_warped_feature = warp(RGB V, shared grid)
 hf_warped_feature  = warp(HF V,  shared grid)
-fused_feature      = rgb_warped_feature + hf_warped_feature
+hf_delta           = RGB_RMS * tanh(Conv_zero(GroupNorm(hf_warped_feature)))
+fused_feature      = rgb_warped_feature + hf_delta
 ```
 
 Nhờ đó logo edge và RGB/chroma cùng đến một person location. HF feature/decoded loss
@@ -100,6 +101,9 @@ fine_velocity = output(modulated + local(modulated))
 
 Đây là modulation nhân, không phải person-only additive shortcut. Nếu garment/HF
 rỗng thì fused feature và fine velocity đều bằng zero.
+
+`fine_velocity` có trust-region mềm so với RMS của backbone. Điều này ngăn refiner
+tăng biên độ vô hạn để tối ưu edge trong khi phá màu và cấu trúc person.
 
 ## 7. Supervision cho routing
 
@@ -151,7 +155,8 @@ region để giữ pose/tay.
 | Match đúng nhưng sai màu | `fine_rgb_loss`, value loss, decoded chroma |
 | Edge có nhưng logo vô nghĩa | decoded RGB/chroma + preview, không chỉ edge loss |
 | Refiner không có authority | `fine_velocity_rms`, `garment_grad/refiner/output` |
-| HF không sống | `hf_feature_rms`, `garment_grad/hf/encoder` |
+| Refiner lấn át backbone | `fine_velocity_rms`, `fine_velocity_limit` |
+| HF không sống | `hf_feature_rms`, `hf_fusion_delta_rms`, fusion/encoder gradients |
 
 ## 10. Code map
 

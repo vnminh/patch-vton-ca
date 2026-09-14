@@ -134,9 +134,9 @@ Coherent grid:
 
 ```text
 coarse Q/K                   B x 8 x 768 x 32
-coarse hard grid             B x 8 x 768 x 2
-upsampled base grid          B x 8 x 3072 x 2
-local fine sampling grid     B x 8 x 3072 x 2
+coarse hard grid (shared)    B x 8 x 768 x 2   # 8 views của cùng tọa độ
+upsampled base grid          B x 8 x 3072 x 2  # identical across heads
+local fine grid (shared)     B x 8 x 3072 x 2  # identical across heads
 warped RGB values            B x 8 x 3072 x 32
 rgb_warped_feature           B x 256 x 64 x 48
 ```
@@ -147,7 +147,7 @@ HF dùng cùng `Q/K/key_valid/sampling_grid` nhưng V riêng:
 
 ```text
 HF input                     B x 256 x 256 x 192
-1x1 zero-init encoder        B x 256 x 256 x 192
+1x1 bias-free encoder        B x 256 x 256 x 192
 high-resolution warp         B x 256 x 256 x 192
 stride-4 downsample          B x 256 x 64 x 48
 local + feature_out          B x 256 x 64 x 48
@@ -159,7 +159,9 @@ local + feature_out          B x 256 x 64 x 48
 ## 10. Fusion/refiner output
 
 ```text
-fused_feature = rgb_warped_feature + hf_warped_feature
+hf_delta = RGB_RMS * tanh(zero-init Conv(GroupNorm(hf_warped_feature)))
+         = B x 256 x 64 x 48
+fused_feature = rgb_warped_feature + hf_delta
               = B x 256 x 64 x 48
 
 velocity_condition(

@@ -123,10 +123,12 @@ def main():
         assert module.model.garment_refiner.query.weight.grad.abs().sum() > 0
         control = module.model.garment_high_frequency_control
         if control is not None:
-            # Production warm starts a trained RGB refiner, so its one velocity head
-            # sends the fused supervision into the zero-initialized HF feature encoder.
+            # The zero-init HF-to-RGB basis conversion receives gradient immediately;
+            # the upstream extractor follows after that gate opens.
+            fusion = module.model.garment_refiner.hf_fusion
+            assert fusion.weight.grad is not None
+            assert fusion.weight.grad.abs().sum() > 0
             assert control.encoder.weight.grad is not None
-            assert control.feature_out.bias.grad is not None
         if step:
             assert module.model.garment_refiner.value.weight.grad.abs().sum() > 0
             if module.model.dense_pose_channels:
@@ -136,7 +138,7 @@ def main():
                 assert dense_gradient.abs().sum() > 0
             if control is not None:
                 assert control.encoder.weight.grad.abs().sum() > 0
-                assert control.feature_out.bias.grad.abs().sum() > 0
+                assert control.feature_out.weight.grad.abs().sum() > 0
         # train.py calls this every garment_grad_log_every_n_steps; a stale attribute
         # path here crashed a real run after 399 iterations.
         grad_metrics = module.garment_gradient_norms()
@@ -173,7 +175,7 @@ def main():
                 num_steps=2, cfg_scale=1.5, **module._garment_conditions(encoded),
             )
         assert samples.shape == encoded['target'].shape and torch.isfinite(samples).all()
-        print('HF FUSION PASS: zero HF feature gate, joint refiner gradients, unpaired CFG generation.', flush=True)
+        print('HF FUSION PASS: zero HF-to-RGB gate, bounded/DC-free fusion, joint refiner gradients, unpaired CFG generation.', flush=True)
     print(f'PASS: {args.height}x{args.width} real paired images, frozen SD-VAE and DINO, two optimizer steps, decoded gradient/parity and direct fine correspondence/value supervision. XL GPU peak memory and image quality are not tested.', flush=True)
 
 

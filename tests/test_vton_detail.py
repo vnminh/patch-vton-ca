@@ -20,7 +20,8 @@ from patch_flow.trainer_vton import LatentVTONPatchForcingTrainer
 from test_vton_supervision import trainer, batch
 
 
-def model(refiner=False, match=False, dense_pose_channels=0, garment_high_frequency_channels=0):
+def model(refiner=False, match=False, dense_pose_channels=0, garment_high_frequency_channels=0,
+          shared_sampling_grid=False, refiner_global_attention=True):
     return VTONPatchForcingDiT(
         input_size=8, in_channels=4, hidden_size=32, depth=3, num_heads=4,
         num_classes=10, cross_attention_every=1, garment_middle_channels=8,
@@ -29,6 +30,8 @@ def model(refiner=False, match=False, dense_pose_channels=0, garment_high_freque
         garment_refiner_width=32, garment_refiner_heads=4, gradient_checkpointing=True,
         dense_pose_channels=dense_pose_channels,
         garment_high_frequency_channels=garment_high_frequency_channels,
+        garment_refiner_shared_sampling_grid=shared_sampling_grid,
+        garment_refiner_global_attention=refiner_global_attention,
     )
 
 
@@ -111,17 +114,19 @@ def test_high_frequency_control_preserves_13_inputs_and_warm_starts(ema_rate):
     nn.init.normal_(old.model.final_layer.linear.weight, std=.1)
     new = wrap(model(refiner=True, dense_pose_channels=4, garment_high_frequency_channels=8))
     old_weight = old.model.x_embedder.proj.weight.detach().clone()
-    with pytest.warns(UserWarning, match='zero-initialized encoder'):
+    with pytest.warns(UserWarning, match='zero-init HF-to-RGB'):
         new.load_state_dict(old.state_dict(), strict=True)
     weight = new.model.x_embedder.proj.weight
     assert weight.shape[1] == 13
     torch.testing.assert_close(weight, old_weight, rtol=0, atol=0)
-    # The zero sits on the encoder, not the head: the head must keep a usable
-    # initialisation or nothing upstream of it ever receives gradient.
-    assert not new.model.garment_high_frequency_control.encoder.weight.any()
+    # The HF extractor is usable immediately; the basis conversion is the exact-zero
+    # function-preserving gate.
+    assert new.model.garment_high_frequency_control.encoder.weight.any()
     assert new.model.garment_high_frequency_control.feature_out.weight.any()
+    assert not new.model.garment_refiner.hf_fusion.weight.any()
     if ema_rate:
-        assert not new.ema_model.garment_high_frequency_control.encoder.weight.any()
+        assert new.ema_model.garment_high_frequency_control.encoder.weight.any()
+        assert not new.ema_model.garment_refiner.hf_fusion.weight.any()
 
     data = inputs()
     dense_pose = torch.randn(2, 4, 8, 6)
@@ -144,7 +149,7 @@ def test_high_frequency_control_preserves_13_inputs_and_warm_starts(ema_rate):
     torch.testing.assert_close(new.model.x_embedder.proj.weight, old_weight, rtol=0, atol=0)
     new.load_state_dict(new.state_dict(), strict=True)
     partial = new.state_dict()
-    del partial['model.garment_high_frequency_control.feature_out.bias']
+    del partial['model.garment_high_frequency_control.feature_out.weight']
     with pytest.raises(RuntimeError, match='Missing key'):
         new.load_state_dict(partial, strict=True)
 
@@ -176,15 +181,16 @@ def test_garment_gradient_norms_cover_every_conditioning_branch():
     metrics = module.garment_gradient_norms()
     for key in ('garment_grad/hf/encoder', 'garment_grad/hf/feature_out',
                 'garment_grad/refiner/state', 'garment_grad/refiner/velocity_condition',
-                'garment_grad/refiner/query',
+                'garment_grad/refiner/query', 'garment_grad/refiner/hf_fusion',
                 'garment_grad/embedder_detail'):
         assert key in metrics, key
         assert torch.isfinite(metrics[key])
-    # The two branches whose gradient path this revision repaired must be alive on the
-    # first backward; the HF head's weight is still waiting for a non-zero input.
-    assert metrics['garment_grad/hf/encoder'] > 0
+    # Fusion opens first while preserving the warm-start prediction exactly. The raw HF
+    # extractor receives flow gradient after this zero gate becomes non-zero.
+    assert metrics['garment_grad/refiner/hf_fusion'] > 0
     assert metrics['garment_grad/refiner/state'] > 0
     assert metrics['garment_grad/refiner/velocity_condition'] > 0
+    assert metrics['garment_grad/hf/encoder'] == 0
     assert metrics['garment_grad/hf/feature_out'] == 0
 
 
@@ -193,7 +199,6 @@ def test_hf_values_follow_the_shared_coherent_sampling_grid():
     net = model(refiner=True, garment_high_frequency_channels=8).eval()
     control = net.garment_high_frequency_control
     nn.init.normal_(control.encoder.weight, std=.1)
-    nn.init.constant_(control.encoder.bias, 3.0)          # a large shared component
     hf = torch.randn(2, 8, 32, 24)
     valid = torch.ones(2, 48, dtype=torch.bool)
     valid[:, 24:] = False                                  # only some keys are garment
@@ -209,6 +214,7 @@ def test_hf_values_follow_the_shared_coherent_sampling_grid():
         b = control(hf, query, key, valid, torch.ones(2, 1, 8, 6),
                     torch.ones(2, 1, 64, 48), shifted)
     assert a.abs().sum() > 0 and not torch.allclose(a, b)
+    torch.testing.assert_close(a.sum((2, 3)), torch.zeros_like(a.sum((2, 3))), atol=1e-4, rtol=0)
 
 
 @pytest.mark.parametrize('gains', [(1., 1.), (10., .25)])
@@ -265,7 +271,7 @@ def test_previous_hf_revision_checkpoint_loads_by_discarding_the_whole_branch():
     )
     prefix = 'model.garment_high_frequency_control.'
     legacy = module.state_dict()
-    for key in (prefix + 'encoder.weight', prefix + 'encoder.bias'):
+    for key in (prefix + 'encoder.weight',):
         del legacy[key]
     # Shapes and names of the previous pixel-unshuffle encoder.
     legacy[prefix + 'encoder.1.weight'] = torch.randn(32, 64, 1, 1)
@@ -284,8 +290,7 @@ def test_previous_hf_revision_checkpoint_loads_by_discarding_the_whole_branch():
     with pytest.warns(UserWarning):
         module.load_state_dict(legacy, strict=True)
     control = module.model.garment_high_frequency_control
-    assert not control.encoder.weight.any() and not control.encoder.bias.any()
-    assert not control.feature_out.bias.any()
+    assert control.encoder.weight.any()
     assert control.feature_out.weight.any()
 
     data = inputs()
@@ -296,7 +301,8 @@ def test_previous_hf_revision_checkpoint_loads_by_discarding_the_whole_branch():
         module.model(**data, dense_pose=torch.randn(2, 4, 8, 6),
                      garment_high_frequency=torch.randn(2, 8, 32, 24))
         handle.remove()
-    assert not residual[0].any()
+    assert residual[0].any()
+    assert not module.model.garment_refiner.hf_fusion.weight.any()
 
 
 def test_hf_features_fuse_into_the_single_refiner_velocity():
@@ -307,7 +313,9 @@ def test_hf_features_fuse_into_the_single_refiner_velocity():
     data['edit_mask'][0, :, :, 3:] = 0
     hf = torch.randn(2, 8, 32, 24)
     control = net.garment_high_frequency_control
-    optimizer = torch.optim.Adam(control.parameters(), lr=.01)
+    optimizer = torch.optim.Adam(
+        [*control.parameters(), *net.garment_refiner.hf_fusion.parameters()], lr=.01
+    )
     for step in range(2):
         captured = []
         routing_requires_grad = []
@@ -320,8 +328,7 @@ def test_hf_features_fuse_into_the_single_refiner_velocity():
         # HF copies the detail refiner's attention probabilities, but its loss must not
         # update the shared Q/K routing. RGB/correspondence supervision owns that map.
         assert routing_requires_grad == [(False, False)]
-        if step == 0:
-            assert not captured[0].any()
+        assert captured[0].any()
         with torch.no_grad():
             baseline, baseline_logvar = net(
                 **data, garment_high_frequency=torch.zeros_like(hf), return_uncertainty=True
@@ -334,10 +341,10 @@ def test_hf_features_fuse_into_the_single_refiner_velocity():
         assert captured[0].shape[1] == net.garment_refiner.width
         assert not captured[0][0, :, :, 3:].any()
         (velocity - torch.randn_like(velocity)).square().mean().backward()
-        # The zero sits on the feature encoder; the trained RGB refiner sends gradient
-        # through the standard-initialized feature projection immediately.
-        assert control.encoder.weight.grad.abs().sum() > 0
-        assert control.feature_out.bias.grad.abs().sum() > 0
+        # The zero fusion projection learns first. Once it opens, gradients reach the
+        # upstream HF feature extractor without perturbing the warm-start prediction.
+        assert net.garment_refiner.hf_fusion.weight.grad.abs().sum() > 0
+        assert (control.encoder.weight.grad.abs().sum() > 0) == bool(step)
         assert (control.feature_out.weight.grad.abs().sum() > 0) == bool(step)
         optimizer.step()
         net.zero_grad(set_to_none=True)
@@ -364,6 +371,7 @@ def test_hf_features_change_only_the_single_fused_refiner_output():
         nn.init.normal_(net.garment_refiner.output.weight, std=.05)
         nn.init.normal_(net.garment_refiner.velocity_condition.weight, std=.05)
         nn.init.normal_(net.garment_high_frequency_control.encoder.weight, std=.05)
+        nn.init.normal_(net.garment_refiner.hf_fusion.weight, std=.01)
 
     condition_inputs, fine_outputs, hf_outputs = [], [], []
     condition_handle = net.garment_refiner.velocity_condition.register_forward_pre_hook(
@@ -628,6 +636,22 @@ def test_hard_coarse_route_and_local_residual_cannot_average_distant_modes():
     torch.testing.assert_close(upsampled, expected, rtol=0, atol=1e-6)
 
 
+def test_consensus_sampling_grid_is_shared_across_value_heads():
+    query = torch.randn(1, 4, 4, 8)
+    key = torch.randn_like(query)
+    valid = torch.ones(1, 4, dtype=torch.bool)
+    coarse = hard_attention_sampling_grid(
+        query, key, valid, 2, 2, shared_heads=True
+    )
+    for head in range(1, 4):
+        torch.testing.assert_close(coarse[:, head], coarse[:, 0])
+    local = local_attention_sampling_grid(
+        query, key, valid, coarse, 2, 2, 1, shared_heads=True
+    )
+    for head in range(1, 4):
+        torch.testing.assert_close(local[:, head], local[:, 0])
+
+
 def test_fine_dense_pose_and_warp_adapters_are_zero_initialized():
     refiner = GarmentLatentRefiner(32, width=32, heads=4, dense_pose_channels=4)
     assert refiner.state.weight.shape[1] == 12
@@ -764,6 +788,9 @@ def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
     with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
         cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-512x384-detail-logo-hf'])
     assert not cfg.model.params.garment_high_frequency_global_attention
+    assert not cfg.model.params.garment_refiner_global_attention
+    assert cfg.model.params.garment_refiner_shared_sampling_grid
+    assert cfg.trainer.params.hf_detail_loss_weight == 0
     assert cfg.trainer.params.hf_source_sparse_weight > 0
     assert cfg.trainer.params.hf_decoded_rgb_weight > 0
     assert cfg.trainer.params.hf_decoded_chroma_weight > 0
@@ -773,7 +800,12 @@ def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
     assert cfg.data.params.batch_size == 1
     assert cfg.train_params.accumulate_grad_batches == 32
     assert cfg.data.params.batch_size * cfg.train_params.accumulate_grad_batches == 32
-    assert cfg.lr_scheduler.params.num_warmup_steps == 100
+    assert cfg.trainer.params.hf_decoded_rgb_weight > cfg.trainer.params.hf_decoded_edge_weight
+    assert cfg.trainer.params.hf_decoded_chroma_weight > cfg.trainer.params.hf_decoded_edge_weight
+    assert cfg.trainer.params.garment_refiner_lr_multiplier == .1
+    assert cfg.trainer.params.garment_high_frequency_lr_multiplier == .1
+    assert cfg.trainer.params.fine_velocity_regularization_weight > 0
+    assert cfg.lr_scheduler.params.num_warmup_steps == 1000
     assert cfg.name.endswith('detail-logo-hf')
 
 

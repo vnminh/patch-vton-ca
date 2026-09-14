@@ -14,7 +14,7 @@ HF **không tự sinh ảnh RGB**. Nó bổ sung thông tin cho RGB warped featu
 chung mới học cách chuyển thông tin kết hợp thành residual RGB/latent hợp lệ.
 
 ```text
-rgb_warped_feature + hf_warped_feature
+rgb_warped_feature + bounded_hf_delta
   -> shared detail refiner
   -> fine_velocity
 
@@ -99,13 +99,14 @@ loss không thể tự bẻ attention map sang nơi có biên mạnh nhưng sai 
 
 `GarmentHighFrequencyControl` thực hiện:
 
-1. `encoder`: 1x1, 256 -> 256, zero-init;
+1. `encoder`: 1x1 bias-free, 256 -> 256, có feature ngay từ đầu;
 2. trừ spatial mean trên valid garment pixels;
 3. local high-resolution processing ở 256x192;
 4. upsample displacement grid và warp HF value tại 256x192;
 5. stride-4 downsample sau warp về 64x48;
-6. local block + `feature_out` tạo 256 channel;
-7. edit/active gate ép vùng không hợp lệ về zero.
+6. local block + `feature_out` bias-free tạo 256 channel;
+7. trừ spatial DC lần cuối trên edit support;
+8. edit/active gate ép vùng không hợp lệ về zero.
 
 Warp trước rồi mới downsample giữ các phase nhỏ của stroke tốt hơn downsample HF
 trước correspondence.
@@ -113,35 +114,48 @@ trước correspondence.
 Spatial mean được loại chỉ ở nhánh HF. RGB refiner giữ garment mean vì đó là màu
 nền thật; HF mean chủ yếu là VAE/DC bias và từng gây flat colour shift.
 
-Global HF attention bị tắt trong config logo. Nó có xu hướng trung bình các vùng xa
-nhau và tạo glyph-like texture; coherent grid là route duy nhất đang hoạt động.
+Global HF và global RGB attention đều bị tắt trong config logo. Chúng có xu hướng
+trung bình các vùng xa nhau và tạo glyph-like texture; coherent grid là route duy
+nhất đang hoạt động. Tám value head dùng cùng một grid vật lý, không còn tám warp.
 
 ## 7. Zero initialization
 
-Zero-init nằm tại HF `encoder`, không nằm tại output head.
+Zero-init nằm tại projection `garment_refiner.hf_fusion`, không nằm trong HF
+extractor hay velocity head.
 
-- Bước đầu: HF feature bằng đúng zero, checkpoint cũ giữ nguyên prediction.
-- `feature_out.weight` vẫn non-zero theo standard initialization.
-- Gradient từ refiner đi xuyên `feature_out/downsample` đến encoder ngay update đầu.
+- Bước đầu: raw HF feature có nghĩa, nhưng `hf_delta` bằng đúng zero nên checkpoint
+  cũ giữ nguyên prediction.
+- `hf_fusion.weight` nhận gradient ngay update đầu.
+- Khi fusion mở, flow/decoded loss tiếp tục cập nhật upstream HF extractor. Source
+  consistency dùng raw HF map để giám sát grid, không đi qua extractor.
 
 Nếu zero cả output weight, gradient encoder cũng bằng zero cho tới khi output head
 đã thay đổi; revision cũ từng gần như không học vì vấn đề này.
 
 Empty garment, garment dropout và unconditional CFG đều bị `active` gate ép HF
-output chính xác zero, kể cả khi bias đã được train.
+output chính xác zero; các projection có thể tạo DC đều được thiết kế bias-free.
 
 ## 8. Fusion/refiner
 
 Sau routing:
 
 ```text
-fused = rgb_warped_feature + hf_warped_feature  # 256 x 64 x 48
+fused = rgb_warped_feature + bounded_hf_delta   # 256 x 64 x 48
 fine_velocity = garment_refiner.refine(fused, detached backbone state)
 final_velocity = backbone_velocity + fine_velocity
 ```
 
-Đây là một refiner duy nhất. HF không có quyền viết trực tiếp vào latent velocity,
-nên muốn giảm decoded RGB/chroma loss nó phải giúp refiner reconstruct appearance.
+Hai feature không được cộng raw vì chúng là hai basis học độc lập. Fusion hiện tại:
+
+```text
+hf_delta = rms(stopgrad(rgb_warped))
+           * tanh(Conv_zero(GroupNorm(hf_warped)))
+fused = rgb_warped + hf_delta
+```
+
+Conv không bias, `tanh` giới hạn biên độ và HF output đã zero spatial mean; vì vậy
+nhánh detail không thể tạo offset latent đồng đều làm đổi hue. Đây vẫn là một
+refiner duy nhất: HF không có quyền viết trực tiếp vào latent velocity.
 
 ## 9. Loss cho HF
 
@@ -162,8 +176,10 @@ z_t.detach() + (1-t) * (
 )
 ```
 
-Loss gồm latent detail và decoded RGB/chroma/edge. Nó cập nhật HF encoder và shared
-refiner, nhưng không cập nhật backbone qua auxiliary objective này.
+`hf_detail_loss` bị tắt vì sau fusion nó trùng số với main latent `detail_loss`, tức
+là cùng edge objective bị đếm hai lần. Loss auxiliary còn decoded RGB/chroma/edge,
+trong đó RGB/chroma mạnh hơn edge. Nó cập nhật HF fusion/extractor và shared refiner,
+nhưng không cập nhật backbone qua auxiliary objective này.
 
 HF decoded supervision chỉ dùng sparse support bên trong `person_garment_mask`.
 Decoded RGB/edge **chính** của trainer dùng toàn edit region để tái tạo cả tay/pose.
@@ -175,7 +191,7 @@ Checkpoint của revision cũ chứa `garment_high_frequency_control.output.*` b
 channel. Graph hiện tại cần `feature_out.*` 256 channel. Loader sẽ:
 
 - bỏ toàn bộ old HF control branch nếu thấy tensor không tương thích;
-- reset branch mới về zero-output;
+- init branch HF bias-free và reset `hf_fusion` về zero-output;
 - giữ DiT, RGB routing, refiner và pretrained/learned HF condition stem;
 - yêu cầu warm-start bằng `load_weights` với optimizer mới.
 
@@ -186,10 +202,13 @@ khôi phục cả optimizer và step. Không truyền hai lựa chọn cùng lú
 
 | Metric | Câu hỏi nó trả lời |
 |---|---|
-| `garment_grad/hf/encoder` | zero-init encoder có nhận gradient không? |
+| `garment_grad/refiner/hf_fusion` | projection đổi HF sang RGB basis có học không? |
+| `garment_grad/hf/encoder` | HF extractor có nhận gradient không? |
 | `garment_grad/hf/feature_out` | projection HF có học không? |
 | `hf_feature_rms` | HF feature có authority hay vẫn zero? |
+| `hf_fusion_delta_rms` | phần HF thực sự được cộng vào RGB lớn bao nhiêu? |
 | `fine_velocity_rms` | joint refiner có đóng góp vào output không? |
+| `fine_velocity_limit` | residual có vượt trust-region không? |
 | `hf_source_sparse_loss` | logo/detail source có được copy đúng vị trí không? |
 | decoded RGB/chroma/edge | reconstructed detail có đúng màu và cấu trúc không? |
 
@@ -200,9 +219,11 @@ có nghĩa và RGB/chroma loss phải cải thiện cùng edge.
 
 `scripts/verify_vton_rgb_hf.py` kiểm tra:
 
-- zero/empty HF không đổi output;
+- zero/empty HF không đổi output và warm start giữ prediction;
 - HF output có width 256 thay vì bốn velocity channel;
 - HF chỉ làm đổi shared `fine_velocity`;
 - hiệu final output đúng bằng hiệu fine output;
 - auxiliary HF loss không có gradient vào backbone final head;
-- gradient đến HF encoder, HF feature projection và RGB refiner.
+- một sampling grid chung cho mọi head;
+- global RGB/HF mixers đều bị tắt;
+- gradient đến HF fusion, encoder, feature projection và RGB refiner.

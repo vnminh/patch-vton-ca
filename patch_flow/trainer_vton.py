@@ -83,6 +83,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         hf_decoded_max_samples=1,
         learnable_hf_condition_encoder=False,
         hf_condition_encoder_lr_multiplier=0.05,
+        garment_refiner_lr_multiplier=1.0,
+        garment_high_frequency_lr_multiplier=1.0,
         decoded_rgb_weight=0.0,
         decoded_edge_weight=0.0,
         decoded_min_time=0.3,
@@ -104,6 +106,9 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         fine_warp_mask_weight=0.0,
         fine_loss_chunk_size=256,
         fine_low_time_power=0.0,
+        fine_velocity_regularization_weight=0.0,
+        fine_velocity_max_backbone_ratio=0.5,
+        fine_velocity_min_limit=0.1,
         garment_supervision_only=False,
         garment_token_min_coverage=0.8,
         garment_dropout_prob=0.1,
@@ -164,6 +169,10 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         self.hf_decoded_max_samples = int(hf_decoded_max_samples)
         self.learnable_hf_condition_encoder = bool(learnable_hf_condition_encoder)
         self.hf_condition_encoder_lr_multiplier = float(hf_condition_encoder_lr_multiplier)
+        self.garment_refiner_lr_multiplier = float(garment_refiner_lr_multiplier)
+        self.garment_high_frequency_lr_multiplier = float(
+            garment_high_frequency_lr_multiplier
+        )
         if min(
             self.hf_source_consistency_weight,
             self.hf_source_sparse_weight,
@@ -178,8 +187,12 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             raise ValueError("hf_sparse_activity_threshold must be in [0, 1]")
         if self.hf_sparse_support_radius < 0 or self.hf_decoded_max_samples < 1:
             raise ValueError("HF support radius must be non-negative and decoded samples positive")
-        if self.hf_condition_encoder_lr_multiplier <= 0:
-            raise ValueError("hf_condition_encoder_lr_multiplier must be positive")
+        if min(
+            self.hf_condition_encoder_lr_multiplier,
+            self.garment_refiner_lr_multiplier,
+            self.garment_high_frequency_lr_multiplier,
+        ) <= 0:
+            raise ValueError("HF/refiner learning-rate multipliers must be positive")
         self._hf_blank_feature_cache = {}
         self.hf_condition_encoder = None
         if self.learnable_hf_condition_encoder:
@@ -234,8 +247,21 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         # a shortcut that pays off for 65% of the sampled timesteps and collapses at the
         # t=0 where generation actually starts. The uniform-in-t loss rewards that.
         self.fine_low_time_power = float(fine_low_time_power)
+        self.fine_velocity_regularization_weight = float(
+            fine_velocity_regularization_weight
+        )
+        self.fine_velocity_max_backbone_ratio = float(
+            fine_velocity_max_backbone_ratio
+        )
+        self.fine_velocity_min_limit = float(fine_velocity_min_limit)
         if self.fine_low_time_power < 0:
             raise ValueError("fine_low_time_power must be non-negative")
+        if min(
+            self.fine_velocity_regularization_weight,
+            self.fine_velocity_max_backbone_ratio,
+            self.fine_velocity_min_limit,
+        ) < 0:
+            raise ValueError("Fine-velocity regularization values must be non-negative")
         if min(
             self.fine_correspondence_weight,
             self.fine_value_weight,
@@ -317,6 +343,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             self.fine_warp_coordinate_weight,
             self.fine_warp_smoothness_weight,
             self.fine_warp_mask_weight,
+            self.fine_velocity_regularization_weight,
         )
         if max(fine_routing_weights) > 0 and getattr(self.model, "garment_refiner", None) is None:
             raise ValueError("fine_correspondence_weight requires model.garment_latent_refiner")
@@ -392,11 +419,17 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         adapter_parameters = []
         backbone_parameters = []
         hf_encoder_parameters = []
+        refiner_parameters = []
+        hf_control_parameters = []
         for name, parameter in self.named_parameters():
             if not parameter.requires_grad:
                 continue
             if name.startswith("hf_condition_encoder."):
                 hf_encoder_parameters.append(parameter)
+            elif ".garment_refiner." in name:
+                refiner_parameters.append(parameter)
+            elif ".garment_high_frequency_control." in name:
+                hf_control_parameters.append(parameter)
             elif "garment_" in name or ".x_embedder" in name:
                 adapter_parameters.append(parameter)
             else:
@@ -404,6 +437,16 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         groups = []
         if adapter_parameters:
             groups.append({"params": adapter_parameters, "lr": self.lr})
+        if refiner_parameters:
+            groups.append({
+                "params": refiner_parameters,
+                "lr": self.lr * self.garment_refiner_lr_multiplier,
+            })
+        if hf_control_parameters:
+            groups.append({
+                "params": hf_control_parameters,
+                "lr": self.lr * self.garment_high_frequency_lr_multiplier,
+            })
         if backbone_parameters:
             groups.append({"params": backbone_parameters, "lr": self.lr * self.backbone_lr_multiplier})
         if hf_encoder_parameters:
@@ -461,7 +504,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         if refiner is not None:
             for name in (
                 "query_expand", "state", "velocity_condition", "query", "key", "value",
-                "warp_mix", "output",
+                "warp_mix", "hf_fusion", "output",
             ):
                 metrics[f"garment_grad/refiner/{name}"] = self._gradient_norm(getattr(refiner, name).weight)
         control = getattr(self.model, "garment_high_frequency_control", None)
@@ -841,11 +884,12 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 if branch_keys and not any(key.startswith(prefix) for key in state_dict):
                     # Do not silently retain a trained output when reusing a module.
                     network = self.ema_model if prefix.startswith("ema_model.") else self.model
-                    network.garment_high_frequency_control.reset_zero_gate()
+                    network.garment_high_frequency_control.reset_feature_path()
                     missing = [key for key in missing if key not in branch_keys]
                     warnings.warn(
-                        f"Warm-start: {prefix} is new with a zero-initialized encoder. "
-                        "Use load_weights with a fresh optimizer.", UserWarning,
+                        f"Warm-start: {prefix} was reinitialized; its zero-init HF-to-RGB "
+                        "fusion keeps the first prediction unchanged. Use load_weights "
+                        "with a fresh optimizer.", UserWarning,
                     )
                 else:
                     warp_prefix = prefix + "warp_mix."
@@ -919,6 +963,20 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                         f"Warm-start: {prefix} is a new zero-initialized deformable "
                         "adapter. Use load_weights with a fresh optimizer.", UserWarning,
                     )
+            for prefix in (
+                "model.garment_refiner.hf_fusion.",
+                "ema_model.garment_refiner.hf_fusion.",
+            ):
+                fusion_keys = {key for key in expected_state if key.startswith(prefix)}
+                if fusion_keys and not any(key.startswith(prefix) for key in state_dict):
+                    network = self.ema_model if prefix.startswith("ema_model.") else self.model
+                    network.garment_refiner.reset_hf_fusion()
+                    missing = [key for key in missing if key not in fusion_keys]
+                    warnings.warn(
+                        f"Warm-start: {prefix} is a new zero-initialized HF-to-RGB "
+                        "fusion. The first prediction is unchanged; use load_weights "
+                        "with a fresh optimizer.", UserWarning,
+                    )
             expected = self.state_dict().keys()
             for prefix in ("model.garment_refiner.", "ema_model.garment_refiner."):
                 branch_keys = {key for key in expected if key.startswith(prefix)}
@@ -938,6 +996,17 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 "ema_model.garment_refiner.local.1.bias", "ema_model.garment_refiner.local.3.bias",
             )
             unexpected = [key for key in unexpected if not key.startswith(obsolete)]
+        # Disabled global mixers are absent from forward and frozen. Clear stale loaded
+        # values as an additional guard if a later experiment enables them accidentally.
+        for network in (self.model, self.ema_model):
+            if network is None:
+                continue
+            refiner = getattr(network, "garment_refiner", None)
+            if refiner is not None and not refiner.use_global_attention:
+                refiner.reset_warp_mix()
+            control = getattr(network, "garment_high_frequency_control", None)
+            if control is not None and not control.use_global_attention:
+                control.reset_warp_mix()
         if strict and (missing or unexpected):
             details = []
             if missing:
@@ -1915,9 +1984,13 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 self.hf_decoded_edge_weight,
             ) > 0
         )
+        supervise_fine_velocity = (
+            self.training and self.fine_velocity_regularization_weight > 0
+        )
         request_attention = (
             supervise_correspondence or supervise_fine
             or supervise_hf_detail or supervise_hf_source or supervise_hf_decoded
+            or supervise_fine_velocity
         )
         output = self.model(
             x=xt,
@@ -1934,6 +2007,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             return_refiner_supervision=(
                 supervise_fine or supervise_hf_detail
                 or supervise_hf_source or supervise_hf_decoded
+                or supervise_fine_velocity
             ),
             garment_attention_scales=self.correspondence_scales,
             **conditions,
@@ -1983,6 +2057,38 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             metrics["detail_supervised_fraction"] = detail_mask.sum() / masks.latent.sum().clamp_min(1)
         fine_entries = [entry for entry in attention_maps if entry.get("scale") == "refiner"]
         attention_maps = [entry for entry in attention_maps if "weights" in entry]
+        if supervise_fine_velocity:
+            if len(fine_entries) != 1:
+                raise RuntimeError("Fine-velocity regularization requires one refiner entry")
+            fine_entry = fine_entries[0]
+            fine_rms = masked_mean(
+                fine_entry["fine_velocity"].square(), masks.latent
+            ).sqrt()
+            backbone_rms = masked_mean(
+                fine_entry["pre_refiner_velocity"].detach().square(), masks.latent
+            ).sqrt()
+            fine_limit = torch.maximum(
+                backbone_rms * self.fine_velocity_max_backbone_ratio,
+                backbone_rms.new_tensor(self.fine_velocity_min_limit),
+            )
+            fine_velocity_regularization = (fine_rms - fine_limit).clamp_min(0).square()
+            loss = loss + (
+                self.fine_velocity_regularization_weight
+                * fine_velocity_regularization
+            )
+            metrics["fine_velocity_rms"] = fine_rms.detach()
+            metrics["backbone_velocity_rms"] = backbone_rms.detach()
+            metrics["fine_velocity_limit"] = fine_limit.detach()
+            metrics["fine_velocity_regularization"] = (
+                fine_velocity_regularization.detach()
+            )
+            if "hf_warped_features" in fine_entry:
+                metrics["hf_feature_rms"] = fine_entry[
+                    "hf_warped_features"
+                ].float().square().mean().sqrt().detach()
+                metrics["hf_fusion_delta_rms"] = fine_entry[
+                    "hf_fusion_delta"
+                ].float().square().mean().sqrt().detach()
         correspondence_target = correspondence_weight = similarity = None
         if (supervise_correspondence or supervise_fine) and self.correspondence_teacher is not None:
             correspondence_target, correspondence_weight, similarity = self._correspondence_targets(
@@ -2024,12 +2130,13 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             metrics["hf_detail_active_fraction"] = (
                 hf_detail_mask.flatten(1).any(1).float().mean()
             )
-            metrics["fine_velocity_rms"] = masked_mean(
-                fine_entry["fine_velocity"].square(), hf_detail_mask
-            ).sqrt()
-            metrics["hf_feature_rms"] = fine_entry[
-                "hf_warped_features"
-            ].float().square().mean().sqrt()
+            if "fine_velocity_rms" not in metrics:
+                metrics["fine_velocity_rms"] = masked_mean(
+                    fine_entry["fine_velocity"].square(), hf_detail_mask
+                ).sqrt()
+                metrics["hf_feature_rms"] = fine_entry[
+                    "hf_warped_features"
+                ].float().square().mean().sqrt()
         if supervise_hf_decoded:
             hf_decoded_loss, hf_decoded_metrics = self._hf_decoded_loss(
                 fused_predicted_clean, batch, encoded, timesteps, keep

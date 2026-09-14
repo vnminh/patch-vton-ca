@@ -10,7 +10,8 @@ Không dùng mô tả `detail_velocity + hf_velocity` từ các revision cũ. Gr
 tại chỉ có một detail residual:
 
 ```text
-rgb_warped_feature + hf_warped_feature
+hf_delta = RGB_RMS * tanh(zero_init_projection(normalize(hf_warped_feature)))
+rgb_warped_feature + hf_delta
   -> shared refiner
   -> fine_velocity
 

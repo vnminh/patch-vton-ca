@@ -60,7 +60,7 @@ def attention_sampling_grid(query, key, valid, height, width):
     )
 
 
-def hard_attention_sampling_grid(query, key, valid, height, width):
+def hard_attention_sampling_grid(query, key, valid, height, width, shared_heads=False):
     """Straight-through hard garment coordinate for coherent coarse routing.
 
     A global soft-argmax can average two distant modes and point between garment parts.
@@ -73,6 +73,13 @@ def hard_attention_sampling_grid(query, key, valid, height, width):
     with torch.autocast(device_type=query.device.type, enabled=False):
         logits = query.float() @ key.float().transpose(-1, -2) / math.sqrt(query.shape[-1])
         logits = logits.masked_fill(~valid[:, None, None], float("-inf"))
+        if shared_heads:
+            # Values are split into channel heads, but a physical cloth point cannot
+            # move to eight different person locations.  Average the routing evidence
+            # before selecting the coordinate, then share that one coordinate across
+            # heads.  Previously each head sampled a different source cell and their
+            # concatenation was not a coherent RGB/texture feature.
+            logits = logits.mean(dim=1, keepdim=True)
         probability = logits.softmax(-1)
     rows = (torch.arange(height, device=query.device, dtype=torch.float32) + 0.5) / height
     columns = (torch.arange(width, device=query.device, dtype=torch.float32) + 0.5) / width
@@ -80,7 +87,10 @@ def hard_attention_sampling_grid(query, key, valid, height, width):
     coordinates = torch.stack((x.mul(2).sub(1), y.mul(2).sub(1)), -1).reshape(-1, 2)
     soft = probability @ coordinates
     hard = coordinates[logits.argmax(-1)]
-    return hard + soft - soft.detach()
+    grid = hard + soft - soft.detach()
+    if shared_heads:
+        grid = grid.expand(-1, query.shape[1], -1, -1)
+    return grid
 
 
 def upsample_displacement_grid(coarse_grid, coarse_size, fine_size):
@@ -114,7 +124,9 @@ def upsample_displacement_grid(coarse_grid, coarse_size, fine_size):
     return output.clamp(-limit, limit).reshape(batch, heads, fine_height * fine_width, 2)
 
 
-def local_attention_sampling_grid(query, key, valid, base_grid, height, width, radius):
+def local_attention_sampling_grid(
+    query, key, valid, base_grid, height, width, radius, shared_heads=False
+):
     """Search only a small residual window around a coherent coarse correspondence."""
     height, width, radius = int(height), int(width), int(radius)
     batch, heads, queries, channels = query.shape
@@ -151,8 +163,17 @@ def local_attention_sampling_grid(query, key, valid, base_grid, height, width, r
         candidate_valid = candidate_valid.clone()
         candidate_valid[..., count // 2] |= empty
     logits = torch.einsum("bhqd,bhqcd->bhqc", query.float(), sampled_key) / math.sqrt(channels)
+    if shared_heads:
+        # ``base_grid`` is already common to all heads.  Use all heads as evidence for
+        # one local residual instead of letting each channel group break the warp apart.
+        logits = logits.mean(dim=1, keepdim=True)
+        candidate_valid = candidate_valid.all(dim=1, keepdim=True)
+        candidate = candidate[:, :1]
     probability = logits.masked_fill(~candidate_valid, float("-inf")).softmax(-1)
-    return (probability[..., None] * candidate).sum(-2).clamp(-limit, limit)
+    grid = (probability[..., None] * candidate).sum(-2).clamp(-limit, limit)
+    if shared_heads:
+        grid = grid.expand(-1, heads, -1, -1)
+    return grid
 
 
 def sample_attention_heads(values, sampling_grid, valid, height, width):
@@ -183,7 +204,8 @@ class GarmentLatentRefiner(nn.Module):
 
     def __init__(self, backbone_dim, channels=4, width=256, heads=8, patch_size=2,
                  qk_norm=False, cosine_scale=10.0, dense_pose_channels=0,
-                 local_radius=2, attention_query_chunk_size=512):
+                 local_radius=2, attention_query_chunk_size=512,
+                 shared_sampling_grid=False, use_global_attention=True):
         super().__init__()
         if width < 1 or heads < 1 or width % heads or width // heads < 2:
             raise ValueError("Refiner width must be divisible by heads with at least two channels per head")
@@ -193,6 +215,8 @@ class GarmentLatentRefiner(nn.Module):
         self.dense_pose_channels = int(dense_pose_channels)
         self.local_radius = int(local_radius)
         self.attention_query_chunk_size = int(attention_query_chunk_size)
+        self.shared_sampling_grid = bool(shared_sampling_grid)
+        self.use_global_attention = bool(use_global_attention)
         if self.local_radius < 0:
             raise ValueError("Fine refiner local radius must be non-negative")
         if self.attention_query_chunk_size < 1:
@@ -234,6 +258,14 @@ class GarmentLatentRefiner(nn.Module):
         # context back in, but washed-out global A@V is no longer the warm-start path.
         self.warp_mix = nn.Linear(width, width)
         self.reset_warp_mix()
+        self.warp_mix.requires_grad_(self.use_global_attention)
+        # HF lives in a separately learned feature basis.  Group-normalise it, learn a
+        # zero-initialised basis conversion, and bound the converted residual relative
+        # to the transported RGB feature RMS.  This keeps a warm start exact and stops
+        # an HF DC component from rotating the garment colour in latent space.
+        self.hf_fusion_norm = nn.GroupNorm(1, width, affine=False)
+        self.hf_fusion = nn.Conv2d(width, width, 1, bias=False)
+        self.reset_hf_fusion()
         self.local = nn.Sequential(
             nn.GroupNorm(1, width),
             nn.Conv2d(width, width, 3, padding=1, groups=width, bias=False),
@@ -252,6 +284,22 @@ class GarmentLatentRefiner(nn.Module):
         """Neutralize deformable transport for a function-preserving warm start."""
         nn.init.zeros_(self.warp_mix.weight)
         nn.init.zeros_(self.warp_mix.bias)
+
+    def reset_hf_fusion(self):
+        """Start with the trained RGB route exactly unchanged."""
+        nn.init.zeros_(self.hf_fusion.weight)
+
+    def fuse_high_frequency(self, rgb_features, hf_features):
+        """Convert HF into the RGB feature basis with a bounded residual."""
+        if hf_features is None:
+            return rgb_features, None
+        if rgb_features.shape != hf_features.shape:
+            raise ValueError("RGB and HF warped features must have identical shapes")
+        rgb_rms = rgb_features.detach().float().square().mean(
+            (1, 2, 3), keepdim=True
+        ).sqrt().clamp_min(1e-3).to(rgb_features.dtype)
+        delta = torch.tanh(self.hf_fusion(self.hf_fusion_norm(hf_features))) * rgb_rms
+        return rgb_features + delta, delta
 
     def route(self, tokens, noisy, agnostic, values, position, garment_mask, dense_pose=None):
         """Transport garment-detail values and return their supervised routing.
@@ -308,9 +356,11 @@ class GarmentLatentRefiner(nn.Module):
             gain = math.sqrt(self.cosine_scale * math.sqrt(q.shape[-1]))
             q = (F.normalize(q.float(), dim=-1, eps=1e-6) * gain).to(q.dtype)
             k = (F.normalize(k.float(), dim=-1, eps=1e-6) * gain).to(k.dtype)
-        attended = chunked_scaled_dot_product_attention(
-            q, k, v, valid, self.attention_query_chunk_size
-        )
+        attended = None
+        if self.use_global_attention:
+            attended = chunked_scaled_dot_product_attention(
+                q, k, v, valid, self.attention_query_chunk_size
+            )
         coarse_height, coarse_width = ph, pw
         def pool_heads(tensor):
             source = tensor.transpose(-1, -2).reshape(
@@ -331,18 +381,23 @@ class GarmentLatentRefiner(nn.Module):
             self.patch_size, self.patch_size,
         ).flatten(1) > 0
         coarse_sampling_grid = hard_attention_sampling_grid(
-            coarse_q, coarse_k, coarse_valid, coarse_height, coarse_width
+            coarse_q, coarse_k, coarse_valid, coarse_height, coarse_width,
+            shared_heads=self.shared_sampling_grid,
         )
         base_grid = upsample_displacement_grid(
             coarse_sampling_grid, (coarse_height, coarse_width), (height, width)
         )
         sampling_grid = local_attention_sampling_grid(
-            q, k, valid, base_grid, height, width, self.local_radius
+            q, k, valid, base_grid, height, width, self.local_radius,
+            shared_heads=self.shared_sampling_grid,
         )
         warped = sample_attention_heads(v, sampling_grid, valid, height, width)
-        attended = attended.transpose(1, 2).reshape(batch, height * width, self.width)
         warped = warped.transpose(1, 2).reshape(batch, height * width, self.width)
-        transported = self.attention_out(warped + self.warp_mix(attended - warped))
+        transported_input = warped
+        if attended is not None:
+            attended = attended.transpose(1, 2).reshape(batch, height * width, self.width)
+            transported_input = warped + self.warp_mix(attended - warped)
+        transported = self.attention_out(transported_input)
         features = transported.transpose(1, 2).reshape(
             batch, self.width, height, width
         )
@@ -412,13 +467,11 @@ class GarmentHighFrequencyControl(nn.Module):
     Two further things differ from the first revision, both forced by measurement. The
     values are frozen pretrained VAE half-resolution features of the cloth detail maps --
     the same basis the refiner's garment keys and values already live in -- instead of a
-    randomly initialised pixel encoder. And the zero initialisation sits on the encoder output
-    rather than on the velocity head: a zero head makes every upstream gradient
-    identically zero, and over 3500 steps that left the old encoder's first convolution
-    at exactly its initialisation rms (0.072657 against a theoretical 0.07217) while the
-    head's own gradient decayed from 0.0146 to 0.0017 instead of growing. Zeroing the
-    encoder keeps the branch's contribution exactly zero on the first step while leaving
-    ``feature_out`` at standard initialisation, so gradient reaches the encoder immediately.
+    randomly initialised pixel encoder. The zero initialisation is placed on the
+    refiner's HF-to-RGB fusion projection, not inside this feature extractor. That
+    makes the loaded RGB model exactly function-preserving while allowing the fusion
+    projection to receive gradient immediately and the HF extractor to follow once
+    the projection opens.
     This module never predicts a four-channel velocity. Its output has ``width`` channels
     and is added to the coherently warped RGB garment feature before the single refiner
     velocity head. That prevents HF from degenerating into an independent edge overlay.
@@ -436,9 +489,9 @@ class GarmentHighFrequencyControl(nn.Module):
         if self.attention_query_chunk_size < 1:
             raise ValueError("HF attention query chunk size must be positive")
         # Project without spatial decimation. The old kernel-4/stride-4 projection
-        # destroyed character strokes before routing. Zero-init here preserves the
-        # loaded model on step one while the nonzero downstream path supplies gradient.
-        self.encoder = nn.Conv2d(self.source_channels, width, 1)
+        # destroyed character strokes before routing. The zero warm-start gate now
+        # lives in the refiner's HF-to-RGB basis conversion.
+        self.encoder = nn.Conv2d(self.source_channels, width, 1, bias=False)
         self.high_local = nn.Sequential(
             nn.GroupNorm(1, width), nn.SiLU(),
             nn.Conv2d(width, width, 3, padding=1, groups=width, bias=False),
@@ -446,35 +499,32 @@ class GarmentHighFrequencyControl(nn.Module):
         # Learn how each routed 4x4 high-resolution neighbourhood becomes one SD latent
         # cell only after the warp has put its sub-cell phases in person coordinates.
         self.downsample = nn.Conv2d(
-            width, width, self.patch_size, stride=self.patch_size
+            width, width, self.patch_size, stride=self.patch_size, bias=False
         )
         self.local = nn.Sequential(
             nn.GroupNorm(1, width), nn.SiLU(),
             nn.Conv2d(width, width, 3, padding=1, groups=width, bias=False), nn.SiLU(),
             nn.Conv2d(width, width, 1, bias=False),
         )
-        # Feature residual, not a standalone latent-velocity head. The zero gate remains
-        # on ``encoder`` so the warm-started RGB refiner is function-preserving while
-        # gradients reach the HF path on its first update.
-        self.feature_out = nn.Conv2d(width, width, 1)
+        # Bias-free by construction: a learned constant here was measured to dominate
+        # the branch and produced garment-wide hue shifts instead of logo detail.
+        self.feature_out = nn.Conv2d(width, width, 1, bias=False)
         self.warp_mix = nn.Conv2d(width, width, 1)
-        self.reset_zero_gate()
+        self.reset_feature_path()
         # Preserve state-dict compatibility while excluding an intentionally disabled
         # global mixer from the optimizer.
         self.warp_mix.requires_grad_(self.use_global_attention)
 
-    def reset_zero_gate(self):
-        """Make the branch contribute exactly zero without disabling its gradient.
-
-        ``local`` is bias-free and GroupNorm's bias starts at zero, so zero encoder
-        output propagates as exact zero up to ``feature_out``'s bias, which is zeroed too.
-        ``feature_out.weight`` deliberately keeps its standard initialisation.
-        """
-        nn.init.zeros_(self.encoder.weight)
-        nn.init.zeros_(self.encoder.bias)
-        nn.init.zeros_(self.downsample.bias)
-        nn.init.zeros_(self.feature_out.bias)
+    def reset_feature_path(self):
+        """Initialise a usable HF representation; fusion is zeroed by the refiner."""
+        if self.source_channels == self.width:
+            nn.init.dirac_(self.encoder.weight)
+        else:
+            nn.init.xavier_uniform_(self.encoder.weight)
         self.reset_warp_mix()
+
+    # Backward-compatible migration hook used by older trainer checkpoints/scripts.
+    reset_zero_gate = reset_feature_path
 
     def reset_warp_mix(self):
         """Zero starts from the shared coherent warp; global context is optional."""
@@ -560,7 +610,13 @@ class GarmentHighFrequencyControl(nn.Module):
             features = warped + self.warp_mix(attended - warped)
         residual = self.feature_out(features + self.local(features))
         gate = F.interpolate(edit.float(), (height, width), mode="area").clamp(0, 1)
-        return residual * gate.to(residual.dtype) * active[:, None, None, None].to(residual.dtype)
+        support = gate.to(residual.dtype) * active[:, None, None, None].to(residual.dtype)
+        # Remove any remaining spatial DC after all learned convolutions.  A high-pass
+        # branch may alter local strokes/chroma boundaries, never the mean cloth colour.
+        mean = (residual * support).sum((2, 3), keepdim=True) / support.sum(
+            (2, 3), keepdim=True
+        ).clamp_min(1)
+        return (residual - mean) * support
 
 
 class VTONPatchForcingBlock(nn.Module):
@@ -699,6 +755,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         garment_refiner_cosine_scale=10.0,
         garment_refiner_local_radius=2,
         garment_refiner_attention_chunk_size=512,
+        garment_refiner_shared_sampling_grid=False,
+        garment_refiner_global_attention=True,
         garment_high_frequency_global_attention=True,
         pretrained_ckpt=None,
         pretrained_use_ema=True,
@@ -823,6 +881,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 dense_pose_channels=self.dense_pose_channels,
                 local_radius=garment_refiner_local_radius,
                 attention_query_chunk_size=garment_refiner_attention_chunk_size,
+                shared_sampling_grid=garment_refiner_shared_sampling_grid,
+                use_global_attention=garment_refiner_global_attention,
             )
 
         self.garment_high_frequency_control = None
@@ -1173,6 +1233,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             backbone_velocity = velocity
             rgb_warped_features = fine_features
             hf_warped_features = None
+            hf_fusion_delta = None
             if self.garment_high_frequency_control is not None:
                 # Reuse the detail refiner's RGB/correspondence-supervised routing, but
                 # do not let the auxiliary HF residual rewrite that routing.  The same
@@ -1188,9 +1249,12 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                     )
                 else:
                     hf_warped_features = self.garment_high_frequency_control(*hf_args)
-                # HF augments the RGB/VAE garment representation. There is deliberately
-                # no independent HF velocity that could appear as an edge overlay.
-                fine_features = rgb_warped_features + hf_warped_features
+                # HF augments the RGB/VAE garment representation through a learned,
+                # zero-init, bounded basis conversion. Raw addition mixed two unrelated
+                # feature bases and was the source of the observed colour drift.
+                fine_features, hf_fusion_delta = self.garment_refiner.fuse_high_frequency(
+                    rgb_warped_features, hf_warped_features
+                )
 
             token_height = height // self.patch_size
             token_width = width // self.patch_size
@@ -1220,6 +1284,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 fine_entry["rgb_warped_features"] = rgb_warped_features
                 if hf_warped_features is not None:
                     fine_entry["hf_warped_features"] = hf_warped_features
+                    fine_entry["hf_fusion_delta"] = hf_fusion_delta
         if return_garment_attention:
             if return_uncertainty:
                 return velocity, logvar_theta, attention_maps
