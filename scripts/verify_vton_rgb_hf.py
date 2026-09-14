@@ -30,6 +30,10 @@ def main():
         garment_high_frequency_global_attention=False,
         garment_refiner_global_attention=False,
         garment_refiner_shared_sampling_grid=True,
+        garment_refiner_velocity_max_backbone_ratio=0.1,
+        garment_refiner_velocity_min_limit=0.05,
+        garment_refiner_detail_activity_floor=0.25,
+        garment_value_preserve_magnitude=True,
     )
     # Production warm-starts a trained nonzero RGB refiner. Reproduce that condition so
     # the new zero-HF feature gate receives a useful gradient on the first test update.
@@ -49,14 +53,25 @@ def main():
         hf_sparse_activity_threshold=0.04,
         hf_sparse_support_radius=1,
         hf_decoded_rgb_weight=1.0,
+        hf_decoded_contrast_weight=1.0,
         hf_decoded_chroma_weight=1.0,
         hf_decoded_edge_weight=0.1,
         hf_decoded_max_samples=1,
         learnable_hf_condition_encoder=True,
         hf_condition_encoder_lr_multiplier=0.05,
-        fine_velocity_regularization_weight=0.1,
+        fine_velocity_regularization_weight=2.0,
+        fine_velocity_max_backbone_ratio=0.1,
+        fine_velocity_min_limit=0.05,
         garment_refiner_lr_multiplier=0.1,
         garment_high_frequency_lr_multiplier=0.1,
+        garment_value_mix_lr_multiplier=1.0,
+        adapter_lr_multiplier=0.1,
+        decoded_rgb_weight=1.0,
+        decoded_edge_weight=0.1,
+        decoded_garment_rgb_weight=1.0,
+        decoded_garment_low_frequency_weight=1.0,
+        decoded_garment_mean_weight=2.0,
+        decoded_max_samples=1,
     ).train()
     module.flow.t_sampler = lambda shape, device, dtype: torch.full(
         shape, 0.5, device=device, dtype=dtype
@@ -82,9 +97,19 @@ def main():
     assert metrics["hf_source_consistency_loss"] > 0
     assert metrics["hf_source_sparse_loss"] > 0
     assert metrics["hf_decoded_rgb_loss"] > 0
+    assert metrics["hf_decoded_contrast_loss"] > 0
     assert metrics["hf_decoded_chroma_loss"] > 0
     assert metrics["hf_decoded_edge_loss"] > 0
     assert metrics["hf_decoded_samples"] == 1
+    assert metrics["fine_velocity_dc_rms"] < 1e-5
+    assert metrics["decoded_garment_rgb_loss"] > 0
+    assert metrics["decoded_garment_low_frequency_loss"] > 0
+    assert metrics["decoded_garment_mean_loss"] > 0
+    assert metrics["garment_value_mix_detail"] == 0
+    assert 0 <= metrics["fine_velocity_norm_gate"] <= 1
+    assert 0 < metrics["fine_velocity_learned_gate"] < 2
+    assert .25 <= metrics["fine_velocity_activity_gate"] < 1
+    assert 0 < metrics["fine_velocity_effective_gate"] < 2
     assert not any(
         parameter.requires_grad
         for parameter in model.garment_high_frequency_control.warp_mix.parameters()
@@ -93,6 +118,8 @@ def main():
         parameter.requires_grad for parameter in model.garment_refiner.warp_mix.parameters()
     )
     loss.backward()
+    value_mix_gradient = model.garment_value_mix["detail"].grad
+    assert value_mix_gradient is not None and value_mix_gradient.abs() > 0
     fusion_gradient = model.garment_refiner.hf_fusion.weight.grad
     assert fusion_gradient is not None and fusion_gradient.abs().sum() > 0
     gradient = model.garment_high_frequency_control.encoder.weight.grad
@@ -104,8 +131,11 @@ def main():
         for group in optimizer.param_groups for parameter in group["params"]
     }
     assert parameter_lrs[id(model.garment_refiner.hf_fusion.weight)] == module.lr * 0.1
+    assert parameter_lrs[id(model.garment_refiner.fine_gate.weight)] == module.lr * 0.1
     assert parameter_lrs[id(model.garment_high_frequency_control.encoder.weight)] == module.lr * 0.1
     assert parameter_lrs[id(module.hf_condition_encoder.conv_in.weight)] == module.lr * 0.05
+    assert parameter_lrs[id(model.x_embedder.proj.weight)] == module.lr * 0.1
+    assert parameter_lrs[id(model.garment_value_mix["detail"])] == module.lr
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
     second_loss, _ = module(data)
@@ -125,44 +155,64 @@ def main():
         garment_detail=torch.randn(1, 32, 32, 24),
         garment_mask=torch.ones(1, 1, 64, 48),
     )
-    conditions, fine_outputs, hf_features = [], [], []
+    conditions, hf_features = [], []
     handle = model.garment_refiner.velocity_condition.register_forward_pre_hook(
         lambda layer, args: conditions.append(args[0].detach().clone())
-    )
-    fine_handle = model.garment_refiner.output.register_forward_hook(
-        lambda layer, args, value: fine_outputs.append(value.detach().clone())
     )
     hf_handle = model.garment_high_frequency_control.register_forward_hook(
         lambda layer, args, value: hf_features.append(value.detach().clone())
     )
     with torch.no_grad():
-        without_hf = model(
-            **direct, garment_high_frequency=torch.zeros(1, 64, 32, 24)
+        without_hf, maps_without = model(
+            **direct, garment_high_frequency=torch.zeros(1, 64, 32, 24),
+            return_garment_attention=True, return_refiner_supervision=True,
         )
-        with_hf = model(**direct, garment_high_frequency=torch.randn(1, 64, 32, 24))
-        _, supervision = model(
+        with_hf, maps_with = model(
             **direct, garment_high_frequency=torch.randn(1, 64, 32, 24),
             return_garment_attention=True, return_refiner_supervision=True,
         )
     handle.remove()
-    fine_handle.remove()
     hf_handle.remove()
     torch.testing.assert_close(conditions[0], conditions[1])
     assert hf_features[0].shape[1] == model.garment_refiner.width
     assert not hf_features[0].any() and hf_features[1].abs().sum() > 0
-    assert not torch.allclose(fine_outputs[0], fine_outputs[1])
-    torch.testing.assert_close(with_hf - without_hf, fine_outputs[1] - fine_outputs[0])
+    fine_without = [entry for entry in maps_without if entry.get("scale") == "refiner"][0]
+    fine_with = [entry for entry in maps_with if entry.get("scale") == "refiner"][0]
+    assert not torch.allclose(fine_without["fine_velocity"], fine_with["fine_velocity"])
+    torch.testing.assert_close(
+        with_hf - without_hf,
+        fine_with["fine_velocity"] - fine_without["fine_velocity"],
+    )
     assert not torch.allclose(without_hf, with_hf)
-    grid = [entry for entry in supervision if entry.get("scale") == "refiner"][0][
-        "sampling_grid"
-    ]
+    support = fine_with["fine_velocity_support"]
+    torch.testing.assert_close(
+        fine_with["fine_velocity"].sum((2, 3)),
+        torch.zeros_like(fine_with["fine_velocity"].sum((2, 3))),
+        atol=1e-5, rtol=0,
+    )
+    denominator = support.sum((1, 2, 3)) * fine_with["fine_velocity"].shape[1]
+    fine_rms = (
+        fine_with["fine_velocity"].float().square().sum((1, 2, 3)) / denominator
+    ).sqrt()
+    backbone_rms = (
+        (fine_with["pre_refiner_velocity"].float().square() * support).sum((1, 2, 3))
+        / denominator
+    ).sqrt()
+    limit = torch.maximum(backbone_rms * .1, backbone_rms.new_full((1,), .05))
+    assert torch.all(fine_rms <= limit + 1e-5)
+    assert 0 <= fine_with["fine_norm_gate_mean"] <= 1
+    assert .25 <= fine_with["fine_activity_gate_mean"] < 1
+    assert fine_with["fine_activity_gate_mean"] > fine_without["fine_activity_gate_mean"]
+    grid = fine_with["sampling_grid"]
     torch.testing.assert_close(grid, grid[:, :1].expand_as(grid))
     print(
         "PASS: blank VAE baseline is exactly zero; RGB-DoG/gradient features are "
         "64 channels in this tiny test; source consistency trains routing; fused decoded "
         "RGB/chroma losses open the zero-init bounded HF-to-RGB fusion; pretrained "
         "condition stem receives gradient; both global mixers are disabled; all heads "
-        "share one deformation; HF changes one fine velocity only through feature fusion"
+        "share one deformation; detached HF activity and learned spatial gates are live; "
+        "absolute/low-pass/mean garment colour losses are finite; final fine velocity "
+        "is DC-free and hard-limited to 10% backbone authority"
     )
 
 

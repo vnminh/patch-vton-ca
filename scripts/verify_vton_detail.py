@@ -44,14 +44,20 @@ def main():
         unexpected = set(current)-set(expected)
         obsolete = {key for key in unexpected if key.startswith(
             ('garment_refiner.condition.',)
-        ) or key in ('garment_refiner.local.1.bias','garment_refiner.local.3.bias')}
+        ) or key in (
+            'garment_refiner.local.1.bias', 'garment_refiner.local.3.bias',
+            'garment_refiner.output.bias',
+        )}
         if cfg.trainer.params.get('allow_new_garment_high_frequency', False):
             # The pixel-encoder revision's tensors are renamed and reshaped, and it never
             # trained, so they are discarded rather than migrated.
             obsolete |= {key for key in unexpected
                          if key.startswith('garment_high_frequency_control.')}
         assert unexpected == obsolete, unexpected - obsolete
-        assert all(key.startswith(('garment_refiner.', 'garment_high_frequency_control.'))
+        assert all(key.startswith((
+                       'garment_refiner.', 'garment_high_frequency_control.',
+                       'garment_value_mix.',
+                   ))
                    for key in missing), missing
         mismatched = {
             key for key in set(current) & set(expected)
@@ -117,6 +123,13 @@ def main():
         loss, metrics = module(data)
         assert torch.isfinite(loss)
         assert metrics['decoded_samples'] == 1
+        assert metrics['fine_velocity_dc_rms'] < 1e-5
+        assert 0 <= metrics['fine_velocity_norm_gate'] <= 1
+        assert 0 < metrics['fine_velocity_learned_gate'] < 2
+        assert 0 < metrics['fine_velocity_activity_gate'] <= 1
+        assert metrics['decoded_garment_rgb_loss'] >= 0
+        assert metrics['decoded_garment_low_frequency_loss'] >= 0
+        assert metrics['decoded_garment_mean_loss'] >= 0
         loss.backward()
         assert all(torch.isfinite(p.grad).all() for p in module.parameters() if p.grad is not None)
         assert module.model.garment_refiner.output.weight.grad.abs().sum() > 0
@@ -143,7 +156,10 @@ def main():
         # path here crashed a real run after 399 iterations.
         grad_metrics = module.garment_gradient_norms()
         assert all(torch.isfinite(value) for value in grad_metrics.values())
-        assert {'garment_grad/refiner/state', 'garment_grad/hf/encoder'} <= set(grad_metrics)
+        assert {
+            'garment_grad/refiner/state', 'garment_grad/refiner/fine_gate',
+            'garment_grad/hf/encoder',
+        } <= set(grad_metrics)
         assert all(p.grad is None and not p.requires_grad for p in module.first_stage.parameters())
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -175,7 +191,7 @@ def main():
                 num_steps=2, cfg_scale=1.5, **module._garment_conditions(encoded),
             )
         assert samples.shape == encoded['target'].shape and torch.isfinite(samples).all()
-        print('HF FUSION PASS: zero HF-to-RGB gate, bounded/DC-free fusion, joint refiner gradients, unpaired CFG generation.', flush=True)
+        print('HF FUSION PASS: zero HF-to-RGB gate, learned spatial fine gate, hard authority cap, DC-free fusion/output, joint refiner gradients, unpaired CFG generation.', flush=True)
     print(f'PASS: {args.height}x{args.width} real paired images, frozen SD-VAE and DINO, two optimizer steps, decoded gradient/parity and direct fine correspondence/value supervision. XL GPU peak memory and image quality are not tested.', flush=True)
 
 

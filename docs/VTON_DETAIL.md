@@ -43,12 +43,17 @@ Garment detail VAE feature được embed thành `B x 3072 x 1152`, đúng grid 
 
 ```text
 Q = projected(normalized person query + PE)
-K = normalized(projected garment detail) + PE
-V = projected garment detail
+K = per-token-LN(projected garment detail) + PE
+V_old = per-token-LN(projected garment detail)
+V_mag = raw projected garment detail / global sample RMS
+V = V_old + clamp_ST(value_mix, 0, 1) * (V_mag - V_old)
 ```
 
 Sau đó Q/K được normalize theo từng head và nhân cosine temperature có giới hạn.
 V không chứa PE: vị trí quyết định **lấy ở đâu**, còn value mang **appearance gì**.
+`value_mix` có một scalar cho coarse/middle/detail và khởi tạo zero, nên checkpoint
+cũ không đổi output ở bước đầu. Khác với per-token LayerNorm, global RMS không xóa
+mean/scale của từng vị trí; đó là payload cần để phân biệt nét logo với màu nền áo.
 
 Garment mask được max-pool về 64x48 để loại background keys. Empty mask được xử lý
 để SDPA luôn finite, rồi `active` gate ép residual cuối về đúng zero.
@@ -96,14 +101,21 @@ Refiner dùng backbone state để biết residual cần sửa tại timestep hi
 preliminary_clean = noisy + (1-t) * backbone_velocity
 condition = Conv([stopgrad(backbone_velocity), stopgrad(preliminary_clean)])
 modulated = fused_feature * (1 + tanh(condition))
-fine_velocity = output(modulated + local(modulated))
+decoded = modulated + local(modulated)
+raw_fine = output_bias_free(decoded)
+learned_gate = 2 * sigmoid(gate_zero_init(decoded))
+activity_gate = .25 + .75 * dilate(normalize_energy(stopgrad(hf_warped)))
+fine_ac = spatial_center(raw_fine * activity_gate * learned_gate, edit_support)
+fine_velocity = fine_ac * min(1, max(.1 * backbone_rms, .05) / rms(fine_ac))
 ```
 
 Đây là modulation nhân, không phải person-only additive shortcut. Nếu garment/HF
 rỗng thì fused feature và fine velocity đều bằng zero.
 
-`fine_velocity` có trust-region mềm so với RMS của backbone. Điều này ngăn refiner
-tăng biên độ vô hạn để tối ưu edge trong khi phá màu và cấu trúc person.
+Activity gate bảo đảm fine correction tập trung quanh detail thực sự đã warp; learned
+gate tinh chỉnh theo channel. Spatial centering cấm latent DC shift. Trust
+region cứng chạy cả inference và giới hạn fine RMS ở 10% backbone (floor 0.05);
+penalty mềm trên raw fine giúp refiner không phụ thuộc lâu dài vào clipping.
 
 ## 7. Supervision cho routing
 
@@ -155,7 +167,10 @@ region để giữ pose/tay.
 | Match đúng nhưng sai màu | `fine_rgb_loss`, value loss, decoded chroma |
 | Edge có nhưng logo vô nghĩa | decoded RGB/chroma + preview, không chỉ edge loss |
 | Refiner không có authority | `fine_velocity_rms`, `garment_grad/refiner/output` |
-| Refiner lấn át backbone | `fine_velocity_rms`, `fine_velocity_limit` |
+| Refiner lấn át backbone | raw/final RMS, `fine_velocity_norm_gate`, limit |
+| Áo bị lệch màu đồng đều | `fine_velocity_dc_rms`, `hf_fusion_removed_dc_rms` |
+| Routing tốt nhưng chỉ ra màu trung bình | `garment_value_mix_*`, decoded RGB/mean |
+| Gate vẫn gần identity | activity/effective gate, không chỉ learned gate mean |
 | HF không sống | `hf_feature_rms`, `hf_fusion_delta_rms`, fusion/encoder gradients |
 
 ## 10. Code map

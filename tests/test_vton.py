@@ -943,6 +943,35 @@ class VTONTests(unittest.TestCase):
             )
             torch.testing.assert_close(keys[scale], values[scale] + expected_position)
 
+    def test_magnitude_preserving_values_warm_start_without_changing_keys(self):
+        model = self._multiscale_model(
+            garment_token_norm=True, garment_value_preserve_magnitude=True
+        ).eval()
+        latent = torch.randn(1, 4, 8, 6)
+        middle = torch.randn(1, 16, 16, 12) * 4
+        detail = torch.randn(1, 8, 32, 24) * 2
+        position = model._position_embedding(8, 6, latent.dtype, latent.device)
+        args = (latent, middle, detail, torch.zeros(1, 12, 64), position, 8, 6)
+        keys_zero, values_zero, grids = model._garment_branches(*args)
+        # Detail keeps its own finer grid (48 tokens), not the 12-token person grid.
+        detail_position = model._grid_position_embedding(
+            *grids["detail"], latent.dtype, latent.device
+        )
+        # Zero mix is exactly the old LayerNorm V route.
+        torch.testing.assert_close(keys_zero["detail"] - detail_position, values_zero["detail"])
+        loss = values_zero["detail"].square().mean()
+        loss.backward()
+        self.assertIsNotNone(model.garment_value_mix["detail"].grad)
+        self.assertGreater(model.garment_value_mix["detail"].grad.abs().item(), 0)
+
+        with torch.no_grad():
+            model.garment_value_mix["detail"].fill_(1)
+            keys_raw, values_raw, _ = model._garment_branches(*args)
+        # K/routing is invariant; only V gains globally-scaled raw magnitude.
+        torch.testing.assert_close(keys_raw["detail"], keys_zero["detail"])
+        self.assertFalse(torch.allclose(values_raw["detail"], values_zero["detail"]))
+        self.assertGreater(values_raw["detail"].mean(-1).std().item(), 0)
+
     def test_512x384_detail_fix_config_is_interleaved_and_content_weighted(self):
         from omegaconf import OmegaConf
 

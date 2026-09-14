@@ -21,7 +21,9 @@ from test_vton_supervision import trainer, batch
 
 
 def model(refiner=False, match=False, dense_pose_channels=0, garment_high_frequency_channels=0,
-          shared_sampling_grid=False, refiner_global_attention=True):
+          shared_sampling_grid=False, refiner_global_attention=True,
+          velocity_max_backbone_ratio=0., velocity_min_limit=0.,
+          detail_activity_floor=1., value_preserve_magnitude=False):
     return VTONPatchForcingDiT(
         input_size=8, in_channels=4, hidden_size=32, depth=3, num_heads=4,
         num_classes=10, cross_attention_every=1, garment_middle_channels=8,
@@ -32,6 +34,10 @@ def model(refiner=False, match=False, dense_pose_channels=0, garment_high_freque
         garment_high_frequency_channels=garment_high_frequency_channels,
         garment_refiner_shared_sampling_grid=shared_sampling_grid,
         garment_refiner_global_attention=refiner_global_attention,
+        garment_refiner_velocity_max_backbone_ratio=velocity_max_backbone_ratio,
+        garment_refiner_velocity_min_limit=velocity_min_limit,
+        garment_refiner_detail_activity_floor=detail_activity_floor,
+        garment_value_preserve_magnitude=value_preserve_magnitude,
     )
 
 
@@ -96,6 +102,23 @@ def test_dense_pose_is_only_zero_initialized_appended_input_channels():
     handle.remove()
     embedded[0].sum().backward()
     assert weight.grad[:,9:].abs().sum() > 0
+
+
+def test_magnitude_value_route_is_zero_init_checkpoint_migration():
+    def wrap(network):
+        return LatentVTONPatchForcingTrainer(
+            model=network, first_stage=torch.nn.Identity(), ema_rate=.99,
+            flow={'target':'patch_flow.flow_vton.VTONPatchFlowForcing','params':{'patch_size':2}},
+            compute_validation_metrics=False, correspondence_center_weight=0,
+            correspondence_nll_weight=0, correspondence_entropy_weight=0,
+            correspondence_photometric_weight=0,
+        )
+    old = wrap(model())
+    new = wrap(model(value_preserve_magnitude=True))
+    with pytest.warns(UserWarning, match='magnitude-preserving V path'):
+        new.load_state_dict(old.state_dict(), strict=True)
+    assert all(value.item() == 0 for value in new.model.garment_value_mix.values())
+    assert all(value.item() == 0 for value in new.ema_model.garment_value_mix.values())
 
 
 @pytest.mark.parametrize('ema_rate', [0, .99])
@@ -235,8 +258,6 @@ def test_warm_start_refiner_and_hf_feature_gains_are_explicit_and_weight_only(ga
     for key, value in (('model.garment_refiner.output.weight', .000792),
                        ('model.garment_high_frequency_control.feature_out.weight', .031433)):
         state[key] = torch.full_like(state[key], value)
-    state['model.garment_refiner.output.bias'] = torch.full_like(
-        state['model.garment_refiner.output.bias'], .5)
     module.load_state_dict(state, strict=True)
     torch.testing.assert_close(module.model.garment_refiner.output.weight,
                                torch.full_like(state['model.garment_refiner.output.weight'],
@@ -245,9 +266,7 @@ def test_warm_start_refiner_and_hf_feature_gains_are_explicit_and_weight_only(ga
                                torch.full_like(
                                    state['model.garment_high_frequency_control.feature_out.weight'],
                                    .031433 * hf_gain))
-    # Biases are never touched, and a zero head stays zero under any gain.
-    torch.testing.assert_close(module.model.garment_refiner.output.bias,
-                               state['model.garment_refiner.output.bias'])
+    assert module.model.garment_refiner.output.bias is None
     state['model.garment_refiner.output.weight'] = torch.zeros_like(
         state['model.garment_refiner.output.weight'])
     module.load_state_dict(state, strict=True)
@@ -373,29 +392,91 @@ def test_hf_features_change_only_the_single_fused_refiner_output():
         nn.init.normal_(net.garment_high_frequency_control.encoder.weight, std=.05)
         nn.init.normal_(net.garment_refiner.hf_fusion.weight, std=.01)
 
-    condition_inputs, fine_outputs, hf_outputs = [], [], []
+    condition_inputs, hf_outputs = [], []
     condition_handle = net.garment_refiner.velocity_condition.register_forward_pre_hook(
         lambda module, args: condition_inputs.append(args[0].detach().clone())
-    )
-    fine_handle = net.garment_refiner.output.register_forward_hook(
-        lambda module, args, value: fine_outputs.append(value.detach().clone())
     )
     hf_handle = net.garment_high_frequency_control.register_forward_hook(
         lambda module, args, value: hf_outputs.append(value.detach().clone())
     )
-    output_without_hf = net(**data, garment_high_frequency=torch.zeros_like(hf))
-    output_with_hf = net(**data, garment_high_frequency=hf)
-    condition_handle.remove(); fine_handle.remove(); hf_handle.remove()
+    output_without_hf, maps_without = net(
+        **data, garment_high_frequency=torch.zeros_like(hf),
+        return_garment_attention=True, return_refiner_supervision=True,
+    )
+    output_with_hf, maps_with = net(
+        **data, garment_high_frequency=hf,
+        return_garment_attention=True, return_refiner_supervision=True,
+    )
+    condition_handle.remove(); hf_handle.remove()
 
-    assert len(condition_inputs) == len(fine_outputs) == len(hf_outputs) == 2
+    assert len(condition_inputs) == len(hf_outputs) == 2
     assert not hf_outputs[0].any() and hf_outputs[1].abs().sum() > 0
     # The state condition stays backbone-only, while HF changes the one refiner output.
     torch.testing.assert_close(condition_inputs[1], condition_inputs[0])
     assert hf_outputs[1].shape[1] == net.garment_refiner.width
-    assert not torch.allclose(fine_outputs[1], fine_outputs[0])
+    fine_without = [entry for entry in maps_without if entry.get('scale') == 'refiner'][0]
+    fine_with = [entry for entry in maps_with if entry.get('scale') == 'refiner'][0]
+    assert not torch.allclose(fine_with['fine_velocity'], fine_without['fine_velocity'])
     torch.testing.assert_close(
-        output_with_hf - output_without_hf, fine_outputs[1] - fine_outputs[0]
+        output_with_hf - output_without_hf,
+        fine_with['fine_velocity'] - fine_without['fine_velocity'],
     )
+    support = fine_with['fine_velocity_support']
+    torch.testing.assert_close(
+        fine_with['fine_velocity'].sum((2, 3)),
+        torch.zeros_like(fine_with['fine_velocity'].sum((2, 3))),
+        atol=1e-5, rtol=0,
+    )
+
+
+def test_fine_velocity_gate_removes_dc_and_hard_limits_authority():
+    refiner = GarmentLatentRefiner(
+        32, width=32, heads=4, max_velocity_ratio=.1, min_velocity_limit=.05,
+    )
+    nn.init.normal_(refiner.output.weight, mean=.1, std=.1)
+    # Make the learned gate spatially/channel dependent rather than testing only its
+    # identity initialization.
+    nn.init.normal_(refiner.fine_gate.weight, std=.1)
+    nn.init.normal_(refiner.fine_gate.bias, std=.1)
+    features = torch.randn(2, 32, 8, 6)
+    backbone = torch.randn(2, 4, 8, 6)
+    clean = torch.randn_like(backbone)
+    edit = torch.ones(2, 1, 8, 6)
+    edit[0, :, :, 4:] = 0
+    active = torch.ones(2, dtype=torch.bool)
+    activity = torch.zeros(2, 1, 8, 6)
+    activity[:, :, 2:6, 1:4] = .75
+    velocity, raw, learned_gate, activity_gate, effective_gate, norm_gate, removed_dc, support = (
+        refiner.refine_with_gate(features, backbone, clean, edit, active, activity)
+    )
+    torch.testing.assert_close(
+        velocity.sum((2, 3)), torch.zeros_like(velocity.sum((2, 3))),
+        atol=1e-5, rtol=0,
+    )
+    assert not velocity[0, :, :, 4:].any()
+    denominator = support.sum((1, 2, 3)) * velocity.shape[1]
+    fine_rms = (velocity.float().square().sum((1, 2, 3)) / denominator).sqrt()
+    backbone_rms = (
+        (backbone.float().square() * support).sum((1, 2, 3)) / denominator
+    ).sqrt()
+    limit = torch.maximum(backbone_rms * .1, backbone_rms.new_full((2,), .05))
+    assert torch.all(fine_rms <= limit + 1e-5)
+    assert raw.shape == velocity.shape and removed_dc.shape == (2, 4, 1, 1)
+    assert 0 < learned_gate < 2 and 0 <= norm_gate <= 1
+    assert 0 < activity_gate < 1 and 0 < effective_gate < 2
+
+
+def test_hf_activity_gate_is_detached_spatial_and_keeps_configured_floor():
+    refiner = GarmentLatentRefiner(
+        32, width=32, heads=4, detail_activity_floor=.25,
+    )
+    hf = torch.zeros(1, 32, 8, 6, requires_grad=True)
+    hf.data[:, :, 3:5, 2:4] = 2
+    edit = torch.ones(1, 1, 8, 6)
+    gate = refiner.detail_activity_gate(hf, edit, torch.ones(1, dtype=torch.bool))
+    assert not gate.requires_grad
+    assert gate.min() >= .25 and gate.max() <= 1
+    assert gate[:, :, 3:5, 2:4].mean() > gate[:, :, :2, :2].mean()
 
 
 def test_existing_hf_checkpoint_warm_starts_zero_cascade_adapter():
@@ -439,6 +520,7 @@ def test_cascade_checkpoint_migrates_dense_query_and_zero_warp_adapters():
     ):
         for key in [name for name in legacy if name.startswith(prefix)]:
             del legacy[key]
+    legacy['model.garment_refiner.output.bias'] = torch.randn(4)
     with pytest.warns(UserWarning):
         module.load_state_dict(legacy, strict=True)
     migrated = module.model.garment_refiner.state.weight
@@ -446,6 +528,9 @@ def test_cascade_checkpoint_migrates_dense_query_and_zero_warp_adapters():
     assert not migrated[:, 8:].any()
     assert not module.model.garment_refiner.warp_mix.weight.any()
     assert not module.model.garment_high_frequency_control.warp_mix.weight.any()
+    assert module.model.garment_refiner.output.bias is None
+    assert not module.model.garment_refiner.fine_gate.weight.any()
+    assert not module.model.garment_refiner.fine_gate.bias.any()
 
 
 def test_refiner_is_garment_transport_only_and_preserves_fine_phase():
@@ -790,22 +875,38 @@ def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
     assert not cfg.model.params.garment_high_frequency_global_attention
     assert not cfg.model.params.garment_refiner_global_attention
     assert cfg.model.params.garment_refiner_shared_sampling_grid
+    assert cfg.model.params.garment_refiner_velocity_max_backbone_ratio == .1
+    assert cfg.model.params.garment_refiner_velocity_min_limit == .05
+    assert cfg.model.params.garment_refiner_detail_activity_floor == .25
+    assert cfg.model.params.garment_value_preserve_magnitude
+    assert cfg.trainer.params.ema_rate == 0
     assert cfg.trainer.params.hf_detail_loss_weight == 0
     assert cfg.trainer.params.hf_source_sparse_weight > 0
     assert cfg.trainer.params.hf_decoded_rgb_weight > 0
+    assert cfg.trainer.params.hf_decoded_contrast_weight > 0
     assert cfg.trainer.params.hf_decoded_chroma_weight > 0
     assert cfg.trainer.params.hf_decoded_edge_weight > 0
     assert list(cfg.trainer.params.correspondence_teacher_input_size) == [768, 576]
     assert list(cfg.trainer.params.correspondence_garment_grid) == [48, 36]
-    assert cfg.data.params.batch_size == 1
-    assert cfg.train_params.accumulate_grad_batches == 32
+    assert cfg.data.params.batch_size == 4
+    assert cfg.train_params.accumulate_grad_batches == 8
     assert cfg.data.params.batch_size * cfg.train_params.accumulate_grad_batches == 32
     assert cfg.trainer.params.hf_decoded_rgb_weight > cfg.trainer.params.hf_decoded_edge_weight
     assert cfg.trainer.params.hf_decoded_chroma_weight > cfg.trainer.params.hf_decoded_edge_weight
     assert cfg.trainer.params.garment_refiner_lr_multiplier == .1
     assert cfg.trainer.params.garment_high_frequency_lr_multiplier == .1
-    assert cfg.trainer.params.fine_velocity_regularization_weight > 0
-    assert cfg.lr_scheduler.params.num_warmup_steps == 1000
+    assert cfg.trainer.params.garment_value_mix_lr_multiplier == 1
+    assert cfg.trainer.params.adapter_lr_multiplier == .1
+    assert cfg.trainer.params.decoded_garment_rgb_weight > 0
+    assert cfg.trainer.params.decoded_garment_low_frequency_weight > 0
+    assert cfg.trainer.params.decoded_garment_mean_weight > 0
+    assert cfg.trainer.params.decoded_min_time == 0
+    assert cfg.trainer.params.fine_velocity_regularization_weight == 2
+    assert cfg.trainer.params.fine_velocity_max_backbone_ratio == .1
+    assert cfg.trainer.params.fine_velocity_min_limit == .05
+    assert cfg.trainer.params.correspondence_warmup_steps == 250
+    assert cfg.lr_scheduler.params.num_warmup_steps == 500
+    assert cfg.train_params.val_check_interval == 50
     assert cfg.name.endswith('detail-logo-hf')
 
 
@@ -864,6 +965,9 @@ def test_decoded_loss_frozen_decoder_input_gradients_and_pixel_time_pair_masking
     module = trainer()
     module.first_stage = TinyDecoder().requires_grad_(False)
     module.decoded_rgb_weight, module.decoded_edge_weight = .2, .5
+    module.decoded_garment_rgb_weight = .3
+    module.decoded_garment_low_frequency_weight = .4
+    module.decoded_garment_mean_weight = .6
     data = batch()
     data['person_garment_mask'][:,:,:8] = 1
     target = torch.zeros(3,3,16,16)
@@ -871,6 +975,9 @@ def test_decoded_loss_frozen_decoder_input_gradients_and_pixel_time_pair_masking
     times = torch.tensor([[.5,.99,.5,.5],[.5,.5,.5,.5],[.5,.5,.5,.5]])
     loss, metrics = module._decoded_garment_loss(latent,data,{'target_image':target},times,torch.tensor([1.,0.,1.]))
     assert metrics['decoded_samples'] == 1 and loss > 0
+    assert metrics['decoded_garment_rgb_loss'] > 0
+    assert metrics['decoded_garment_low_frequency_loss'] > 0
+    assert metrics['decoded_garment_mean_loss'] > 0
     loss.backward()
     assert latent.grad[0,:,:2,:2].abs().sum() > 0
     assert not latent.grad[1:].any()

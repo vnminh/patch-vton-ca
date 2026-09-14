@@ -209,8 +209,19 @@ final RGB reference, never as inference conditioning.
 
 Garment appearance travels on three SD-VAE branches, routed one per cross-attention
 block: garment latent, encoder 1/4-resolution, and encoder 1/2-resolution detail.
+Garment keys are normalized per token for stable correspondence, while values use a
+zero-init learned blend toward globally RMS-scaled raw features. This preserves the
+spatial/channel magnitude needed for colour blocks and logos without changing an old
+checkpoint's first prediction; positional encoding remains key-only.
 After the DiT, coherent RGB and signed-RGB HF transports are fused at 64x48 before
 one shared refiner predicts `fine_velocity`. There is no standalone HF velocity head.
+The fine residual is passed through a detached warped-HF activity gate, a learned
+spatial/channel gate, per-channel DC removal, and an inference-time RMS authority cap
+before it is added to the backbone. Garment-specific decoded RGB, low-frequency and
+channel-mean losses prevent edge improvement from trading away absolute colour.
+Those decoded losses include the pure-noise `t=0` regime used at the first sampling
+state. This experiment keeps `ema_rate=0`, so validation and saved sampling use the
+current student directly and do not hide new zero-init paths behind a stale average.
 Configure backbone assignment with `model.params.garment_scale_routes`.
 
 Garment/body correspondence is supervised rather than supplied as an inference

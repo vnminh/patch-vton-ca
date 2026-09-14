@@ -97,10 +97,14 @@ Trong 28 backbone block, cả ba route dùng:
 
 ```text
 Q_person       B x 768 x 1152
-K_garment      B x 768 x 1152 = content + PE
-V_garment      B x 768 x 1152 = content only
+K_garment      B x 768 x 1152 = per-token-LN(content) + PE
+V_garment      B x 768 x 1152 = blend(LN(content), content/global-RMS)
 attention      16 heads
 ```
+
+Blend V có scalar zero-init riêng cho mỗi scale. Đây là điểm quan trọng: K được
+chuẩn hóa để route ổn định, còn V không bị buộc mất amplitude/màu của từng token.
+PE chỉ nằm trong K, không bao giờ được trộn vào V.
 
 `fine_values` giữ bản detail **trước pool**:
 
@@ -129,6 +133,10 @@ Q                            B x 8 x 3072 x 32
 K_detail                     B x 8 x 3072 x 32
 V_detail                     B x 8 x 3072 x 32
 ```
+
+`V_detail` nhận payload giữ magnitude nói trên. Vì scalar bắt đầu bằng zero, lần
+forward đầu sau `load_weights` vẫn đúng route V cũ; decoded RGB mở payload mới bằng
+gradient và TensorBoard log `garment_value_mix_detail`.
 
 Coherent grid:
 
@@ -159,7 +167,8 @@ local + feature_out          B x 256 x 64 x 48
 ## 10. Fusion/refiner output
 
 ```text
-hf_delta = RGB_RMS * tanh(zero-init Conv(GroupNorm(hf_warped_feature)))
+hf_delta_raw = RGB_RMS * tanh(zero-init Conv(GroupNorm(hf_warped_feature)))
+hf_delta = spatial_center(hf_delta_raw, edit_support)
          = B x 256 x 64 x 48
 fused_feature = rgb_warped_feature + hf_delta
               = B x 256 x 64 x 48
@@ -169,7 +178,12 @@ velocity_condition(
   preliminary_clean
 )             = B x 256 x 64 x 48
 
-fine_velocity = B x 4 x 64 x 48
+raw_fine       = bias-free Conv(refined_feature)
+learned_gate   = 2 * sigmoid(zero-init Conv(refined_feature))
+activity_gate  = .25 + .75 * dilated detached HF energy
+fine_velocity  = spatial_center(raw_fine * activity_gate * learned_gate)
+fine_velocity  = hard_RMS_gate(fine_velocity, backbone_velocity)
+                B x 4 x 64 x 48
 final_velocity= B x 4 x 64 x 48
 ```
 
@@ -192,6 +206,9 @@ Joint HF/refiner auxiliary:
 fused_predicted_clean = z_t.detach()
   + (1-t) * (backbone_velocity.detach() + fine_velocity)
 ```
+
+Decoded supervision gồm full edit RGB/edge để giữ person, garment-only
+RGB/low-pass/channel-mean để giữ màu, và sparse HF RGB/contrast/chroma/edge để giữ logo.
 
 Sau frozen VAE decoder, supervision image trở lại `B x 3 x 512 x 384` hoặc
 resolution phụ được cấu hình riêng để giảm memory.

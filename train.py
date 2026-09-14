@@ -334,6 +334,9 @@ def main(cfg: DictConfig):
 
     """ Setup training loop """
     global_step = resume_step
+    # Hooks (EMA/correspondence warmups) need the correct counter on their very first
+    # optimizer update, especially when resuming a checkpoint at a non-zero step.
+    module.global_step = global_step
     max_steps = cfg.train_params.get("max_steps", -1)
     validation_steps = {int(step) for step in cfg.train_params.get("validation_steps", [])}
     if any(step <= 0 for step in validation_steps):

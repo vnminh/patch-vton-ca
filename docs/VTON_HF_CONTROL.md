@@ -111,8 +111,9 @@ loss không thể tự bẻ attention map sang nơi có biên mạnh nhưng sai 
 Warp trước rồi mới downsample giữ các phase nhỏ của stroke tốt hơn downsample HF
 trước correspondence.
 
-Spatial mean được loại chỉ ở nhánh HF. RGB refiner giữ garment mean vì đó là màu
-nền thật; HF mean chủ yếu là VAE/DC bias và từng gây flat colour shift.
+Spatial mean được loại ở HF delta và ở fine velocity cuối, không loại khỏi warped RGB
+carrier. RGB carrier phải giữ màu nền thật; phần residual chỉ được phép mô tả contrast
+không gian, không được dùng một offset latent đồng đều để đổi hue.
 
 Global HF và global RGB attention đều bị tắt trong config logo. Chúng có xu hướng
 trung bình các vùng xa nhau và tạo glyph-like texture; coherent grid là route duy
@@ -148,14 +149,18 @@ final_velocity = backbone_velocity + fine_velocity
 Hai feature không được cộng raw vì chúng là hai basis học độc lập. Fusion hiện tại:
 
 ```text
-hf_delta = rms(stopgrad(rgb_warped))
-           * tanh(Conv_zero(GroupNorm(hf_warped)))
+hf_delta_raw = rms(stopgrad(rgb_warped))
+               * tanh(Conv_zero(GroupNorm(hf_warped)))
+hf_delta = spatial_center(hf_delta_raw, edit_support)
 fused = rgb_warped + hf_delta
 ```
 
-Conv không bias, `tanh` giới hạn biên độ và HF output đã zero spatial mean; vì vậy
-nhánh detail không thể tạo offset latent đồng đều làm đổi hue. Đây vẫn là một
-refiner duy nhất: HF không có quyền viết trực tiếp vào latent velocity.
+Conv không bias và `tanh` giới hạn biên độ. Năng lượng của `hf_warped` được detach,
+chuẩn hóa theo sample, dilate 3x3 và ánh xạ vào `[0.25,1]` để làm activity gate thật.
+Sau shared refiner, fine output đi qua activity gate và learned spatial/channel gate,
+khử DC theo channel, rồi hard RMS gate giới hạn nó ở
+`max(0.05, 10% backbone_rms)`. Đây vẫn là một refiner duy nhất: HF không có
+quyền viết trực tiếp vào latent velocity.
 
 ## 9. Loss cho HF
 
@@ -177,8 +182,9 @@ z_t.detach() + (1-t) * (
 ```
 
 `hf_detail_loss` bị tắt vì sau fusion nó trùng số với main latent `detail_loss`, tức
-là cùng edge objective bị đếm hai lần. Loss auxiliary còn decoded RGB/chroma/edge,
-trong đó RGB/chroma mạnh hơn edge. Nó cập nhật HF fusion/extractor và shared refiner,
+là cùng edge objective bị đếm hai lần. Loss auxiliary dùng absolute RGB, spatial
+contrast, opponent chroma và edge. Absolute RGB cần thiết vì zero-mean latent residual
+không bảo đảm zero-mean RGB qua nonlinear VAE decoder. Nó cập nhật HF fusion/extractor và shared refiner,
 nhưng không cập nhật backbone qua auxiliary objective này.
 
 HF decoded supervision chỉ dùng sparse support bên trong `person_garment_mask`.
@@ -192,6 +198,7 @@ channel. Graph hiện tại cần `feature_out.*` 256 channel. Loader sẽ:
 
 - bỏ toàn bộ old HF control branch nếu thấy tensor không tương thích;
 - init branch HF bias-free và reset `hf_fusion` về zero-output;
+- bỏ output bias cũ và identity-init learned `fine_gate` mới;
 - giữ DiT, RGB routing, refiner và pretrained/learned HF condition stem;
 - yêu cầu warm-start bằng `load_weights` với optimizer mới.
 
@@ -209,8 +216,16 @@ khôi phục cả optimizer và step. Không truyền hai lựa chọn cùng lú
 | `hf_fusion_delta_rms` | phần HF thực sự được cộng vào RGB lớn bao nhiêu? |
 | `fine_velocity_rms` | joint refiner có đóng góp vào output không? |
 | `fine_velocity_limit` | residual có vượt trust-region không? |
+| `fine_velocity_raw_rms` | refiner trước hard gate có đang cố lấn át không? |
+| `fine_velocity_learned_gate` | learned spatial gate có hoạt động không? |
+| `fine_velocity_activity_gate` | HF activity prior có thực sự giới hạn spatial support? |
+| `fine_velocity_effective_gate` | tích activity x learned gate có authority bao nhiêu? |
+| `fine_velocity_norm_gate` | hard gate đang phải clip mạnh đến đâu? |
+| `fine_velocity_dc_rms` | output còn rò DC làm lệch màu không? (phải gần zero) |
+| `hf_fusion_removed_dc_rms` | HF fusion đã loại bao nhiêu offset màu? |
 | `hf_source_sparse_loss` | logo/detail source có được copy đúng vị trí không? |
 | decoded RGB/chroma/edge | reconstructed detail có đúng màu và cấu trúc không? |
+| decoded garment RGB/low-frequency/mean | màu tuyệt đối có bị drift/dark shift không? |
 
 Không kết luận logo đã học chỉ vì edge loss giảm. Preview held-out phải cho chữ/logo
 có nghĩa và RGB/chroma loss phải cải thiện cùng edge.
@@ -223,6 +238,7 @@ có nghĩa và RGB/chroma loss phải cải thiện cùng edge.
 - HF output có width 256 thay vì bốn velocity channel;
 - HF chỉ làm đổi shared `fine_velocity`;
 - hiệu final output đúng bằng hiệu fine output;
+- fine output zero-DC và không vượt 10% backbone RMS (có floor 0.05);
 - auxiliary HF loss không có gradient vào backbone final head;
 - một sampling grid chung cho mọi head;
 - global RGB/HF mixers đều bị tắt;
