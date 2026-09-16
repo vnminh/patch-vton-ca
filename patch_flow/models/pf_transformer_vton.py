@@ -211,7 +211,7 @@ class GarmentLatentRefiner(nn.Module):
                  local_radius=2, attention_query_chunk_size=512,
                  shared_sampling_grid=False, use_global_attention=True,
                  max_velocity_ratio=0.0, min_velocity_limit=0.0,
-                 detail_activity_floor=1.0):
+                 detail_activity_floor=1.0, highpass_kernel=0):
         super().__init__()
         if width < 1 or heads < 1 or width % heads or width // heads < 2:
             raise ValueError("Refiner width must be divisible by heads with at least two channels per head")
@@ -226,6 +226,7 @@ class GarmentLatentRefiner(nn.Module):
         self.max_velocity_ratio = float(max_velocity_ratio)
         self.min_velocity_limit = float(min_velocity_limit)
         self.detail_activity_floor = float(detail_activity_floor)
+        self.highpass_kernel = int(highpass_kernel)
         if self.local_radius < 0:
             raise ValueError("Fine refiner local radius must be non-negative")
         if self.attention_query_chunk_size < 1:
@@ -234,6 +235,10 @@ class GarmentLatentRefiner(nn.Module):
             raise ValueError("Fine velocity hard-gate limits must be non-negative")
         if not 0 <= self.detail_activity_floor <= 1:
             raise ValueError("Fine detail activity gate floor must be in [0, 1]")
+        if self.highpass_kernel < 0 or (
+            self.highpass_kernel > 1 and self.highpass_kernel % 2 == 0
+        ):
+            raise ValueError("Fine high-pass kernel must be zero/one or a positive odd integer")
         if self.dense_pose_channels not in (0, channels):
             raise ValueError("Fine DensePose channels must be zero or equal latent channels")
         self.qk_norm = bool(qk_norm)
@@ -253,6 +258,12 @@ class GarmentLatentRefiner(nn.Module):
         self.state = nn.Conv2d(channels * 2 + self.dense_pose_channels, width, 3, padding=1)
         nn.init.zeros_(self.state.weight)
         nn.init.zeros_(self.state.bias)
+        # Predict where garment detail is allowed to modify the person.  The target
+        # parse is used only by a training loss; inference uses this person/DensePose
+        # prediction.  A partially open warm start keeps detail alive while avoiding
+        # sigmoid saturation, so the mask can quickly reject arms/background.
+        self.support_head = nn.Conv2d(width, 1, 1)
+        self.reset_support_head()
         # The fine decoder corrects the backbone velocity that will be integrated. The
         # first half is that preliminary velocity and the second half is its x1 estimate;
         # RGB and HF garment evidence are fused in ``features`` instead of in velocity.
@@ -267,6 +278,13 @@ class GarmentLatentRefiner(nn.Module):
         self.key = nn.Linear(backbone_dim, width)
         self.value = nn.Linear(backbone_dim, width)
         self.attention_out = nn.Linear(width, width)
+        # A direct, lossless carrier for the four-channel garment VAE latent. The
+        # learned 128->hidden detail projection is useful context, but it is free to
+        # collapse to a garment-wide style code. Sampling the actual garment latent
+        # with the same supervised grid preserves colour/logo payload to the refiner.
+        # Zero init makes old checkpoints function-identical.
+        self.latent_fusion = nn.Conv2d(channels, width, 1, bias=False)
+        self.reset_latent_fusion()
         # Zero keeps the coherent local warp. The adapter can learn to mix global
         # context back in, but washed-out global A@V is no longer the warm-start path.
         self.warp_mix = nn.Linear(width, width)
@@ -307,10 +325,19 @@ class GarmentLatentRefiner(nn.Module):
         """Start with the trained RGB route exactly unchanged."""
         nn.init.zeros_(self.hf_fusion.weight)
 
+    def reset_latent_fusion(self):
+        """Open direct garment-latent transport without changing a warm start."""
+        nn.init.zeros_(self.latent_fusion.weight)
+
     def reset_fine_gate(self):
         """Identity-initialize the bounded spatial fine-velocity gate."""
         nn.init.zeros_(self.fine_gate.weight)
         nn.init.zeros_(self.fine_gate.bias)
+
+    def reset_support_head(self):
+        """Warm-start open enough for detail, but away from sigmoid saturation."""
+        nn.init.zeros_(self.support_head.weight)
+        nn.init.constant_(self.support_head.bias, math.log(0.75 / 0.25))
 
     @staticmethod
     def _masked_spatial_center(tensor, support):
@@ -322,6 +349,20 @@ class GarmentLatentRefiner(nn.Module):
         ).clamp_min(1)
         centered = (tensor_float - mean) * support_float
         return centered.to(tensor.dtype), mean
+
+    def _masked_local_highpass(self, tensor, support):
+        """Remove garment-wide low frequency while retaining strokes and boundaries."""
+        if self.highpass_kernel <= 1:
+            return tensor
+        kernel = self.highpass_kernel
+        support_float = support.float()
+        numerator = F.avg_pool2d(
+            tensor.float() * support_float, kernel, stride=1, padding=kernel // 2
+        )
+        denominator = F.avg_pool2d(
+            support_float, kernel, stride=1, padding=kernel // 2
+        ).clamp_min(1e-4)
+        return (tensor.float() - numerator / denominator).to(tensor.dtype)
 
     def fuse_high_frequency(self, rgb_features, hf_features, edit, active):
         """Convert HF into the RGB feature basis with a bounded residual."""
@@ -364,7 +405,20 @@ class GarmentLatentRefiner(nn.Module):
         # would square fractional boundary masks and suppress garment-border detail.
         return gate.to(hf_features.dtype)
 
-    def route(self, tokens, noisy, agnostic, values, position, garment_mask, dense_pose=None):
+    def route(
+        self,
+        tokens,
+        noisy,
+        agnostic,
+        key_content,
+        values,
+        position,
+        garment_mask,
+        garment_latent=None,
+        dense_pose=None,
+        sampling_grid_target=None,
+        sampling_grid_mask=None,
+    ):
         """Transport garment-detail values and return their supervised routing.
 
         Person/backbone features construct Q -- including the noisy and agnostic latents
@@ -373,7 +427,7 @@ class GarmentLatentRefiner(nn.Module):
         separate so the HF branch can reuse Q/K before the final correction is decoded.
         """
         batch, _, height, width = noisy.shape
-        if values.shape[1] != height * width:
+        if values.shape[1] != height * width or key_content.shape[1] != height * width:
             raise ValueError("Person and garment detail grids must have identical resolution")
         ph, pw = height // self.patch_size, width // self.patch_size
         query = self.query_expand(tokens).transpose(1, 2).reshape(batch, -1, ph, pw)
@@ -391,6 +445,8 @@ class GarmentLatentRefiner(nn.Module):
         elif dense_pose is not None:
             raise ValueError("Fine refiner received DensePose with dense_pose_channels=0")
         query = query + self.state(torch.cat(state_inputs, dim=1))
+        support_logits = self.support_head(query)
+        support_probability = support_logits.sigmoid()
         query = query.flatten(2).transpose(1, 2)
         pos = self.position(position)
         if self.qk_norm:
@@ -398,8 +454,15 @@ class GarmentLatentRefiner(nn.Module):
             # constant across garment content. Keep position comparable to normalized
             # person/garment content before combining them, without learned gain.
             pos = F.layer_norm(pos.float(), (self.width,)).to(pos.dtype)
-        q = self.query(self.query_norm(query) + pos)
-        k = self.key_norm(self.key(values)) + pos
+        # Apply the same positional basis after the learned content projection on both
+        # sides.  Previously Q rotated PE through ``self.query`` while K added PE after
+        # its projection, so equal person/garment coordinates were not comparable even
+        # before content learning.
+        q = self.query(self.query_norm(query)) + pos
+        # K and V deliberately receive different tensors. K stays per-token
+        # LayerNormed for stable geometry; V may retain raw appearance magnitude.
+        # Reusing V for K made opening the colour payload move the sampling grid too.
+        k = self.key_norm(self.key(key_content)) + pos
         v = self.value(values)
         def heads(tensor):
             return tensor.reshape(batch, height * width, self.heads, -1).transpose(1, 2)
@@ -450,10 +513,24 @@ class GarmentLatentRefiner(nn.Module):
         base_grid = upsample_displacement_grid(
             coarse_sampling_grid, (coarse_height, coarse_width), (height, width)
         )
-        sampling_grid = local_attention_sampling_grid(
+        predicted_sampling_grid = local_attention_sampling_grid(
             q, k, valid, base_grid, height, width, self.local_radius,
             shared_heads=self.shared_sampling_grid,
         )
+        sampling_grid = predicted_sampling_grid
+        teacher_fraction = q.new_zeros((), dtype=torch.float32)
+        if sampling_grid_target is not None:
+            if sampling_grid_mask is None:
+                raise ValueError("A teacher sampling grid requires a sampling-grid mask")
+            if sampling_grid_target.shape != (batch, height * width, 2):
+                raise ValueError("Teacher sampling grid must have shape (B,H*W,2)")
+            if sampling_grid_mask.shape != (batch, height * width):
+                raise ValueError("Teacher sampling-grid mask must have shape (B,H*W)")
+            teacher = sampling_grid_target[:, None].to(sampling_grid.dtype)
+            teacher_mask = sampling_grid_mask[:, None, :, None].bool()
+            sampling_grid = torch.where(teacher_mask, teacher, sampling_grid)
+            teacher_fraction = sampling_grid_mask.float().mean()
+
         warped = sample_attention_heads(v, sampling_grid, valid, height, width)
         warped = warped.transpose(1, 2).reshape(batch, height * width, self.width)
         transported_input = warped
@@ -464,9 +541,26 @@ class GarmentLatentRefiner(nn.Module):
         features = transported.transpose(1, 2).reshape(
             batch, self.width, height, width
         )
+        warped_latent = None
+        if garment_latent is not None:
+            garment_latent = F.interpolate(
+                garment_latent, (height, width), mode="bilinear", align_corners=False
+            ).to(values.dtype)
+            latent_heads = garment_latent.flatten(2).transpose(1, 2)
+            latent_heads = latent_heads[:, None].expand(-1, self.heads, -1, -1)
+            warped_latent = sample_attention_heads(
+                latent_heads, sampling_grid, valid, height, width
+            ).mean(1).transpose(1, 2).reshape(batch, -1, height, width)
+            features = features + self.latent_fusion(warped_latent)
         return features, {
             "scale": "refiner", "query": q, "key": k,
-            "output": transported, "sampling_grid": sampling_grid, "key_valid": valid,
+            "output": transported, "sampling_grid": predicted_sampling_grid,
+            "transport_sampling_grid": sampling_grid,
+            "teacher_forcing_fraction": teacher_fraction,
+            "warped_garment_latent": warped_latent,
+            "garment_support_logits": support_logits,
+            "garment_support": support_probability,
+            "key_valid": valid,
             "grid": (height, width), "query_grid": (height, width),
             "coarse_query": coarse_q, "coarse_key": coarse_k,
             "coarse_key_valid": coarse_valid,
@@ -476,7 +570,7 @@ class GarmentLatentRefiner(nn.Module):
 
     def refine_with_gate(
         self, features, preliminary_velocity, preliminary_clean, edit, active,
-        detail_activity_gate=None,
+        detail_activity_gate=None, garment_support=None,
     ):
         """Decode fused RGB+HF garment features into one fine velocity correction.
 
@@ -499,6 +593,13 @@ class GarmentLatentRefiner(nn.Module):
         height, width = features.shape[-2:]
         support = F.interpolate(edit.float(), (height, width), mode="area").clamp(0, 1)
         support = support * active[:, None, None, None].float()
+        if garment_support is not None:
+            garment_support = F.interpolate(
+                garment_support.float(), (height, width), mode="bilinear", align_corners=False
+            ).clamp(0, 1)
+            # Reconstruction must not learn to close its own gate.  This mask is learned
+            # only by explicit paired parse supervision in the trainer.
+            support = support * garment_support.detach()
         if detail_activity_gate is None:
             detail_activity_gate = torch.ones_like(support)
         else:
@@ -509,6 +610,7 @@ class GarmentLatentRefiner(nn.Module):
             ).clamp(0, 1)
         effective_gate = learned_gate * detail_activity_gate.to(learned_gate.dtype)
         residual = raw_residual * effective_gate
+        residual = self._masked_local_highpass(residual, support)
         residual, residual_dc = self._masked_spatial_center(residual, support)
 
         # Hard inference-time authority gate. A loss penalty alone can be ignored and
@@ -554,7 +656,8 @@ class GarmentLatentRefiner(nn.Module):
                 dense_pose=None):
         """Return the garment-only correction, optionally with compact loss tensors."""
         features, supervision, active = self.route(
-            tokens, noisy, agnostic, values, position, garment_mask, dense_pose
+            tokens, noisy, agnostic, values, values, position, garment_mask,
+            dense_pose=dense_pose,
         )
         if (preliminary_velocity is None) != (preliminary_clean is None):
             raise ValueError("Both preliminary_velocity and preliminary_clean must be provided together")
@@ -859,6 +962,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         use_vae_garment=True,
         garment_token_norm=True,
         garment_value_preserve_magnitude=False,
+        garment_value_minimum_mix=0.0,
         garment_middle_channels=None,
         garment_detail_channels=None,
         garment_scale_routes=None,
@@ -879,6 +983,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         garment_refiner_velocity_max_backbone_ratio=0.0,
         garment_refiner_velocity_min_limit=0.0,
         garment_refiner_detail_activity_floor=1.0,
+        garment_refiner_highpass_kernel=0,
         garment_high_frequency_global_attention=True,
         pretrained_ckpt=None,
         pretrained_use_ema=True,
@@ -911,6 +1016,9 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         self.garment_value_preserve_magnitude = bool(
             garment_value_preserve_magnitude
         )
+        self.garment_value_minimum_mix = float(garment_value_minimum_mix)
+        if not 0 <= self.garment_value_minimum_mix <= 1:
+            raise ValueError("garment_value_minimum_mix must be in [0, 1]")
         self.garment_middle_channels = None if garment_middle_channels is None else int(garment_middle_channels)
         self.garment_detail_channels = None if garment_detail_channels is None else int(garment_detail_channels)
         self.garment_embed_gain = float(garment_embed_gain)
@@ -1020,6 +1128,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 max_velocity_ratio=garment_refiner_velocity_max_backbone_ratio,
                 min_velocity_limit=garment_refiner_velocity_min_limit,
                 detail_activity_floor=garment_refiner_detail_activity_floor,
+                highpass_kernel=garment_refiner_highpass_kernel,
             )
 
         self.garment_high_frequency_control = None
@@ -1169,7 +1278,10 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         # Bounded forward authority with an identity straight-through derivative: a
         # scalar that momentarily moves below zero can still recover instead of dying
         # at the clamp boundary.
-        mix = raw_mix + (raw_mix.clamp(0, 1) - raw_mix).detach()
+        learned_mix = raw_mix + (raw_mix.clamp(0, 1) - raw_mix).detach()
+        mix = self.garment_value_minimum_mix + (
+            1 - self.garment_value_minimum_mix
+        ) * learned_mix
         values = normalized_tokens.float() + mix * (
             magnitude_tokens - normalized_tokens.float()
         )
@@ -1243,6 +1355,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         garment_middle=None,
         garment_detail=None,
         garment_mask=None,
+        garment_sampling_grid=None,
+        garment_sampling_mask=None,
         return_uncertainty=False,
         return_garment_attention=False,
         garment_attention_scales=None,
@@ -1314,6 +1428,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             garment, garment_middle, garment_detail, x, position, height, width
         )
         fine_values = garment_values.get("detail")
+        fine_keys = garment_tokens.get("detail")
         if self.garment_refiner is not None and fine_values is not None:
             if garment_grids["detail"] != (height, width):
                 raise ValueError("Person and garment detail grids must have identical resolution")
@@ -1403,10 +1518,16 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         if self.garment_high_frequency_control is not None and fine_values is None:
             raise ValueError("HF control requires garment detail features for spatial routing")
         if self.garment_refiner is not None and fine_values is not None:
+            fine_position = self._grid_position_embedding(
+                height, width, x.dtype, x.device
+            )
+            # `_garment_branches` stores normalized K content + PE. The refiner owns
+            # a separate PE projection, so pass only content to its K projection.
+            fine_key_content = fine_keys - fine_position
             route_args = (
-                x, noisy_latent, person_agnostic, fine_values,
-                self._grid_position_embedding(height, width, x.dtype, x.device),
-                garment_mask, dense_pose,
+                x, noisy_latent, person_agnostic, fine_key_content, fine_values,
+                fine_position, garment_mask, garment, dense_pose,
+                garment_sampling_grid, garment_sampling_mask,
             )
             if self.gradient_checkpointing and self.training:
                 fine_features, fine_entry, fine_active = checkpoint(
@@ -1430,7 +1551,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 hf_args = (garment_high_frequency, fine_entry["query"].detach(),
                            fine_entry["key"].detach(),
                            fine_entry["key_valid"], edit_mask, garment_mask,
-                           fine_entry["sampling_grid"].detach())
+                           fine_entry["transport_sampling_grid"].detach())
                 if self.gradient_checkpointing and self.training:
                     hf_warped_features = checkpoint(
                         self.garment_high_frequency_control, *hf_args, use_reentrant=False
@@ -1463,6 +1584,7 @@ class VTONPatchForcingDiT(PatchForcingDiT):
             refine_args = (
                 fine_features, refiner_velocity.detach(), preliminary_clean.detach(),
                 edit_mask, fine_active, fine_detail_activity_gate,
+                fine_entry["garment_support"],
             )
             if self.gradient_checkpointing and self.training:
                 refine_output = checkpoint(

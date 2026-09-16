@@ -88,7 +88,7 @@ RGB refiner đã tạo:
 HF dùng lại đúng bốn tensor trên. Q/K/grid được detach trên HF path:
 
 ```text
-RGB: shared Q/K/grid + RGB V -> rgb_warped_feature
+RGB: shared Q/K/grid + learned RGB V + direct garment latent -> rgb_warped_feature
 HF : shared Q/K/grid + HF  V -> hf_warped_feature
 ```
 
@@ -141,6 +141,7 @@ output chính xác zero; các projection có thể tạo DC đều được thi�
 Sau routing:
 
 ```text
+rgb_warped_feature = learned_V_warp + Conv_zero(direct_garment_latent_warp)
 fused = rgb_warped_feature + bounded_hf_delta   # 256 x 64 x 48
 fine_velocity = garment_refiner.refine(fused, detached backbone state)
 final_velocity = backbone_velocity + fine_velocity
@@ -158,7 +159,8 @@ fused = rgb_warped + hf_delta
 Conv không bias và `tanh` giới hạn biên độ. Năng lượng của `hf_warped` được detach,
 chuẩn hóa theo sample, dilate 3x3 và ánh xạ vào `[0.25,1]` để làm activity gate thật.
 Sau shared refiner, fine output đi qua activity gate và learned spatial/channel gate,
-khử DC theo channel, rồi hard RMS gate giới hạn nó ở
+masked high-pass kernel 9, garment-support gate dự đoán từ person/DensePose, khử DC
+theo channel trong support đó, rồi hard RMS gate giới hạn nó ở
 `max(0.05, 10% backbone_rms)`. Đây vẫn là một refiner duy nhất: HF không có
 quyền viết trực tiếp vào latent velocity.
 

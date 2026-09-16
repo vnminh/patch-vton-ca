@@ -11,6 +11,10 @@ model:
     # through a zero-init learned mix. Per-token LayerNorm on V was deleting the payload
     # needed to distinguish a logo from the garment's mean colour.
     garment_value_preserve_magnitude: true
+    # The measured learned mix reached only 0.007 after 1.6k steps, so 99.3% of V was
+    # still per-token LayerNorm payload. K remains normalized, but V now always uses the
+    # global-RMS appearance representation that preserves colour and logo magnitude.
+    garment_value_minimum_mix: 1.0
     # Scale 30 made the straight-through hard coarse route almost one-hot before it
     # was correct: top-1 fell from 29.5% to 25.1% while the fine velocity collapsed.
     # Scale 10 leaves the hard forward argmax unchanged, but gives losing locations a
@@ -33,6 +37,10 @@ model:
     # Keep 25% authority away from explicit strokes so color-block interiors can still
     # be refined; logo/text neighbourhoods receive up to full authority.
     garment_refiner_detail_activity_floor: 0.25
+    # A fine branch should write strokes and colour boundaries, not a garment-wide
+    # brightness field. Remove only its broad latent component; the backbone retains
+    # ownership of base colour and low-frequency shading.
+    garment_refiner_highpass_kernel: 9
 
 trainer:
   params:
@@ -74,6 +82,17 @@ trainer:
     decoded_garment_mean_weight: 2.0
     decoded_low_frequency_scale: 8
     fine_rgb_weight: 0.5
+    # Learn the inference-time garment region from person/DensePose features. Ground-
+    # truth parsing supervises this head only during training; it is never an inference
+    # input. This prevents warped cloth residuals from being written onto erased arms.
+    fine_support_weight: 0.25
+
+    # The hard route is currently correct for only ~22-35% of queries. Let 75% of
+    # paired samples initially transport through reliable DINO anchors plus mask-only
+    # propagated coordinates, then decay this probability to exactly zero. This breaks
+    # the wrong-warp -> mean-colour local optimum while retaining inference without DINO.
+    fine_teacher_forcing_start: 0.75
+    fine_teacher_forcing_steps: 2000
 
     # Decode the joint RGB+HF refiner estimate. RGB keeps ink colour, opponent chroma
     # keeps colour blocks, and edge keeps letter boundaries. One sample caps frozen-VAE
@@ -111,11 +130,25 @@ trainer:
     # Three bounded zero-init scalars are safe at the base 1e-4 LR; putting them in
     # the 1e-5 adapter group would open the corrected V payload only ~0.01 after 1k steps.
     garment_value_mix_lr_multiplier: 1.0
+    # The direct four-channel carrier is a tiny zero-init projection. Open it at base
+    # LR; the final residual remains protected by its DC removal and hard RMS gate.
+    garment_latent_fusion_lr_multiplier: 1.0
+    # Tiny new segmentation head starts at p=0.75 and needs to move faster than the
+    # already-trained refiner matrices; its detached output cannot game reconstruction.
+    garment_support_lr_multiplier: 1.0
     # x_embedder and every garment cross-attention adapter were still at 1e-4, ten
     # times the backbone/refiner. The common RGB dark shift began as that warmup reached
     # full LR. This warm start already has trained DensePose/garment adapters, so keep
     # all conditioning paths at the stable 1e-5 rate.
     adapter_lr_multiplier: 0.1
+
+    # Garment is already a spatial condition. CFG 1.5 amplified its colour residual
+    # (especially blue) and worsened edges in the fixed-sample ablation.
+    sample_kwargs:
+      num_steps: 30
+      cfg_scale: 1.0
+      adaptive: false
+      progress: false
 
     # This is a warm restart from a trained checkpoint, so only ramp the denser DINO
     # route briefly instead of suppressing it for another thousand optimizer steps.

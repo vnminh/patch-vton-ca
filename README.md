@@ -210,13 +210,19 @@ final RGB reference, never as inference conditioning.
 Garment appearance travels on three SD-VAE branches, routed one per cross-attention
 block: garment latent, encoder 1/4-resolution, and encoder 1/2-resolution detail.
 Garment keys are normalized per token for stable correspondence, while values use a
-zero-init learned blend toward globally RMS-scaled raw features. This preserves the
-spatial/channel magnitude needed for colour blocks and logos without changing an old
-checkpoint's first prediction; positional encoding remains key-only.
+checkpoint-compatible blend toward globally RMS-scaled raw features; the logo config
+sets its minimum mix to one after the learned scalar was measured at only 0.007. This
+preserves the spatial/channel magnitude needed for colour blocks and logos. Positional
+encoding is key-only with respect to payload V, while Q and K add the same PE basis
+after their content projections. The full-latent
+refiner now receives K and V separately, so opening the raw V payload cannot move K or
+the warp grid. The same coherent grid also samples the four-channel garment VAE latent
+directly; a zero-init projection fuses that non-collapsible carrier into the RGB feature.
 After the DiT, coherent RGB and signed-RGB HF transports are fused at 64x48 before
 one shared refiner predicts `fine_velocity`. There is no standalone HF velocity head.
 The fine residual is passed through a detached warped-HF activity gate, a learned
-spatial/channel gate, per-channel DC removal, and an inference-time RMS authority cap
+spatial/channel gate, a person/DensePose garment-support gate, masked local high-pass,
+per-channel DC removal, and an inference-time RMS authority cap
 before it is added to the backbone. Garment-specific decoded RGB, low-frequency and
 channel-mean losses prevent edge improvement from trading away absolute colour.
 Those decoded losses include the pure-noise `t=0` regime used at the first sampling
@@ -227,9 +233,14 @@ Configure backbone assignment with `model.params.garment_scale_routes`.
 Garment/body correspondence is supervised rather than supplied as an inference
 condition. A frozen DINOv3 teacher provides sparse geometric anchors during training;
 paired RGB/VAE transport, coordinate, mask and smoothness losses refine the coherent
-grid below DINO resolution. At inference the teacher and ground-truth person garment
+grid below DINO resolution. A finite teacher-forcing curriculum initially lets the
+refiner learn from reliable/propagated transport instead of a mostly wrong hard grid,
+then decays to zero so late training matches inference. At inference the teacher and ground-truth person garment
 mask are absent; the model uses person agnostic, DensePose, in-shop garment, garment
-mask, and HF computed from that same garment.
+mask, and HF computed from that same garment. The support gate is supervised by the
+paired parse during training but predicts its own mask from person/DensePose features
+at inference. The logo config samples at CFG 1.0 because fixed-noise ablation showed
+CFG 1.5 amplifying a blue cast and increasing edge error.
 
 The barycentre term alone is not enough, and measurably so: a map can be sharp (3.8 effective keys of 768) and barycentre-correct (1.7 tokens off) while placing its peak 4.5 tokens away with 5% of its mass on the target. That straddling map retrieves a *blend* of two fabrics, which is how a navy-and-lavender garment renders as uniform violet. See [`docs/VTON_PFT_DESIGN.md`](docs/VTON_PFT_DESIGN.md) §10.4.
 
@@ -325,8 +336,9 @@ python train.py experiment=viton-pft-xl-smoke16gb \
 
 The 512-by-384 experiment encodes garments online with the VAE pyramid. Three settings there are worth knowing about:
 
-The current logo-HF variant uses a single detail residual: coherently warped RGB/VAE
-features are added to warped signed-RGB HF features, then one shared refiner predicts
+The current logo-HF variant uses a single detail residual: coherently warped learned
+RGB/VAE features plus directly warped garment latent are fused with warped signed-RGB HF
+features, then one shared refiner predicts
 `fine_velocity`; the final output is `backbone_velocity + fine_velocity`. HF is neither
 an `x_embedder` input channel nor an independent velocity head. See
 [`docs/VTON_HF_CONTROL.md`](docs/VTON_HF_CONTROL.md) for the graph, checkpoint migration,

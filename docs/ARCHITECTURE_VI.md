@@ -57,6 +57,9 @@ garment detail RGB feature, no position ─────────────�
 Q/K ──> coarse hard anchor + local fine grid ──> warp RGB V
                                                    = rgb_warped_feature
 
+same grid + garment VAE latent 4ch ──> exact latent warp ──> zero-init projection
+                                      ────────────> rgb_warped_feature bổ sung
+
 same detached Q/K/grid + HF V ──> high-resolution warp/downsample
                                                    = hf_warped_feature
 
@@ -65,7 +68,8 @@ hf_delta_raw = RGB_RMS * tanh(zero_init_conv(group_norm(hf_warped_feature)))
 hf_delta = spatial_center(hf_delta_raw, edit_support)
 fused_feature = rgb_warped_feature + hf_delta
 fused_feature + detached backbone state ──> one shared refiner ──> raw_fine
-raw_fine ──> detached HF activity x learned gate ──> center/RMS gate ──> fine_velocity
+person/DensePose query ──> supervised support head ──> predicted garment support
+raw_fine ──> HF activity x learned gate ──> high-pass/support/center/RMS ──> fine_velocity
 final_velocity = backbone_velocity + fine_velocity
 ```
 
@@ -226,14 +230,21 @@ latent cell trong mỗi PFT patch. Query này được cộng với convolution 
 
 Nhờ đó bốn subquery khác nhau theo nội dung/pose thực tế, không chỉ theo absolute PE.
 
-### 8.2 Tạo garment key/value
+### 8.2 Tạo garment key/value độc lập
 
-- `K = key_norm(key(detail_rgb)) + position`;
-- `V = value(detail_rgb)`;
+- `Q = query(query_norm(person_content)) + shared_position`;
+- `K = key_norm(key(per_token_LN(detail_rgb))) + shared_position`;
+- `V = value(raw/global_RMS)` trong config logo;
 - Q/K được normalize theo head và dùng cosine scale có giới hạn;
 - V không chứa PE.
 
 Person và garment detail đều có đúng lưới 64x48.
+
+Q và K cộng cùng positional basis **sau** content projection. Bản cũ đưa PE qua
+`query()` ở Q nhưng cộng PE sau projection ở K; vì thế cùng tọa độ không nằm trong
+cùng basis. K và V cũng không dùng chung input: appearance magnitude của V không được
+phép đổi score/routing của K. Config logo đặt minimum V mix bằng 1 vì audit cho thấy
+learned scalar mới chỉ đạt 0.007 sau 1.6k step và gần như vẫn xóa payload màu.
 
 ### 8.3 Coarse anchor rồi local fine correspondence
 
@@ -244,14 +255,40 @@ Refiner không lấy trung bình softmax toàn garment:
 3. lấy trung bình routing evidence của 8 head để chọn **một** coarse grid vật lý;
 4. upsample displacement về 64x48;
 5. tìm một local residual đồng thuận trong bán kính cấu hình quanh anchor;
-6. dùng cùng grid đó bilinear-sample tám nhóm channel của V.
+6. dùng cùng grid đó bilinear-sample tám nhóm channel của V;
+7. dùng chính grid đó sample trực tiếp `garment_latent` bốn kênh.
 
-Kết quả qua `attention_out` là `rgb_warped_feature` kích thước
-`B x 256 x 64 x 48`.
+Kết quả learned V qua `attention_out` được cộng với
+`latent_fusion(warped_garment_latent)`, tạo `rgb_warped_feature` kích thước
+`B x 256 x 64 x 48`. `latent_fusion` là zero-init để checkpoint cũ có prediction đầu
+giống hệt, nhưng sau khi mở nó cung cấp carrier trực tiếp từ latent garment đã được
+chứng minh còn giữ chữ/logo qua VAE. Nhánh learned detail không còn là con đường duy
+nhất có thể co thành style/màu trung bình.
 
 Global RGB `A@V/warp_mix` bị tắt trong config logo. Nó từng trộn các vị trí garment
 xa nhau; hơn nữa per-head grid cũ cho phép tám nhóm channel lấy từ tám vị trí khác
 nhau, nên feature concat có edge nhưng không còn là một logo/màu coherent.
+
+Correspondence NLL được tính trên chính logits đã trung bình head này. Trước đây loss
+tối ưu tám argmax riêng nhưng forward/inference lại dùng argmax của mean logits; metric
+top-1 và objective vì thế không mô tả sampling grid thực sự.
+
+### 8.4 Curriculum chống nghiệm màu trung bình
+
+Ở run đã đo, hard grid chỉ top-1 đúng khoảng 22–35%. Nếu refiner luôn phải decode
+từ một warp sai trong 65–78% vị trí, nghiệm MSE dễ nhất là màu/style trung bình dù
+loss routing vẫn giảm. Trong 2000 optimizer step đầu của một warm restart:
+
+```text
+teacher_probability = 0.75 * max(0, 1 - local_step/2000)
+transport_grid = DINO_anchor_plus_mask_propagation  # sample được chọn, train-only
+predicted_grid vẫn nhận correspondence/RGB/coordinate loss
+```
+
+Teacher grid chỉ thay đường transport trên garment pixel đã có confidence; nó không
+thay Q/K dùng để tính routing loss. Xác suất giảm chính xác về zero, nên giai đoạn cuối
+train giống inference. DINO, target person và `person_garment_mask` vẫn không phải input
+inference.
 
 ## 9. GarmentHighFrequencyControl
 
@@ -298,14 +335,19 @@ decoded_feature = fused_modulated + Local(fused_modulated)
 raw_fine = Conv_bias_free(decoded_feature)
 learned_gate = 2 * sigmoid(Conv_zero(decoded_feature))
 activity_gate = 0.25 + 0.75 * dilate(normalize_energy(stopgrad(hf_warped)))
-fine_ac = spatial_center(raw_fine * activity_gate * learned_gate, edit_support)
+garment_support = sigmoid(SupportHead(person_query_with_DensePose))
+detail = masked_highpass(raw_fine * activity_gate * learned_gate, kernel=9)
+fine_ac = spatial_center(detail, edit_support * stopgrad(garment_support))
 hard_gate = min(1, max(0.10 * backbone_rms, 0.05) / rms(fine_ac))
 fine_velocity = fine_ac * stopgrad(hard_gate)
 final_velocity = backbone_velocity + fine_velocity
 ```
 
-`spatial_center` loại mean riêng cho từng latent channel, nên fine branch không thể
-tạo DC offset làm cả áo đổi hue. Hard gate chạy ngay trong `forward`, cả train lẫn
+`garment_support` được train bằng paired person parse nhưng inference tự dự đoán từ
+person/DensePose; target parse không được feed vào model. Nó ngăn cloth residual ghi
+lên tay/nền. Masked high-pass loại trường sáng/tối rộng, còn `spatial_center` loại mean
+riêng cho từng latent channel trong garment support, nên fine branch không thể tạo
+DC/low-frequency offset làm cả áo đổi hue. Hard gate chạy ngay trong `forward`, cả train lẫn
 inference, và bảo đảm RMS không vượt `max(0.05, 0.10 * backbone_rms)`. Trainer còn
 phạt `fine_ac` trước hard gate để branch học tự giữ trong trust region, thay vì luôn
 dựa vào clipping.
@@ -324,6 +366,7 @@ Garment-transported feature luôn là carrier của residual detail.
 | fine correspondence/coordinate | garment pixel/token | coarse anchor + local grid |
 | fine RGB/value | garment pixel | warped RGB/VAE V phải đúng content |
 | warp smoothness/mask | garment region | flow mượt và không lấy background |
+| fine garment support | full edit parse, train-only | tách vùng áo khỏi tay/nền khi infer |
 | decoded RGB/edge chính | toàn edit region | reconstruction và tay/pose bị agnostic xoá |
 | decoded garment RGB/low-pass/mean | garment pixels | khóa màu tuyệt đối và color-block |
 | HF decoded RGB/contrast/chroma/edge | sparse garment detail | logo/màu/biên tại vùng garment |
@@ -352,6 +395,7 @@ backbone velocity đến local optimum của auxiliary edge objective. Flow loss
 | DiT backbone | flow, backbone correspondence, decoded reconstruction chính |
 | garment K/Q routing | correspondence, RGB/value, coordinate/smoothness, HF source consistency |
 | garment RGB V/refiner | flow, fine RGB/value, joint decoded HF loss |
+| direct latent fusion | flow và decoded RGB/chroma tại `t=0` |
 | HF fusion/encoder/feature_out | flow và joint decoded RGB/chroma/edge |
 | uncertainty head | uncertainty NLL |
 
@@ -359,7 +403,8 @@ backbone velocity đến local optimum của auxiliary edge objective. Flow loss
 checkpoint đã học các adapter này, nên không cho chúng chạy nhanh gấp 10 backbone nữa.
 Các `garment_value_mix_{scale}` zero-init nhưng dùng riêng base LR `1e-4`: prediction
 đầu không đổi, còn ba scalar bounded có thể mở payload giữ magnitude đủ nhanh. Các
-matrix adapter lớn vẫn ở `1e-5` để không drift.
+matrix adapter lớn vẫn ở LR thấp để không drift. `latent_fusion` cũng dùng base LR:
+nó chỉ là projection 4->256 zero-init và output sau nó vẫn bị DC/RMS gate bảo vệ.
 
 HF Q/K được detach chỉ trên HF-value path; Q/K vẫn học bình thường từ các loss
 correspondence/RGB và raw-HF source consistency của shared sampling grid.
@@ -387,6 +432,7 @@ Khi đổi từ kiến trúc `backbone + detail_velocity + hf_velocity` sang fus
 - bỏ `garment_refiner.output.bias`, vì bias này chính là đường tắt tạo latent DC;
 - init `fine_gate` mới về identity (`2*sigmoid(0)=1`);
 - init `garment_value_mix` bằng zero: K và prediction đầu giữ nguyên, V mới mở bằng loss;
+- init `garment_refiner.latent_fusion` bằng zero: latent carrier mới không tạo cú nhảy output;
 - config này giữ `ema_rate=0`; preview và checkpoint sampling dùng trực tiếp student,
   đồng thời tránh thêm một bản PFT-XL vào VRAM 24 GB;
 - dùng `load_weights` với optimizer mới.
@@ -401,15 +447,19 @@ hiện tại. Không dùng đồng thời hai tùy chọn.
 - `x_embedder` có 13 input channel;
 - person và garment detail refiner cùng grid 64x48;
 - `hf_warped_feature` và bounded `hf_fusion_delta` có 256 channel, không phải 4;
+- K refiner lấy normalized key content, V lấy appearance payload; hai input không alias;
+- `warped_garment_latent` là `B x 4 x 64 x 48` và dùng cùng physical grid;
 - tám attention head dùng cùng một `sampling_grid`;
 - RGB/HF global attention đều tắt trong config logo;
 - chỉ có một `fine_velocity` và một phép cộng velocity cuối;
-- `fine_velocity` có spatial mean bằng zero theo từng channel và RMS bị hard-limit;
+- `fine_velocity` bị giới hạn vào predicted garment support, high-pass, có spatial
+  mean bằng zero theo từng channel và RMS bị hard-limit;
 - zero garment/HF hoặc empty garment mask cho residual chính xác bằng zero.
 
 ### Metric cần theo dõi cùng nhau
 
 - routing: `fine_top1_accuracy`, `fine_rgb_loss`, `fine_warp_coordinate_loss`;
+- target support: `fine_support_loss`, `fine_support_iou`;
 - branch sống: `garment_grad/refiner/output`, `garment_grad/hf/encoder`,
   `garment_grad/hf/feature_out`;
 - authority: `fine_velocity_raw_rms`, `fine_velocity_rms`, `fine_velocity_limit`,
@@ -419,6 +469,8 @@ hiện tại. Không dùng đồng thời hai tùy chọn.
   `hf_fusion_removed_dc_rms`;
 - HF: `hf_feature_rms`, `hf_fusion_delta_rms`;
 - V payload: `garment_value_mix_coarse|middle|detail`;
+- curriculum/carrier: `fine_teacher_forcing_ratio`, `fine_teacher_forcing_fraction`,
+  `warped_garment_latent_rms`, `garment_grad/refiner/latent_fusion`;
 - reconstruction: `hf_decoded_rgb_loss`, `hf_decoded_chroma_loss`,
   `hf_decoded_contrast_loss`, `hf_decoded_edge_loss`,
   `decoded_garment_rgb_loss`, `decoded_garment_low_frequency_loss`,
@@ -433,6 +485,14 @@ Audit frozen SD-VAE trên sample cố định `00055_00.jpg` cho
 `0.00975/0.01008`; chữ VANS vẫn đọc rõ sau encode/decode. Vì vậy trong trường hợp
 đã đo, VAE không phải trần làm mất logo. Khoảng cách validation khoảng `0.10` nằm ở
 garment transport/value/refiner, phù hợp với lỗi V từng bị per-token LayerNorm.
+
+Run `2026-09-14/T232158` đến step 2000 cho thêm bằng chứng kiến trúc: test garment
+RGB MAE chỉ dao động `0.1025 -> 0.0996`, edge MAE gần như đứng yên quanh `0.0818`,
+trong khi fine target mass đạt `0.49–0.67` nhưng top-1 chỉ `0.22–0.35`. Preview dựng
+đúng pose/loại áo và màu tổng quát nhưng xóa stripe/chữ. Vì vậy tiếp tục riêng graph
+cũ không giải quyết được bottleneck: refiner đang học từ phần lớn warp sai và learned
+V là carrier duy nhất. K/V separation, direct latent carrier và curriculum ở trên xử
+lý đúng ba điểm đó.
 
 ## 16. Bản đồ code
 

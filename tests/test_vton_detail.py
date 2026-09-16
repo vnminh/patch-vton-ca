@@ -519,6 +519,7 @@ def test_cascade_checkpoint_migrates_dense_query_and_zero_warp_adapters():
     legacy[state_key] = old_state
     for prefix in (
         'model.garment_refiner.warp_mix.',
+        'model.garment_refiner.latent_fusion.',
         'model.garment_high_frequency_control.warp_mix.',
     ):
         for key in [name for name in legacy if name.startswith(prefix)]:
@@ -530,6 +531,7 @@ def test_cascade_checkpoint_migrates_dense_query_and_zero_warp_adapters():
     torch.testing.assert_close(migrated[:, :8], old_state)
     assert not migrated[:, 8:].any()
     assert not module.model.garment_refiner.warp_mix.weight.any()
+    assert not module.model.garment_refiner.latent_fusion.weight.any()
     assert not module.model.garment_high_frequency_control.warp_mix.weight.any()
     assert module.model.garment_refiner.output.bias is None
     assert not module.model.garment_refiner.fine_gate.weight.any()
@@ -920,11 +922,14 @@ def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
     assert cfg.trainer.params.garment_refiner_lr_multiplier == .25
     assert cfg.trainer.params.garment_high_frequency_lr_multiplier == .1
     assert cfg.trainer.params.garment_value_mix_lr_multiplier == 1
+    assert cfg.trainer.params.garment_latent_fusion_lr_multiplier == 1
     assert cfg.trainer.params.adapter_lr_multiplier == .1
     assert cfg.trainer.params.decoded_garment_rgb_weight > 0
     assert cfg.trainer.params.decoded_garment_low_frequency_weight > 0
     assert cfg.trainer.params.decoded_garment_mean_weight > 0
     assert cfg.trainer.params.decoded_min_time == 0
+    assert cfg.trainer.params.fine_teacher_forcing_start == .75
+    assert cfg.trainer.params.fine_teacher_forcing_steps == 2000
     assert cfg.trainer.params.fine_velocity_regularization_weight == 2
     assert cfg.trainer.params.fine_velocity_max_backbone_ratio == .1
     assert cfg.trainer.params.fine_velocity_min_limit == .05

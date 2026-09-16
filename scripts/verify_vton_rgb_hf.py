@@ -2,6 +2,7 @@
 """CPU smoke check for RGB-DoG features fused into the one RGB refiner head."""
 from pathlib import Path
 import sys
+import warnings
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import torch
@@ -65,6 +66,7 @@ def main():
         garment_refiner_lr_multiplier=0.1,
         garment_high_frequency_lr_multiplier=0.1,
         garment_value_mix_lr_multiplier=1.0,
+        garment_latent_fusion_lr_multiplier=1.0,
         adapter_lr_multiplier=0.1,
         decoded_rgb_weight=1.0,
         decoded_edge_weight=0.1,
@@ -72,7 +74,14 @@ def main():
         decoded_garment_low_frequency_weight=1.0,
         decoded_garment_mean_weight=2.0,
         decoded_max_samples=1,
+        allow_new_garment_refiner=True,
     ).train()
+    legacy = module.state_dict()
+    del legacy["model.garment_refiner.latent_fusion.weight"]
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        module.load_state_dict(legacy, strict=True)
+    assert not model.garment_refiner.latent_fusion.weight.any()
     module.flow.t_sampler = lambda shape, device, dtype: torch.full(
         shape, 0.5, device=device, dtype=dtype
     )
@@ -122,6 +131,8 @@ def main():
     assert value_mix_gradient is not None and value_mix_gradient.abs() > 0
     fusion_gradient = model.garment_refiner.hf_fusion.weight.grad
     assert fusion_gradient is not None and fusion_gradient.abs().sum() > 0
+    latent_gradient = model.garment_refiner.latent_fusion.weight.grad
+    assert latent_gradient is not None and latent_gradient.abs().sum() > 0
     gradient = model.garment_high_frequency_control.encoder.weight.grad
     assert gradient is None or gradient.abs().sum() == 0
     assert model.garment_high_frequency_control.encoder.weight.detach().abs().sum() > 0
@@ -131,6 +142,7 @@ def main():
         for group in optimizer.param_groups for parameter in group["params"]
     }
     assert parameter_lrs[id(model.garment_refiner.hf_fusion.weight)] == module.lr * 0.1
+    assert parameter_lrs[id(model.garment_refiner.latent_fusion.weight)] == module.lr
     assert parameter_lrs[id(model.garment_refiner.fine_gate.weight)] == module.lr * 0.1
     assert parameter_lrs[id(model.garment_high_frequency_control.encoder.weight)] == module.lr * 0.1
     assert parameter_lrs[id(module.hf_condition_encoder.conv_in.weight)] == module.lr * 0.05
@@ -178,6 +190,7 @@ def main():
     assert not hf_features[0].any() and hf_features[1].abs().sum() > 0
     fine_without = [entry for entry in maps_without if entry.get("scale") == "refiner"][0]
     fine_with = [entry for entry in maps_with if entry.get("scale") == "refiner"][0]
+    assert fine_with["warped_garment_latent"].shape == (1, 4, 8, 6)
     assert not torch.allclose(fine_without["fine_velocity"], fine_with["fine_velocity"])
     torch.testing.assert_close(
         with_hf - without_hf,
@@ -205,6 +218,27 @@ def main():
     assert fine_with["fine_activity_gate_mean"] > fine_without["fine_activity_gate_mean"]
     grid = fine_with["sampling_grid"]
     torch.testing.assert_close(grid, grid[:, :1].expand_as(grid))
+    rows = (torch.arange(8, dtype=torch.float32) + .5) * (2 / 8) - 1
+    columns = (torch.arange(6, dtype=torch.float32) + .5) * (2 / 6) - 1
+    yy, xx = torch.meshgrid(rows, columns, indexing="ij")
+    teacher_grid = torch.stack((xx, yy), -1).reshape(1, 48, 2)
+    with torch.no_grad():
+        _, teacher_maps = model(
+            **direct,
+            garment_high_frequency=torch.zeros(1, 64, 32, 24),
+            garment_sampling_grid=teacher_grid,
+            garment_sampling_mask=torch.ones(1, 48, dtype=torch.bool),
+            return_garment_attention=True,
+            return_refiner_supervision=True,
+        )
+    teacher_entry = [
+        entry for entry in teacher_maps if entry.get("scale") == "refiner"
+    ][0]
+    torch.testing.assert_close(
+        teacher_entry["transport_sampling_grid"],
+        teacher_grid[:, None].expand(-1, 4, -1, -1),
+    )
+    assert teacher_entry["teacher_forcing_fraction"] == 1
     print(
         "PASS: blank VAE baseline is exactly zero; RGB-DoG/gradient features are "
         "64 channels in this tiny test; source consistency trains routing; fused decoded "
@@ -212,7 +246,8 @@ def main():
         "condition stem receives gradient; both global mixers are disabled; all heads "
         "share one deformation; detached HF activity and learned spatial gates are live; "
         "absolute/low-pass/mean garment colour losses are finite; final fine velocity "
-        "is DC-free and hard-limited to 10% backbone authority"
+        "is DC-free and hard-limited to 10% backbone authority; teacher-forced "
+        "transport uses its supplied grid exactly"
     )
 
 

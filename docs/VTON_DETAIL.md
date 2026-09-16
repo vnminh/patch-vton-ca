@@ -42,18 +42,24 @@ phân biệt tay, thân và hình dạng garment ở full latent resolution.
 Garment detail VAE feature được embed thành `B x 3072 x 1152`, đúng grid 64x48.
 
 ```text
-Q = projected(normalized person query + PE)
-K = per-token-LN(projected garment detail) + PE
+Q = query_projector(normalized person query) + shared_PE
+K = key_projector(per-token-LN(garment detail)) + PE
 V_old = per-token-LN(projected garment detail)
 V_mag = raw projected garment detail / global sample RMS
-V = V_old + clamp_ST(value_mix, 0, 1) * (V_mag - V_old)
+mix = minimum_mix + (1-minimum_mix) * clamp_ST(value_mix, 0, 1)
+V = value_projector(V_old + mix * (V_mag - V_old))
 ```
 
 Sau đó Q/K được normalize theo từng head và nhân cosine temperature có giới hạn.
 V không chứa PE: vị trí quyết định **lấy ở đâu**, còn value mang **appearance gì**.
-`value_mix` có một scalar cho coarse/middle/detail và khởi tạo zero, nên checkpoint
-cũ không đổi output ở bước đầu. Khác với per-token LayerNorm, global RMS không xóa
+`value_mix` có một scalar cho coarse/middle/detail để checkpoint cũ vẫn load được;
+config logo đặt `minimum_mix=1`, nên V dùng hoàn toàn global-RMS payload. Audit cho
+thấy scalar learned chỉ đạt 0.007 và không thể tự mở đường màu. Khác với per-token LayerNorm, global RMS không xóa
 mean/scale của từng vị trí; đó là payload cần để phân biệt nét logo với màu nền áo.
+
+K và V là hai argument riêng của `GarmentLatentRefiner.route`. Trước bản sửa này,
+refiner tạo K từ V; mở `value_mix` để giữ màu đồng thời thay đổi K và làm grid trôi.
+Hiện K luôn dùng normalized content, còn raw/global-RMS chỉ có quyền thay appearance V.
 
 Garment mask được max-pool về 64x48 để loại background keys. Empty mask được xử lý
 để SDPA luôn finite, rồi `active` gate ép residual cuối về đúng zero.
@@ -69,10 +75,20 @@ dùng một deformation grid nhất quán:
 4. Tại 64x48, trung bình local score để chọn một residual chung trong radius 2.
 5. Dùng cùng grid vật lý để bilinear-sample tám nhóm channel của garment V.
 
+Loss correspondence cũng dùng mean-head logits giống hệt bước 2; nó không còn tối ưu
+tám route riêng khác với route thật được dùng trong forward.
+
 ```text
 warped = sample_attention_heads(V, sampling_grid)
-rgb_warped_feature = attention_out(warped)
+learned_rgb_feature = attention_out(warped)
+warped_latent = grid_sample(garment_vae_latent, same_sampling_grid)
+rgb_warped_feature = learned_rgb_feature + Conv_zero(warped_latent)
 ```
+
+Đường latent bốn kênh là carrier trực tiếp, không phải branch velocity mới. VAE audit
+cho thấy latent này decode vẫn đọc được chữ VANS; vì vậy zero-init `latent_fusion`
+cho refiner một đường giữ RGB/logo không phụ thuộc hoàn toàn vào projection learned
+có thể co thành style code. Fine output vẫn là một velocity duy nhất.
 
 Trong config logo, global RGB `A@V/warp_mix` và global HF đều bị tắt. Chỉ coherent
 grid hoạt động; mỗi nhóm channel không còn được lấy từ một garment location khác.
@@ -105,15 +121,20 @@ decoded = modulated + local(modulated)
 raw_fine = output_bias_free(decoded)
 learned_gate = 2 * sigmoid(gate_zero_init(decoded))
 activity_gate = .25 + .75 * dilate(normalize_energy(stopgrad(hf_warped)))
-fine_ac = spatial_center(raw_fine * activity_gate * learned_gate, edit_support)
+garment_support = sigmoid(support_head(person_query_with_DensePose))
+detail = masked_highpass(raw_fine * activity_gate * learned_gate, kernel=9)
+fine_ac = spatial_center(detail, edit_support * stopgrad(garment_support))
 fine_velocity = fine_ac * min(1, max(.1 * backbone_rms, .05) / rms(fine_ac))
 ```
 
 Đây là modulation nhân, không phải person-only additive shortcut. Nếu garment/HF
 rỗng thì fused feature và fine velocity đều bằng zero.
 
-Activity gate bảo đảm fine correction tập trung quanh detail thực sự đã warp; learned
-gate tinh chỉnh theo channel. Spatial centering cấm latent DC shift. Trust
+Support head được supervise bằng `person_garment_mask` chỉ lúc train, nhưng lúc infer
+tự dự đoán từ person/DensePose. Reconstruction gradient không được phép đóng support
+gate vì gate bị detach trên đường fine velocity. Activity gate tập trung quanh detail;
+learned gate tinh chỉnh theo channel. Masked high-pass loại trường màu/sáng rộng,
+spatial centering cấm latent DC shift. Trust
 region cứng chạy cả inference và giới hạn fine RMS ở 10% backbone (floor 0.05);
 penalty mềm trên raw fine giúp refiner không phụ thuộc lâu dài vào clipping.
 
@@ -146,15 +167,27 @@ và local grid học fine displacement dưới độ phân giải DINO.
 - `fine_warp_mask_loss`: không sample background garment;
 - `fine_rgb_loss`: RGB được warp phải giống paired worn garment;
 - `fine_value_loss`: transported VAE feature phải đúng target feature.
+- `fine_support_loss`: BCE + Dice cho garment-support inference gate.
 
 Mọi loss trên chỉ chấm garment pixels. Decoded reconstruction riêng chấm toàn edit
 region để giữ pose/tay.
+
+### 7.4 Teacher-forced transport curriculum
+
+Metric run step 2000 cho thấy target mass cao nhưng hard top-1 chỉ 22–35%. Nếu dùng
+hard grid sai đó cho mọi refiner update, decoder nhìn thấy sai logo ở đa số query và
+học màu trung bình. Trong 2000 local optimizer step đầu, 75% sample ban đầu dùng
+DINO anchor đáng tin cộng displacement propagation để **transport** RGB/latent/HF.
+Xác suất giảm tuyến tính về zero. Predicted Q/K/grid vẫn nhận toàn bộ routing loss;
+teacher không thay prediction và không xuất hiện ở inference.
 
 ## 8. Điều không được hiểu nhầm
 
 - `rgb_warped_feature` được tạo **sau DiT**, nhưng không phải chính output `x` của DiT.
 - Refiner Q đến từ người; garment K/V đến từ ảnh sản phẩm.
 - K có PE, V không có PE.
+- `garment_value_mix` thay V nhưng không được thay K.
+- garment latent bốn kênh được warp trực tiếp rồi zero-init fuse vào RGB feature.
 - HF bổ sung feature trước refiner, không cộng edge vào velocity.
 - DINO hướng dẫn geometric anchor, không trực tiếp encode ý nghĩa chữ/logo.
 - Fine grid 64x48 là latent resolution, không phải full 512x384 pixel attention.
@@ -170,12 +203,14 @@ region để giữ pose/tay.
 | Refiner lấn át backbone | raw/final RMS, `fine_velocity_norm_gate`, limit |
 | Áo bị lệch màu đồng đều | `fine_velocity_dc_rms`, `hf_fusion_removed_dc_rms` |
 | Routing tốt nhưng chỉ ra màu trung bình | `garment_value_mix_*`, decoded RGB/mean |
+| Curriculum không chạy/không tắt | `fine_teacher_forcing_ratio/fraction` |
+| Direct latent carrier không học | `warped_garment_latent_rms`, gradient `latent_fusion` |
 | Gate vẫn gần identity | activity/effective gate, không chỉ learned gate mean |
 | HF không sống | `hf_feature_rms`, `hf_fusion_delta_rms`, fusion/encoder gradients |
 
 ## 10. Code map
 
-- `GarmentLatentRefiner.route`: tạo Q/K/V và coherent sampling grid;
+- `GarmentLatentRefiner.route`: tạo Q/K/V, coherent grid và direct latent warp;
 - `GarmentLatentRefiner.refine`: modulation + local decoder thành fine velocity;
 - `GarmentHighFrequencyControl.forward`: transport HF V theo shared grid;
 - `LatentVTONPatchForcingTrainer._fine_losses`: loss routing/value/RGB;

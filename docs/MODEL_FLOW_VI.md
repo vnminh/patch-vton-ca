@@ -9,7 +9,8 @@ Config tham chiếu:
 viton-pft-xl-512x384-detail-logo-hf
 ```
 
-Ký hiệu: `B` là microbatch; config hiện tại dùng `B=1`, accumulation 32.
+Ký hiệu: `B` là microbatch; config 512x384 hiện tại dùng `B=4`, accumulation 8
+(effective batch 32).
 
 ## 1. Dataset output
 
@@ -130,8 +131,8 @@ pixel_shuffle(2)             B x 256 x 64 x 48
 state[z_t,agnostic,dense]    B x 256 x 64 x 48
 
 Q                            B x 8 x 3072 x 32
-K_detail                     B x 8 x 3072 x 32
-V_detail                     B x 8 x 3072 x 32
+K_detail(normalized content) B x 8 x 3072 x 32
+V_detail(appearance payload) B x 8 x 3072 x 32
 ```
 
 `V_detail` nhận payload giữ magnitude nói trên. Vì scalar bắt đầu bằng zero, lần
@@ -146,8 +147,20 @@ coarse hard grid (shared)    B x 8 x 768 x 2   # 8 views của cùng tọa độ
 upsampled base grid          B x 8 x 3072 x 2  # identical across heads
 local fine grid (shared)     B x 8 x 3072 x 2  # identical across heads
 warped RGB values            B x 8 x 3072 x 32
-rgb_warped_feature           B x 256 x 64 x 48
+learned_rgb_feature          B x 256 x 64 x 48
+warped garment latent        B x 4 x 64 x 48
+zero-init latent projection  B x 256 x 64 x 48
+rgb_warped_feature           B x 256 x 64 x 48  # tổng hai carrier
 ```
+
+K và V nhận tensor độc lập. `garment_value_mix` chỉ thay V, không thể làm K/grid
+trôi. `warped garment latent` sample trực tiếp latent bốn kênh bằng cùng grid, nên
+không phải dựa hoàn toàn vào learned 128->1152->256 projection để giữ logo.
+
+Trong curriculum train-only, `transport_sampling_grid` có thể lấy DINO anchor đã
+propagate trên một phần sample. `sampling_grid` dự đoán vẫn được log/chấm routing.
+Tỷ lệ teacher bắt đầu 0.75 và giảm về 0 sau 2000 optimizer step; inference luôn dùng
+grid dự đoán.
 
 ## 9. HF route
 
@@ -181,7 +194,9 @@ velocity_condition(
 raw_fine       = bias-free Conv(refined_feature)
 learned_gate   = 2 * sigmoid(zero-init Conv(refined_feature))
 activity_gate  = .25 + .75 * dilated detached HF energy
-fine_velocity  = spatial_center(raw_fine * activity_gate * learned_gate)
+garment_support= sigmoid(SupportHead(person/DensePose query))
+fine_detail    = masked_highpass(raw_fine * activity_gate * learned_gate, k=9)
+fine_velocity  = spatial_center(fine_detail, edit * detached garment_support)
 fine_velocity  = hard_RMS_gate(fine_velocity, backbone_velocity)
                 B x 4 x 64 x 48
 final_velocity= B x 4 x 64 x 48
@@ -207,7 +222,8 @@ fused_predicted_clean = z_t.detach()
   + (1-t) * (backbone_velocity.detach() + fine_velocity)
 ```
 
-Decoded supervision gồm full edit RGB/edge để giữ person, garment-only
+Support head dùng paired person parse cho BCE+Dice lúc train nhưng chỉ nhận
+person/DensePose feature lúc infer. Decoded supervision gồm full edit RGB/edge để giữ person, garment-only
 RGB/low-pass/channel-mean để giữ màu, và sparse HF RGB/contrast/chroma/edge để giữ logo.
 
 Sau frozen VAE decoder, supervision image trở lại `B x 3 x 512 x 384` hoặc
@@ -223,5 +239,6 @@ z_next = z_t + (t_next-t_current) * velocity * masks.latent
 z_next = z_next * masks.latent + person_context * (1-masks.latent)
 ```
 
-Với CFG, conditional và unconditional có cùng person/DensePose; nửa unconditional
+Config logo dùng `cfg_scale=1.0`; ablation cho thấy 1.5 khuếch đại blue cast và làm
+edge xấu hơn. Nếu bật CFG, conditional và unconditional có cùng person/DensePose; nửa unconditional
 nhận garment RGB, garment mask và HF bằng zero.
