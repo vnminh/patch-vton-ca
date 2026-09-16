@@ -118,6 +118,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         decoded_min_time=0.3,
         decoded_max_time=0.95,
         decoded_max_samples=1,
+        decoded_clean_time_floor=0.0,
         decoded_checkpoint=True,
         decoded_supervision_image_size=None,
         allow_new_garment_refiner=False,
@@ -257,6 +258,18 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         self.decoded_min_time = float(decoded_min_time)
         self.decoded_max_time = float(decoded_max_time)
         self.decoded_max_samples = int(decoded_max_samples)
+        # Every decoded/clean-estimate loss supervises ``x_t + (1 - t) * v``, so its
+        # derivative with respect to the model is exactly ``(1 - t)``. The high-time
+        # regime that ``high_time_probability`` buys -- the interval where logo and
+        # printed-text detail is actually written -- therefore receives almost no pixel
+        # supervision: at t=0.95 a velocity error reaches the decoder at 5% strength,
+        # and at t=1 the decoded loss is identically zero whatever the model predicts.
+        # Dividing each decoded sample by its own mean ``(1 - t)`` over supervised
+        # tokens restores a timestep-independent gradient on the velocity. The floor
+        # bounds the amplification; 0 disables the correction entirely.
+        self.decoded_clean_time_floor = float(decoded_clean_time_floor)
+        if not 0 <= self.decoded_clean_time_floor <= 1:
+            raise ValueError("decoded_clean_time_floor must be in [0, 1]")
         self.decoded_checkpoint = bool(decoded_checkpoint)
         self.decoded_supervision_image_size = (
             None
@@ -1170,6 +1183,22 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                         UserWarning,
                     )
         unexpected = list(incompatible.unexpected_keys)
+        # Value-target projectors exist once per *supervised* scale, so narrowing
+        # correspondence_scales leaves the dropped scale's frozen copies in the
+        # checkpoint with nowhere to load. They carry no independent knowledge: they are
+        # EMA copies of the student's own embedder/norm and are re-seeded from it with
+        # decay=0 whenever a scale is (re-)introduced. Discarding them is symmetric to
+        # the missing_targets path below, which already tolerates the opposite direction.
+        stale_targets = [key for key in unexpected if key.startswith(target_prefixes)]
+        if stale_targets:
+            unexpected = [key for key in unexpected if key not in stale_targets]
+            dropped = sorted({key.split(".")[1] for key in stale_targets})
+            warnings.warn(
+                f"Warm-start: discarded {len(stale_targets)} frozen value-target "
+                f"tensor(s) for unsupervised scale(s) {dropped}. They are EMA copies of "
+                "the student and are rebuilt from it if the scale returns.",
+                UserWarning,
+            )
         if self.allow_new_garment_refiner:
             obsolete = (
                 "model.garment_refiner.condition.", "model.garment_refiner.state.",
@@ -2001,7 +2030,28 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         latent = latent / vae.scale + vae.shift
         return vae.decoder(vae.post_quant_conv(latent))
 
-    def _decoded_garment_loss(self, predicted_clean, batch, encoded, timesteps, keep):
+    def _clean_estimate_time_weights(self, timesteps, eligible, edit_tokens):
+        """Per-sample ``1 / mean(1 - t)`` so decoded losses stop vanishing at high t.
+
+        ``predicted_clean = x_t + (1 - t) * v``, so a fixed velocity error shows up in
+        the decoded image scaled by ``(1 - t)``. Without this correction the 25% of
+        training pinned near t=1 -- the refinement regime that writes logos and printed
+        text -- contributes almost nothing to any pixel-space objective. Only editable
+        tokens count: context tokens are pinned at t=1 by ``get_interpolants``.
+        """
+        weights = timesteps.new_ones(timesteps.shape[0])
+        if self.decoded_clean_time_floor <= 0:
+            return weights
+        counted = eligible.float()
+        if edit_tokens is not None:
+            counted = counted * edit_tokens.to(counted.dtype)
+        total = counted.sum(1)
+        remaining = ((1 - timesteps.float()) * counted).sum(1) / total.clamp_min(1)
+        scale = 1.0 / remaining.clamp_min(self.decoded_clean_time_floor)
+        return torch.where(total > 0, scale.to(weights.dtype), weights)
+
+    def _decoded_garment_loss(self, predicted_clean, batch, encoded, timesteps, keep,
+                              edit_tokens=None):
         """Pixel supervision on the full paired edit region at refinement timesteps.
 
         Decode the estimated clean latent, NOT velocity. Do not use self.decode:
@@ -2069,11 +2119,13 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             "decoded_garment_mean_loss": zero.detach(),
             "decoded_samples": zero.detach(),
             "decoded_supervised_fraction": zero.detach(),
+            "decoded_time_weight": zero.detach(),
         }
         if candidates.numel() == 0:
             return zero, metrics
         order = candidates[torch.randperm(candidates.numel(), device=candidates.device)]
         selected = order if self.decoded_max_samples == 0 else order[:self.decoded_max_samples]
+        time_weights = self._clean_estimate_time_weights(timesteps, eligible, edit_tokens)
         rgb_losses, edge_losses = [], []
         garment_rgb_losses, garment_low_frequency_losses, garment_mean_losses = [], [], []
         # Decode one sample at a time. With decoded_max_samples=0 this covers every
@@ -2090,16 +2142,19 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             # Work in [0,1] units, but do not clamp predictions and lose out-of-range gradients.
             decoded, target = (decoded.float() + 1) * 0.5, (target.float() + 1) * 0.5
             selected_mask = mask[index]
-            rgb_losses.append(masked_mean((decoded - target).abs(), selected_mask))
-            edge_losses.append(self._detail_loss(decoded, target, selected_mask))
+            weight = time_weights[index].reshape(())
+            rgb_losses.append(weight * masked_mean((decoded - target).abs(), selected_mask))
+            edge_losses.append(weight * self._detail_loss(decoded, target, selected_mask))
             selected_garment = garment_colour_mask[index]
             if bool(selected_garment.any()):
-                garment_rgb_losses.append(masked_mean(
+                garment_rgb_losses.append(weight * masked_mean(
                     (decoded - target).abs(), selected_garment
                 ))
                 predicted_mean = self._masked_channel_mean(decoded, selected_garment)
                 target_mean = self._masked_channel_mean(target, selected_garment)
-                garment_mean_losses.append((predicted_mean - target_mean).abs().mean())
+                garment_mean_losses.append(
+                    weight * (predicted_mean - target_mean).abs().mean()
+                )
                 low_size = (
                     max(1, decoded.shape[-2] // self.decoded_low_frequency_scale),
                     max(1, decoded.shape[-1] // self.decoded_low_frequency_scale),
@@ -2107,7 +2162,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 low_decoded = F.interpolate(decoded, low_size, mode="area")
                 low_target = F.interpolate(target, low_size, mode="area")
                 low_mask = F.interpolate(selected_garment, low_size, mode="area")
-                garment_low_frequency_losses.append(masked_mean(
+                garment_low_frequency_losses.append(weight * masked_mean(
                     (low_decoded - low_target).abs(), low_mask
                 ))
         rgb = torch.stack(rgb_losses).mean()
@@ -2130,6 +2185,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             decoded_garment_mean_loss=garment_mean.detach(),
             decoded_samples=rgb.new_tensor(selected.numel()),
             decoded_supervised_fraction=mask[selected].mean().detach(),
+            decoded_time_weight=time_weights[selected].mean().detach(),
         )
         return (
             self.decoded_rgb_weight * rgb
@@ -2158,7 +2214,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         mean = LatentVTONPatchForcingTrainer._masked_channel_mean(image, mask)
         return image.float() - mean
 
-    def _hf_decoded_loss(self, fused_predicted_clean, batch, encoded, timesteps, keep):
+    def _hf_decoded_loss(self, fused_predicted_clean, batch, encoded, timesteps, keep,
+                         edit_tokens=None):
         """Decode the fused RGB+HF refiner estimate and supervise sparse logo support.
 
         The backbone velocity is detached when ``fused_predicted_clean`` is constructed.
@@ -2224,6 +2281,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             return zero, metrics
         order = candidates[torch.randperm(candidates.numel(), device=candidates.device)]
         selected = order[:self.hf_decoded_max_samples]
+        time_weights = self._clean_estimate_time_weights(timesteps, eligible, edit_tokens)
         rgb_losses, contrast_losses, chroma_losses, edge_losses = [], [], [], []
         for index in selected.split(1):
             latent = decode_latents[index]
@@ -2241,19 +2299,20 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             # absolute RGB/chroma term as well as contrast: zero latent mean does not
             # imply zero RGB mean through the nonlinear VAE decoder, which is exactly
             # how the measured run darkened while its latent DC metric stayed near zero.
-            rgb_losses.append(masked_mean((decoded - target).abs(), selected_mask))
+            weight = time_weights[index].reshape(())
+            rgb_losses.append(weight * masked_mean((decoded - target).abs(), selected_mask))
             decoded_contrast = self._masked_colour_contrast(decoded, selected_mask)
             target_contrast = self._masked_colour_contrast(target, selected_mask)
-            contrast_losses.append(masked_mean(
+            contrast_losses.append(weight * masked_mean(
                 (decoded_contrast - target_contrast).abs(), selected_mask
             ))
-            chroma_losses.append(masked_mean(
+            chroma_losses.append(weight * masked_mean(
                 (
                     self._rgb_chroma(decoded)
                     - self._rgb_chroma(target)
                 ).abs(), selected_mask
             ))
-            edge_losses.append(self._detail_loss(decoded, target, selected_mask))
+            edge_losses.append(weight * self._detail_loss(decoded, target, selected_mask))
         rgb = torch.stack(rgb_losses).mean()
         contrast = torch.stack(contrast_losses).mean()
         chroma = torch.stack(chroma_losses).mean()
@@ -2573,7 +2632,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 ].float().square().mean().sqrt()
         if supervise_hf_decoded:
             hf_decoded_loss, hf_decoded_metrics = self._hf_decoded_loss(
-                fused_predicted_clean, batch, encoded, timesteps, keep
+                fused_predicted_clean, batch, encoded, timesteps, keep,
+                edit_tokens=masks.token,
             )
             loss = loss + hf_decoded_loss
             metrics.update(hf_decoded_metrics)
@@ -2634,7 +2694,8 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             metrics["correspondence_ramp"] = torch.as_tensor(ramp, device=loss.device)
         if use_decoded:
             decoded_loss, decoded_metrics = self._decoded_garment_loss(
-                predicted_clean, batch, encoded, timesteps, keep
+                predicted_clean, batch, encoded, timesteps, keep,
+                edit_tokens=masks.token,
             )
             loss = loss + decoded_loss
             metrics.update(decoded_metrics)

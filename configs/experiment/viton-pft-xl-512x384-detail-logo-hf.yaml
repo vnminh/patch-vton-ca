@@ -30,17 +30,24 @@ model:
     garment_refiner_shared_sampling_grid: true
     # Enforce the authority bound inside every sampler call, not only through a train
     # loss. The learned spatial gate remains free to place detail, but the total AC
-    # residual cannot exceed 10% of backbone RMS.
-    garment_refiner_velocity_max_backbone_ratio: 0.10
+    # residual cannot exceed this fraction of backbone RMS.
+    # 0.10 was never the binding constraint: fine_velocity_rms sat at 0.029 against a
+    # 0.124 limit for 1300 steps and fine_velocity_norm_gate logged exactly 1.0 at every
+    # step, i.e. the branch suppressed itself and the clamp never fired. The hard cap is
+    # the safety mechanism -- it runs inside the sampler -- so it can be loosened while
+    # the soft penalty that actually pinned the branch is reduced below.
+    garment_refiner_velocity_max_backbone_ratio: 0.30
     garment_refiner_velocity_min_limit: 0.05
     # HF energy is warped by the same garment grid and becomes a detached spatial gate.
     # Keep 25% authority away from explicit strokes so color-block interiors can still
     # be refined; logo/text neighbourhoods receive up to full authority.
     garment_refiner_detail_activity_floor: 0.25
-    # A fine branch should write strokes and colour boundaries, not a garment-wide
-    # brightness field. Remove only its broad latent component; the backbone retains
-    # ownership of base colour and low-frequency shading.
-    garment_refiner_highpass_kernel: 9
+    # The VANS-style wordmark block measures about 12x5 latent cells. A 9x9 local-mean
+    # subtraction removes exactly that band, so the refiner could never fix a logo's
+    # fill colour -- only its outline. Masked per-channel DC removal (always on) is
+    # already enough to stop a garment-wide brightness field, so the local high-pass is
+    # off. Re-enable it only with a kernel well below the smallest structure to keep.
+    garment_refiner_highpass_kernel: 0
 
 trainer:
   params:
@@ -69,17 +76,31 @@ trainer:
     detail_loss_weight: 0.1
     detail_edge_weight: 2.0
     decoded_rgb_weight: 1.0
-    decoded_edge_weight: 0.10
+    decoded_edge_weight: 0.5
     # t=0 is the actual first sampling state and 35% of training examples are forced to
     # pure noise there. Excluding it from decoded RGB taught refinement only when xt
     # already leaked target appearance.
     decoded_min_time: 0.0
+    # predicted_clean = x_t + (1 - t) * v, so every decoded loss reaches the model
+    # scaled by (1 - t) and is identically zero at t=1. That silently excluded the 25%
+    # of training bought by high_time_probability -- the regime meant to write logo and
+    # printed-text detail -- from all pixel supervision. Normalise it back, capped at 5x.
+    decoded_clean_time_floor: 0.2
+    # One decode per micro-batch sample (decoded_max_samples: 0) with a checkpointed
+    # frozen VAE was a large share of the 24 s optimizer step. Two is enough signal.
+    decoded_max_samples: 2
     # Full-edit RGB preserves arms/pose, but garment colour occupied too little of that
     # denominator: test RGB worsened 9.5% while edge improved. Add garment-only absolute,
     # low-pass and channel-mean terms using paired masks only (never inference inputs).
+    # The previous split put 5.0 of weight on flat colour (rgb 1.0 + garment rgb 1.0 +
+    # low frequency 1.0 + garment mean 2.0) against 0.10 on edges. The measured previews
+    # are exactly what that asks for: paired mean luminance is within 0.004 of target
+    # while within-garment contrast is down 12-26% and saturation down ~17%. Absolute
+    # garment colour stays fully weighted; the two redundant low-frequency terms that
+    # only restate it are cut back.
     decoded_garment_rgb_weight: 1.0
-    decoded_garment_low_frequency_weight: 1.0
-    decoded_garment_mean_weight: 2.0
+    decoded_garment_low_frequency_weight: 0.25
+    decoded_garment_mean_weight: 0.5
     decoded_low_frequency_scale: 8
     fine_rgb_weight: 0.5
     # Learn the inference-time garment region from person/DensePose features. Ground-
@@ -106,27 +127,29 @@ trainer:
     hf_decoded_rgb_weight: 1.0
     hf_decoded_contrast_weight: 1.0
     hf_decoded_chroma_weight: 1.0
-    hf_decoded_edge_weight: 0.10
+    hf_decoded_edge_weight: 0.5
     hf_decoded_max_samples: 1
 
-    # Sized as a regulator, not a disaster catcher. Measured on T004330: fine velocity
-    # RMS sat at 0.062 while the LR was still ramping, then took off the moment warmup
-    # completed at step 500 -- 0.099 (471), 0.200 (518), 0.325 (565), doubling every
-    # ~50 steps. Every other fine metric degraded in lockstep, because they all measure
-    # the same growing residual: value loss 0.0313 -> 0.0388, warp smoothness 0.0137 ->
-    # 0.0145, warp mask 0.0088 -> 0.0148, displacement 0.840 -> 0.911, and it leaked
-    # into flow_loss 0.4354 -> 0.4520.
-    fine_velocity_regularization_weight: 2.0
-    fine_velocity_max_backbone_ratio: 0.10
+    # Sized as a regulator, not a disaster catcher. On T004330 an unbounded fine
+    # velocity doubled every ~50 steps once warmup completed and dragged every other
+    # fine metric with it, which is why the branch is bounded at all. What actually
+    # enforces that bound now is the in-sampler hard cap above, which also applies at
+    # inference; this soft term only has to discourage the runaway, not prevent it.
+    # Weight 2.0 on an excess-RMS penalty, against a flow loss of ~0.45, held the only
+    # sub-8px garment path at 2.3% of the backbone velocity (0.029 vs 1.24) -- far too
+    # small to write a letter. The in-sampler hard cap above already guarantees the
+    # branch can never take over, so this stays only as a mild anti-runaway term.
+    fine_velocity_regularization_weight: 0.25
+    fine_velocity_max_backbone_ratio: 0.30
     fine_velocity_min_limit: 0.05
 
-    # Both newly coupled branches were previously trained at 1e-4 while the backbone
-    # used 1e-5. Use the stable rate for fusion/refinement as well.
-    # The router was receiving only 7e-6 at step 700 and its top-1 accuracy regressed.
-    # A quarter-rate adapter remains below the full garment attention LR while allowing
-    # the corrected, non-saturated routing signal to move Q/K during this warm restart.
-    garment_refiner_lr_multiplier: 0.25
-    garment_high_frequency_lr_multiplier: 0.1
+    # The refiner and the HF branch were the newest, mostly zero-initialised modules in
+    # the model and also had the lowest learning rates in it (2.5e-5 and 1e-5 against a
+    # 1e-4 base). Nothing about them is a loaded pretrained weight that needs protecting;
+    # the backbone stays at 1e-5 because it is.
+    garment_refiner_lr_multiplier: 1.0
+    garment_high_frequency_lr_multiplier: 1.0
+    hf_condition_encoder_lr_multiplier: 0.25
     # Three bounded zero-init scalars are safe at the base 1e-4 LR; putting them in
     # the 1e-5 adapter group would open the corrected V payload only ~0.01 after 1k steps.
     garment_value_mix_lr_multiplier: 1.0
@@ -136,11 +159,12 @@ trainer:
     # Tiny new segmentation head starts at p=0.75 and needs to move faster than the
     # already-trained refiner matrices; its detached output cannot game reconstruction.
     garment_support_lr_multiplier: 1.0
-    # x_embedder and every garment cross-attention adapter were still at 1e-4, ten
-    # times the backbone/refiner. The common RGB dark shift began as that warmup reached
-    # full LR. This warm start already has trained DensePose/garment adapters, so keep
-    # all conditioning paths at the stable 1e-5 rate.
-    adapter_lr_multiplier: 0.1
+    # The observed RGB dark shift began when this group's warmup reached the full 1e-4,
+    # so it does not go back there. 1e-5 was the over-correction: the garment cross-
+    # attention that has to learn where the cloth goes was then training no faster than
+    # the frozen-in-place pretrained backbone. 2.5e-5 is 2.5x the stalled rate and still
+    # four times below the rate with measured colour damage.
+    adapter_lr_multiplier: 0.25
 
     # Garment is already a spatial condition. CFG 1.5 amplified its colour residual
     # (especially blue) and worsened edges in the fixed-sample ablation.
@@ -153,6 +177,12 @@ trainer:
     # This is a warm restart from a trained checkpoint, so only ramp the denser DINO
     # route briefly instead of suppressing it for another thousand optimizer steps.
     correspondence_warmup_steps: 250
+
+    # Correspondence supervision needs the full attention matrix, which disables fused
+    # attention in every block it touches. The resolved config was supervising all three
+    # scales in all 14 routed blocks. `middle` is the least region-separable of the
+    # three and is the documented one to drop.
+    correspondence_scales: [coarse, detail]
 
 data:
   params:
@@ -167,8 +197,17 @@ lr_scheduler:
     # correspondence ramp, which starved the fine route quadratically.
     num_warmup_steps: 500
 
+checkpoint_params:
+  # This experiment needs one long uninterrupted run, not another 1.5k-step restart:
+  # every restart so far discarded the Adam state and re-ran a 500-step LR warmup, and
+  # the last one reloaded step 1000 of a run that had reached 1600. At ~24 s/step a
+  # 1000-step checkpoint interval risks losing 6.7 h; 500 halves that.
+  every_n_train_steps: 500
+
 train_params:
   accumulate_grad_batches: 8
   # Fixed paired/swapped previews and paired garment RGB/edge measurements must be
-  # frequent enough to catch a colour drift before it contaminates a long run.
-  val_check_interval: 50
+  # frequent enough to catch a colour drift before it contaminates a long run, but each
+  # validation samples 36 previews at 30 steps each. At ~24 s/optimizer step, every-50
+  # spent roughly a tenth of the run validating; every-250 keeps that near 2%.
+  val_check_interval: 250

@@ -359,9 +359,13 @@ class GarmentLatentRefiner(nn.Module):
         numerator = F.avg_pool2d(
             tensor.float() * support_float, kernel, stride=1, padding=kernel // 2
         )
+        # A 1e-4 floor let a window holding one fractional support cell amplify its
+        # local mean by four orders of magnitude, so the subtracted "low frequency"
+        # exploded along the garment boundary. Require a real fraction of the window
+        # to be writable before trusting its mean.
         denominator = F.avg_pool2d(
             support_float, kernel, stride=1, padding=kernel // 2
-        ).clamp_min(1e-4)
+        ).clamp_min(0.05)
         return (tensor.float() - numerator / denominator).to(tensor.dtype)
 
     def fuse_high_frequency(self, rgb_features, hf_features, edit, active):

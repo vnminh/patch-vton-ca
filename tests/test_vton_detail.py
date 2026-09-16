@@ -900,10 +900,12 @@ def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
     assert not cfg.model.params.garment_high_frequency_global_attention
     assert not cfg.model.params.garment_refiner_global_attention
     assert cfg.model.params.garment_refiner_shared_sampling_grid
-    assert cfg.model.params.garment_refiner_velocity_max_backbone_ratio == .1
+    assert cfg.model.params.garment_refiner_velocity_max_backbone_ratio == .3
     assert cfg.model.params.garment_refiner_velocity_min_limit == .05
     assert cfg.model.params.garment_refiner_detail_activity_floor == .25
+    assert cfg.model.params.garment_refiner_highpass_kernel == 0
     assert cfg.model.params.garment_value_preserve_magnitude
+    assert cfg.model.params.garment_value_minimum_mix == 1.0
     assert cfg.trainer.params.ema_rate == 0
     assert cfg.trainer.params.hf_detail_loss_weight == 0
     assert cfg.trainer.params.hf_source_sparse_weight > 0
@@ -919,23 +921,33 @@ def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
     assert cfg.trainer.params.hf_decoded_rgb_weight > cfg.trainer.params.hf_decoded_edge_weight
     assert cfg.trainer.params.hf_decoded_chroma_weight > cfg.trainer.params.hf_decoded_edge_weight
     assert cfg.model.params.garment_refiner_cosine_scale == 10
-    assert cfg.trainer.params.garment_refiner_lr_multiplier == .25
-    assert cfg.trainer.params.garment_high_frequency_lr_multiplier == .1
+    assert cfg.trainer.params.garment_refiner_lr_multiplier == 1.0
+    assert cfg.trainer.params.garment_high_frequency_lr_multiplier == 1.0
     assert cfg.trainer.params.garment_value_mix_lr_multiplier == 1
     assert cfg.trainer.params.garment_latent_fusion_lr_multiplier == 1
-    assert cfg.trainer.params.adapter_lr_multiplier == .1
+    assert cfg.trainer.params.garment_support_lr_multiplier == 1
+    assert cfg.trainer.params.hf_condition_encoder_lr_multiplier == .25
+    assert cfg.trainer.params.adapter_lr_multiplier == .25
     assert cfg.trainer.params.decoded_garment_rgb_weight > 0
     assert cfg.trainer.params.decoded_garment_low_frequency_weight > 0
     assert cfg.trainer.params.decoded_garment_mean_weight > 0
     assert cfg.trainer.params.decoded_min_time == 0
+    assert cfg.trainer.params.decoded_clean_time_floor == .2
+    assert cfg.trainer.params.decoded_max_samples == 2
+    assert cfg.trainer.params.decoded_edge_weight == .5
+    assert cfg.trainer.params.hf_decoded_edge_weight == .5
+    assert cfg.trainer.params.fine_support_weight == .25
     assert cfg.trainer.params.fine_teacher_forcing_start == .75
     assert cfg.trainer.params.fine_teacher_forcing_steps == 2000
-    assert cfg.trainer.params.fine_velocity_regularization_weight == 2
-    assert cfg.trainer.params.fine_velocity_max_backbone_ratio == .1
+    assert cfg.trainer.params.fine_velocity_regularization_weight == .25
+    assert cfg.trainer.params.fine_velocity_max_backbone_ratio == .3
     assert cfg.trainer.params.fine_velocity_min_limit == .05
+    assert list(cfg.trainer.params.correspondence_scales) == ['coarse', 'detail']
     assert cfg.trainer.params.correspondence_warmup_steps == 250
+    assert cfg.trainer.params.sample_kwargs.cfg_scale == 1.0
     assert cfg.lr_scheduler.params.num_warmup_steps == 500
-    assert cfg.train_params.val_check_interval == 50
+    assert cfg.train_params.val_check_interval == 250
+    assert cfg.checkpoint_params.every_n_train_steps == 500
     assert cfg.name.endswith('detail-logo-hf')
 
 
