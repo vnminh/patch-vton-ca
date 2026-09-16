@@ -369,6 +369,19 @@ def main(cfg: DictConfig):
     # Hooks (EMA/correspondence warmups) need the correct counter on their very first
     # optimizer update, especially when resuming a checkpoint at a non-zero step.
     module.global_step = global_step
+    # _training_step_count() (correspondence warmup ramp, fine teacher-forcing decay)
+    # reads this private counter, not self.global_step -- self.global_step is Lightning
+    # state that stays 0 outside a real Trainer.fit() loop, which this script never
+    # calls. Without this, every restart replayed the full 250-step correspondence
+    # ramp and the full 2000-step teacher-forcing decay from scratch: on a
+    # resume_checkpoint restart (same architecture, meant to be one continuous run)
+    # the fine sampling grid would keep re-entering heavy DINO teacher forcing instead
+    # of accumulating real self-routing practice, silently reintroducing exactly the
+    # train/inference mismatch (validation always runs at teacher_ratio=0) most likely
+    # to leave routing -- and therefore logo/text placement -- undertrained. A
+    # load_weights restart (changed architecture) still starts this at 0 by default,
+    # which is correct: the new modules need their own fresh ramp-in.
+    module._optimizer_steps = global_step
     max_steps = cfg.train_params.get("max_steps", -1)
     validation_steps = {int(step) for step in cfg.train_params.get("validation_steps", [])}
     if any(step <= 0 for step in validation_steps):
