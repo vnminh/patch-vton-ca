@@ -108,21 +108,18 @@ trainer:
     # input. This prevents warped cloth residuals from being written onto erased arms.
     fine_support_weight: 0.25
 
-    # Disabled. Forward-substituting DINO routing avoided the wrong-warp -> mean-colour
-    # collapse, but every schedule that lets it reach zero reproduces the same collapse
-    # the moment self-routing has to fly solo (measured: fine_top1_accuracy 0.36 -> 0.25
-    # and decoded_garment_rgb/hf_decoded_rgb/contrast/edge all roughly tripled within
-    # ~500 steps of the ratio hitting exactly 0, at both 2000 and effectively any finite
-    # horizon). That is a real train/inference mismatch, not just "needs more steps": the
-    # fine decoder learns to decode whatever ratio of ground-truth-vs-self routing it is
-    # fed, and inference always gives it 100% self-routing regardless of the schedule.
-    # Route on the model's own prediction from step 0 -- identical to inference from the
-    # start, no cliff to fall off later -- and push routing correctness entirely through
-    # the supervised correspondence losses below (nll/center/photometric/value), which
-    # already exist and act on the same coarse/middle/detail attention. Paired with
-    # correspondence_entropy_weight below as the regularizer that specifically discourages
-    # the diffuse/averaged-attention shape that produces the mean-colour collapse.
-    fine_teacher_forcing_start: 0.0
+    # Reverted to enabled. Tried removing this entirely (relying only on the supervised
+    # correspondence losses below plus entropy regularization) and reverted without
+    # having measured it run -- restoring the known-working starting point rather than
+    # stacking an untested change on top of an unresolved architecture review.
+    # The hard route is currently correct for only ~22-35% of queries. Let 75% of
+    # paired samples initially transport through reliable DINO anchors plus mask-only
+    # propagated coordinates, then decay this probability to exactly zero. This breaks
+    # the wrong-warp -> mean-colour local optimum while retaining inference without DINO.
+    # 2000 steps was measured too short (fine_top1_accuracy 0.36 -> 0.25 and decoded/HF
+    # colour losses roughly tripled within ~500 steps of the ratio hitting exactly 0);
+    # stretched to 8000 so withdrawal is much more gradual relative to real progress.
+    fine_teacher_forcing_start: 0.75
     fine_teacher_forcing_steps: 8000
     # Entropy of the routing/correspondence attention, penalised only on examples with
     # an intrinsically spread target. Off by default in the base experiment (0.0); with
