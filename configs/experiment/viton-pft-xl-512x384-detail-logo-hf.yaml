@@ -112,8 +112,15 @@ trainer:
     # paired samples initially transport through reliable DINO anchors plus mask-only
     # propagated coordinates, then decay this probability to exactly zero. This breaks
     # the wrong-warp -> mean-colour local optimum while retaining inference without DINO.
+    # 2000 steps was measured too short: now that the counter actually survives a
+    # resume_checkpoint restart (it previously reset to 0 every restart, so this decay
+    # had never really completed before), the ratio reached exactly 0 at step ~2000 and
+    # fine_top1_accuracy fell from its 0.36 mid-decay peak back to ~0.25 -- self-routing
+    # was not ready to fly solo. decoded_garment_rgb_loss, hf_decoded_rgb/contrast/edge
+    # all roughly tripled in the following ~500 steps as a result. Stretch the horizon
+    # so withdrawal is much more gradual relative to real training progress.
     fine_teacher_forcing_start: 0.75
-    fine_teacher_forcing_steps: 2000
+    fine_teacher_forcing_steps: 8000
 
     # Decode the joint RGB+HF refiner estimate. RGB keeps ink colour, opponent chroma
     # keeps colour blocks, and edge keeps letter boundaries. One sample caps frozen-VAE
