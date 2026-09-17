@@ -152,9 +152,33 @@ def oracle_reachable_fraction(teacher, base_grid, mask, radius, width, height):
 
 
 def local_attention_sampling_grid(
-    query, key, valid, base_grid, height, width, radius, shared_heads=False
+    query, key, valid, base_grid, height, width, radius, shared_heads=False,
+    temperature_ratio=1.0, return_sharpness=False,
 ):
-    """Search only a small residual window around a coherent coarse correspondence."""
+    """Search only a small residual window around a coherent coarse correspondence.
+
+    Unlike the coarse stage, whose forward pass is a straight-through ``argmax`` and is
+    therefore temperature-free, this stage's forward pass IS the softmax: it returns
+    ``sum_c p_c * candidate_c``, a soft-argmax over coordinates. Two consequences follow
+    that the coarse stage does not share.
+
+    First, a flat ``p`` collapses the result onto the centroid of the window -- which is
+    the coarse anchor this stage exists to refine. Measured on the trained model at the
+    shared scale of 10, ``p`` covered 21 of 25 candidates and the returned coordinate
+    moved 0.52 cells, under half a cell for 55% of queries: the refinement was very
+    nearly a no-op, which is why fine_top1_accuracy tracked the coarse route's accuracy
+    across every configuration tried.
+
+    Second, averaging *coordinates* is not averaging *values*. If the true match sits at
+    (+2, 0) and a decoy at (-2, 0), a value-average would at least blend two real cloth
+    colours; the coordinate-average samples (0, 0), which matches neither. Diffuseness
+    here is worse than diffuseness in ordinary attention, not equivalent to it.
+
+    ``temperature_ratio`` scales the scores relative to whatever the caller already
+    folded into Q/K, so this stage can be sharp enough to interpolate between adjacent
+    cells (sub-pixel, a handful of effective candidates) while the coarse stage keeps
+    the soft backward signal it needs.
+    """
     height, width, radius = int(height), int(width), int(radius)
     batch, heads, queries, channels = query.shape
     if radius < 0 or key.shape != query.shape or queries != height * width:
@@ -196,10 +220,20 @@ def local_attention_sampling_grid(
         logits = logits.mean(dim=1, keepdim=True)
         candidate_valid = candidate_valid.all(dim=1, keepdim=True)
         candidate = candidate[:, :1]
+    logits = logits * float(temperature_ratio)
     probability = logits.masked_fill(~candidate_valid, MASKED_LOGIT).softmax(-1)
     grid = (probability[..., None] * candidate).sum(-2).clamp(-limit, limit)
     if shared_heads:
         grid = grid.expand(-1, heads, -1, -1)
+    if return_sharpness:
+        # exp(entropy): how many of the (2r+1)^2 candidates the stage is effectively
+        # averaging. Approaching the candidate count means the window is being blurred
+        # rather than searched; 2-4 means genuine sub-cell interpolation.
+        with torch.no_grad():
+            safe = probability.clamp_min(1e-9)
+            effective = (-(safe.log() * probability).sum(-1)).exp()
+            effective = effective[candidate_valid.any(-1)].float().mean()
+        return grid, effective
     return grid
 
 
@@ -234,7 +268,9 @@ class GarmentLatentRefiner(nn.Module):
                  local_radius=2, attention_query_chunk_size=512,
                  shared_sampling_grid=False, use_global_attention=True,
                  max_velocity_ratio=0.0, min_velocity_limit=0.0,
-                 detail_activity_floor=1.0, highpass_kernel=0):
+                 detail_activity_floor=1.0, highpass_kernel=0,
+                 remove_velocity_dc=True, learnable_position_gain=False,
+                 local_cosine_scale=None):
         super().__init__()
         if width < 1 or heads < 1 or width % heads or width // heads < 2:
             raise ValueError("Refiner width must be divisible by heads with at least two channels per head")
@@ -250,6 +286,17 @@ class GarmentLatentRefiner(nn.Module):
         self.min_velocity_limit = float(min_velocity_limit)
         self.detail_activity_floor = float(detail_activity_floor)
         self.highpass_kernel = int(highpass_kernel)
+        # Removing the residual's per-channel spatial DC assumes the backbone already
+        # owns the garment's base colour. The backbone reaches the garment only through
+        # softmax cross-attention, which returns a convex combination of garment value
+        # tokens, so anything short of one-hot attention hands it a *blend* of garment
+        # regions -- measured at 56% of mass on the matched key, i.e. 44% from elsewhere.
+        # A lavender body blended with navy sleeves is the darker blue-purple in the
+        # previews; red and white stripes blended are the uniform pink. This branch is
+        # the only one that transports by warping (one grid_sample per cell) rather than
+        # averaging, so it is the only one that can correct that blend -- but only if it
+        # is allowed to carry a mean. Keep the default for every other experiment.
+        self.remove_velocity_dc = bool(remove_velocity_dc)
         if self.local_radius < 0:
             raise ValueError("Fine refiner local radius must be non-negative")
         if self.attention_query_chunk_size < 1:
@@ -268,6 +315,17 @@ class GarmentLatentRefiner(nn.Module):
         self.cosine_scale = float(cosine_scale)
         if not math.isfinite(self.cosine_scale) or not 0 < self.cosine_scale <= 30:
             raise ValueError("Refiner cosine scale must be finite and in (0, 30]")
+        # One scalar used to serve two stages that need opposite temperatures. The
+        # coarse stage selects by straight-through argmax, so its forward pass ignores
+        # temperature entirely and only its backward pass sees it -- low is right there,
+        # to keep losing locations differentiable. The local stage's forward pass IS the
+        # softmax, so low flattens its coordinate regressor onto the anchor. Tuning the
+        # shared value for the coarse backward pass silently disabled local refinement.
+        self.local_cosine_scale = (
+            self.cosine_scale if local_cosine_scale is None else float(local_cosine_scale)
+        )
+        if not math.isfinite(self.local_cosine_scale) or not 0 < self.local_cosine_scale <= 200:
+            raise ValueError("Refiner local cosine scale must be finite and in (0, 200]")
         self.query_expand = nn.Linear(backbone_dim, width * patch_size ** 2)
         # Fine-resolution person evidence for the query. Without it the four subpixel
         # queries inside a patch differ only by a learned constant slice of
@@ -295,6 +353,13 @@ class GarmentLatentRefiner(nn.Module):
         self.velocity_condition = nn.Conv2d(channels * 2, width, 3, padding=1)
         self.reset_velocity_condition()
         self.position = nn.Linear(backbone_dim, width, bias=False)
+        # One scalar, because ``route`` layer-norms the positional projection and would
+        # otherwise discard any magnitude ``self.position`` learns. Identity at 1.0, and
+        # only created when requested: adding a parameter changes the optimizer's group
+        # sizes, which costs a full Adam state on the next restart.
+        self.learnable_position_gain = bool(learnable_position_gain)
+        if self.learnable_position_gain:
+            self.position_gain = nn.Parameter(torch.ones(()))
         self.query_norm = nn.LayerNorm(width)
         self.key_norm = nn.LayerNorm(width)
         self.query = nn.Linear(width, width)
@@ -478,9 +543,25 @@ class GarmentLatentRefiner(nn.Module):
         pos = self.position(position)
         if self.qk_norm:
             # A large shared positional component also makes cosine attention nearly
-            # constant across garment content. Keep position comparable to normalized
-            # person/garment content before combining them, without learned gain.
+            # constant across garment content. Normalising bounds it -- but with no gain
+            # it also *floors* it: K is key_norm(content) (RMS 1) plus this (RMS 1), so
+            # position is permanently half the key energy and q.k carries a fixed
+            # pos_i . pos_j term peaked at i == j. That is an identity-warp prior the
+            # network cannot unlearn, and an identity-biased softmax over a flat-laid
+            # garment is exactly "right region, wrong cell" -- fine_top1_accuracy has sat
+            # at 0.2-0.35 across every configuration tried. The gain starts at 1.0, so a
+            # loaded checkpoint routes identically, and lets appearance matching take
+            # over from the positional anchor as it becomes reliable.
             pos = F.layer_norm(pos.float(), (self.width,)).to(pos.dtype)
+            if self.learnable_position_gain:
+                # Bounded forward authority with an identity straight-through derivative,
+                # the same idiom as ``garment_value_mix``: a gain that momentarily
+                # overshoots can still recover instead of dying at the clamp boundary.
+                # Negative would flip the positional basis, which is meaningless, and
+                # above 2 it dominates content again.
+                raw_gain = self.position_gain.float()
+                gain = raw_gain + (raw_gain.clamp(0.0, 2.0) - raw_gain).detach()
+                pos = pos * gain.to(pos.dtype)
         # Apply the same positional basis after the learned content projection on both
         # sides.  Previously Q rotated PE through ``self.query`` while K added PE after
         # its projection, so equal person/garment coordinates were not comparable even
@@ -540,9 +621,14 @@ class GarmentLatentRefiner(nn.Module):
         base_grid = upsample_displacement_grid(
             coarse_sampling_grid, (coarse_height, coarse_width), (height, width)
         )
-        predicted_sampling_grid = local_attention_sampling_grid(
+        # Q/K already carry ``cosine_scale`` in their gain, so pass the ratio.
+        predicted_sampling_grid, local_effective_candidates = local_attention_sampling_grid(
             q, k, valid, base_grid, height, width, self.local_radius,
             shared_heads=self.shared_sampling_grid,
+            temperature_ratio=(
+                self.local_cosine_scale / self.cosine_scale if self.qk_norm else 1.0
+            ),
+            return_sharpness=True,
         )
         sampling_grid = predicted_sampling_grid
         teacher_fraction = q.new_zeros((), dtype=torch.float32)
@@ -590,6 +676,7 @@ class GarmentLatentRefiner(nn.Module):
             "transport_sampling_grid": sampling_grid,
             "teacher_forcing_fraction": teacher_fraction,
             "oracle_within_radius_fraction": oracle_within_radius_fraction,
+            "local_effective_candidates": local_effective_candidates,
             "warped_garment_latent": warped_latent,
             "garment_support_logits": support_logits,
             "garment_support": support_probability,
@@ -644,7 +731,13 @@ class GarmentLatentRefiner(nn.Module):
         effective_gate = learned_gate * detail_activity_gate.to(learned_gate.dtype)
         residual = raw_residual * effective_gate
         residual = self._masked_local_highpass(residual, support)
-        residual, residual_dc = self._masked_spatial_center(residual, support)
+        if self.remove_velocity_dc:
+            residual, residual_dc = self._masked_spatial_center(residual, support)
+        else:
+            # Report the DC the branch chose to keep, so fine_velocity_dc_fraction still
+            # measures the same quantity. The residual stays support-masked either way.
+            _, residual_dc = self._masked_spatial_center(residual, support)
+            residual = residual * support.to(residual.dtype)
 
         # Hard inference-time authority gate. A loss penalty alone can be ignored and
         # does not run inside the sampler. This per-sample bound guarantees the detail
@@ -1017,6 +1110,9 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         garment_refiner_velocity_min_limit=0.0,
         garment_refiner_detail_activity_floor=1.0,
         garment_refiner_highpass_kernel=0,
+        garment_refiner_remove_velocity_dc=True,
+        garment_refiner_learnable_position_gain=False,
+        garment_refiner_local_cosine_scale=None,
         garment_high_frequency_global_attention=True,
         pretrained_ckpt=None,
         pretrained_use_ema=True,
@@ -1162,6 +1258,9 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 min_velocity_limit=garment_refiner_velocity_min_limit,
                 detail_activity_floor=garment_refiner_detail_activity_floor,
                 highpass_kernel=garment_refiner_highpass_kernel,
+                remove_velocity_dc=garment_refiner_remove_velocity_dc,
+                learnable_position_gain=garment_refiner_learnable_position_gain,
+                local_cosine_scale=garment_refiner_local_cosine_scale,
             )
 
         self.garment_high_frequency_control = None

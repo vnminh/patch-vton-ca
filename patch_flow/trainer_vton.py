@@ -1158,6 +1158,20 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                         UserWarning,
                     )
             for prefix in (
+                "model.garment_refiner.position_gain",
+                "ema_model.garment_refiner.position_gain",
+            ):
+                gain_keys = {key for key in expected_state if key == prefix}
+                if gain_keys and prefix not in state_dict:
+                    missing = [key for key in missing if key not in gain_keys]
+                    warnings.warn(
+                        f"Warm-start: {prefix} is new and starts at 1.0, which reproduces "
+                        "the previously hard-normalized positional term exactly. It lets "
+                        "the router trade its identity-warp prior for appearance matching. "
+                        "Use load_weights with a fresh optimizer.",
+                        UserWarning,
+                    )
+            for prefix in (
                 "model.garment_refiner.support_head.",
                 "ema_model.garment_refiner.support_head.",
             ):
@@ -2506,6 +2520,15 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         # of whether local attention then scores it correctly. Low and flat over
         # training would mean local_radius itself is the ceiling on fine_top1_accuracy,
         # not routing capability; high would mean scoring, not reach, is the bottleneck.
+        # How many of the (2r+1)^2 local candidates the sub-cell stage is effectively
+        # averaging. Near the candidate count means it is blurring the window instead of
+        # searching it, and the returned coordinate collapses onto the coarse anchor;
+        # 2-4 means genuine sub-cell interpolation between adjacent garment cells.
+        metrics["fine_local_effective_candidates"] = (
+            fine_entries[0]["local_effective_candidates"].detach()
+            if fine_entries
+            else loss.new_zeros(())
+        )
         metrics["fine_oracle_within_radius_fraction"] = (
             fine_entries[0]["oracle_within_radius_fraction"].detach()
             if fine_entries
@@ -2551,6 +2574,13 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             metrics["fine_velocity_raw_rms"] = raw_fine_rms.detach()
             metrics["backbone_velocity_rms"] = backbone_rms.detach()
             metrics["fine_velocity_limit"] = fine_limit.detach()
+            position_gain = getattr(
+                self.model.garment_refiner, "position_gain", None
+            )
+            if position_gain is not None:
+                # Falling below 1 means the router is trading its positional anchor for
+                # appearance matching, which is the whole point of making it learnable.
+                metrics["fine_position_gain"] = position_gain.detach().clamp(0.0, 2.0)
             metrics["fine_velocity_regularization"] = (
                 fine_velocity_regularization.detach()
             )

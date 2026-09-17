@@ -949,7 +949,15 @@ def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
     assert cfg.model.params.garment_refiner_shared_sampling_grid
     assert cfg.model.params.garment_refiner_velocity_max_backbone_ratio == .3
     assert cfg.model.params.garment_refiner_velocity_min_limit == .05
-    assert cfg.model.params.garment_refiner_detail_activity_floor == .25
+    # Not 0.25 any more: this gate multiplies the residual *including* the colour
+    # correction the branch now owns, so a hard floor there quartered every colour fix
+    # in the flat interiors that need it most. It must still separate stroke
+    # neighbourhoods from flat cloth, and must not be fully open.
+    assert .5 <= cfg.model.params.garment_refiner_detail_activity_floor < 1
+    # The backbone reaches the garment only through softmax cross-attention, which
+    # returns a blend of garment tokens. This branch warps instead of averaging and is
+    # the only one that can correct that blend's colour, so it must keep its DC.
+    assert cfg.model.params.garment_refiner_remove_velocity_dc is False
     assert cfg.model.params.garment_refiner_highpass_kernel == 0
     assert cfg.model.params.garment_value_preserve_magnitude
     assert cfg.model.params.garment_value_minimum_mix == 1.0
@@ -1153,3 +1161,168 @@ def test_detail_config_keeps_both_images_512x384_and_global_batch_32():
     assert cfg.trainer.params.fine_value_weight > 0
     assert 'attention_tv_weight' not in cfg.trainer.params
     assert not (Path(__file__).resolve().parents[1]/'patch_flow'/'attention_smoothing.py').exists()
+
+
+def _refiner(remove_dc=True, position_gain=False):
+    return GarmentLatentRefiner(
+        32, channels=4, width=32, heads=4, qk_norm=True,
+        max_velocity_ratio=.3, min_velocity_limit=.05,
+        remove_velocity_dc=remove_dc, learnable_position_gain=position_gain,
+    )
+
+
+def _residual_args(refiner, constant=.4):
+    features = torch.zeros(1, 32, 8, 8)
+    velocity = torch.full((1, 4, 8, 8), 1.)
+    edit = torch.ones(1, 1, 8, 8)
+    active = torch.ones(1, dtype=torch.bool)
+    # Drive a purely constant residual so DC is the entire signal.
+    nn.init.zeros_(refiner.output.weight)
+    refiner.output.weight.data[:, 0] = constant
+    features = features.clone()
+    features[:, 0] = 1.
+    return features, velocity, velocity.clone(), edit, active
+
+
+def test_refiner_keeps_its_colour_correction_when_dc_removal_is_disabled():
+    """The mean the branch writes is a garment colour correction, not an artefact.
+
+    The backbone reaches the garment through softmax cross-attention, which returns a
+    convex combination of garment tokens; this branch warps instead, so it is the only
+    one that can correct the resulting blend. Deleting its DC deleted that correction --
+    measured as fine_velocity_dc_fraction 0.50-0.79, i.e. up to 56% of everything it
+    produced.
+    """
+    removing, keeping = _refiner(remove_dc=True), _refiner(remove_dc=False)
+    keeping.load_state_dict(removing.state_dict())
+    out_removed = removing.refine_with_gate(*_residual_args(removing))[0]
+    out_kept = keeping.refine_with_gate(*_residual_args(keeping))[0]
+    # The per-channel spatial mean IS the colour correction. Removal zeroes it exactly;
+    # retention passes it through at a magnitude comparable to the residual itself.
+    dc_removed = out_removed.mean((2, 3)).abs().max()
+    dc_kept = out_kept.mean((2, 3)).abs().max()
+    assert dc_removed < 1e-6
+    assert dc_kept > .5 * out_kept.abs().mean()
+    # Both still carry structure, so this is not simply a larger output.
+    assert out_removed.abs().mean() > 0
+    # Retention is not a licence to exceed the hard authority cap (0.3 x backbone RMS,
+    # and the backbone velocity here is exactly 1.0).
+    assert out_kept.square().mean().sqrt() <= .3 + 1e-4
+
+
+def test_disabled_dc_removal_still_confines_the_residual_to_the_edit_support():
+    refiner = _refiner(remove_dc=False)
+    features, velocity, clean, edit, active = _residual_args(refiner)
+    edit = edit.clone()
+    edit[:, :, :, 4:] = 0.
+    out = refiner.refine_with_gate(features, velocity, clean, edit, active)[0]
+    assert out[:, :, :, 4:].abs().max() == 0
+    assert out[:, :, :, :4].abs().mean() > 0
+
+
+def test_position_gain_is_opt_in_and_identity_at_one():
+    """Off by default: adding a parameter costs the optimizer state on the next restart."""
+    plain, gained = _refiner(position_gain=False), _refiner(position_gain=True)
+    assert not hasattr(plain, 'position_gain')
+    assert gained.position_gain.item() == 1.
+    assert 'position_gain' not in dict(plain.named_parameters())
+    gained.load_state_dict(plain.state_dict(), strict=False)
+    torch.manual_seed(0)
+    args = (torch.randn(1, 16, 32), torch.randn(1, 4, 8, 8), torch.randn(1, 4, 8, 8),
+            torch.randn(1, 64, 32), torch.randn(1, 64, 32), torch.randn(1, 64, 32), None)
+    plain.eval(); gained.eval()
+    with torch.no_grad():
+        reference = plain.route(*args)[1]['sampling_grid']
+        output = gained.route(*args)[1]['sampling_grid']
+    torch.testing.assert_close(output, reference, rtol=0, atol=0)
+
+
+def test_position_gain_shrinks_the_positional_share_of_the_key():
+    """Hard-normalised, position is permanently half the key energy: an identity prior."""
+    refiner = _refiner(position_gain=True)
+    torch.manual_seed(0)
+    args = (torch.randn(1, 16, 32), torch.randn(1, 4, 8, 8), torch.randn(1, 4, 8, 8),
+            torch.randn(1, 64, 32), torch.randn(1, 64, 32), torch.randn(1, 64, 32), None)
+    refiner.eval()
+    with torch.no_grad():
+        full = refiner.route(*args)[1]['key'].clone()
+        refiner.position_gain.fill_(0.)
+        none = refiner.route(*args)[1]['key'].clone()
+    # With the gain at zero the key is content only, so it must differ materially.
+    assert (full - none).norm() / full.norm() > .1
+    with torch.no_grad():
+        refiner.position_gain.fill_(3.)          # clamped to 2 in the forward pass
+        clamped = refiner.route(*args)[1]['key'].clone()
+        refiner.position_gain.fill_(2.)
+        at_limit = refiner.route(*args)[1]['key'].clone()
+    torch.testing.assert_close(clamped, at_limit, rtol=0, atol=0)
+
+
+def _local_inputs(radius=2, height=8, width=8, heads=1, dim=16, seed=0):
+    torch.manual_seed(seed)
+    q = torch.randn(1, heads, height * width, dim)
+    k = torch.randn(1, heads, height * width, dim)
+    valid = torch.ones(1, height * width, dtype=torch.bool)
+    base = upsample_displacement_grid(
+        torch.zeros(1, heads, (height // 2) * (width // 2), 2),
+        (height // 2, width // 2), (height, width),
+    )
+    return q, k, valid, base, height, width, radius
+
+
+def test_local_stage_temperature_controls_whether_it_refines_or_blurs():
+    """Its forward pass IS the softmax, unlike the argmax coarse stage above it.
+
+    A flat distribution over the (2r+1)^2 candidates makes sum_c p_c * candidate_c
+    return the centroid of the window -- the coarse anchor it was supposed to refine.
+    Measured on the trained model at the shared scale of 10: 20.95 of 25 candidates.
+    """
+    q, k, valid, base, h, w, r = _local_inputs()
+    grids, effs = {}, {}
+    for ratio in (0.05, 1.0, 20.0):
+        grid, eff = local_attention_sampling_grid(
+            q, k, valid, base, h, w, r, temperature_ratio=ratio, return_sharpness=True)
+        grids[ratio], effs[ratio] = grid, eff.item()
+    count = (2 * r + 1) ** 2
+    # Flat -> the whole window is averaged and the coordinate barely leaves the anchor.
+    assert effs[0.05] > 0.95 * count
+    assert (grids[0.05] - base).abs().max() < (grids[20.0] - base).abs().max()
+    # Sharp -> a handful of adjacent candidates, i.e. sub-cell interpolation.
+    assert effs[20.0] < 0.25 * count
+    assert effs[0.05] > effs[1.0] > effs[20.0]
+
+
+def test_local_temperature_defaults_to_the_shared_scale_and_stays_bounded():
+    shared = GarmentLatentRefiner(32, channels=4, width=32, heads=4,
+                                  qk_norm=True, cosine_scale=10.)
+    assert shared.local_cosine_scale == shared.cosine_scale == 10.
+    split = GarmentLatentRefiner(32, channels=4, width=32, heads=4,
+                                 qk_norm=True, cosine_scale=10., local_cosine_scale=50.)
+    assert (split.cosine_scale, split.local_cosine_scale) == (10., 50.)
+    # The coarse scale keeps its own tighter bound; the local one may exceed it because
+    # it is a coordinate regressor, not a straight-through gradient path.
+    with pytest.raises(ValueError, match='cosine scale'):
+        GarmentLatentRefiner(32, channels=4, width=32, heads=4, cosine_scale=50.)
+    with pytest.raises(ValueError, match='local cosine scale'):
+        GarmentLatentRefiner(32, channels=4, width=32, heads=4, local_cosine_scale=500.)
+    with pytest.raises(ValueError, match='local cosine scale'):
+        GarmentLatentRefiner(32, channels=4, width=32, heads=4, local_cosine_scale=0.)
+
+
+def test_a_sharper_local_stage_does_not_change_the_coarse_anchor():
+    """The two stages are decoupled: only the sub-cell regressor sees the new scale."""
+    base_kwargs = dict(backbone_dim=32, channels=4, width=32, heads=4, qk_norm=True,
+                       cosine_scale=10., shared_sampling_grid=True)
+    flat = GarmentLatentRefiner(**base_kwargs)
+    sharp = GarmentLatentRefiner(**base_kwargs, local_cosine_scale=50.)
+    sharp.load_state_dict(flat.state_dict())
+    torch.manual_seed(0)
+    args = (torch.randn(1, 16, 32), torch.randn(1, 4, 8, 8), torch.randn(1, 4, 8, 8),
+            torch.randn(1, 64, 32), torch.randn(1, 64, 32), torch.randn(1, 64, 32), None)
+    flat.eval(); sharp.eval()
+    with torch.no_grad():
+        a, b = flat.route(*args)[1], sharp.route(*args)[1]
+    torch.testing.assert_close(a['coarse_sampling_grid'], b['coarse_sampling_grid'],
+                               rtol=0, atol=0)
+    assert not torch.equal(a['sampling_grid'], b['sampling_grid'])
+    assert b['local_effective_candidates'] < a['local_effective_candidates']

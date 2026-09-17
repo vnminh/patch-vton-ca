@@ -20,6 +20,19 @@ model:
     # Scale 10 leaves the hard forward argmax unchanged, but gives losing locations a
     # usable backward probability and keeps the 5x5 local refinement sub-pixel smooth.
     garment_refiner_cosine_scale: 10.0
+    # ...but that scalar was also the local 5x5 stage's temperature, and those two
+    # stages need opposite ones. The coarse stage picks by straight-through argmax, so
+    # temperature only touches its backward pass. The local stage's FORWARD pass is the
+    # softmax -- it returns sum_c p_c * candidate_c -- so a flat p returns the centroid
+    # of the window, i.e. exactly the anchor it was meant to refine. Measured on
+    # step003000: p covered 20.95 of 25 candidates (uniform is 25) and the coordinate
+    # moved 0.52 cells, under half a cell for 55% of queries. Sub-cell refinement, the
+    # only mechanism that can place a letter stroke, was very nearly a no-op -- which is
+    # why fine_top1_accuracy tracked the coarse route at 0.26-0.35 through every
+    # configuration tried. At 50 the same weights give 8.6 effective candidates and 1.22
+    # cells of movement. Watch train/fine_local_effective_candidates: 2-4 is genuine
+    # sub-pixel interpolation, near 25 is a box blur.
+    garment_refiner_local_cosine_scale: 50.0
     # Character strokes must follow the single coherent deformation grid. A second
     # global A@V path averages unrelated cloth locations and turns text into glyph-like
     # texture. The parameter remains checkpoint-compatible but is frozen and unused.
@@ -39,9 +52,26 @@ model:
     garment_refiner_velocity_max_backbone_ratio: 0.30
     garment_refiner_velocity_min_limit: 0.05
     # HF energy is warped by the same garment grid and becomes a detached spatial gate.
-    # Keep 25% authority away from explicit strokes so color-block interiors can still
-    # be refined; logo/text neighbourhoods receive up to full authority.
-    garment_refiner_detail_activity_floor: 0.25
+    # Now that this branch also owns garment colour (see remove_velocity_dc below), a
+    # 0.25 floor would quarter every colour correction in exactly the flat interiors
+    # that need it. Logo/text neighbourhoods still get ~1.7x the authority of a plain
+    # colour block, which is the separation this gate exists to provide.
+    garment_refiner_detail_activity_floor: 0.6
+
+    # The measured reason the previews blend colours. `_masked_spatial_center` deletes
+    # this branch's per-channel spatial DC on the theory that the backbone owns base
+    # colour -- but the backbone reaches the garment only through softmax cross-
+    # attention, which returns a convex combination of garment tokens. At the measured
+    # correspondence_target_mass of 0.56, 44% of every retrieved value comes from
+    # somewhere other than the matched region, so what the backbone writes is a blend:
+    # lavender body + navy sleeve = the darker blue-purple in the preview, red + white
+    # stripes = the uniform pink. This refiner is the only module that transports by
+    # warping (one grid_sample per latent cell) instead of averaging, so it is the only
+    # one that can undo that blend -- and it has been trying: fine_velocity_dc_fraction
+    # runs 0.50-0.79, i.e. 40-56% of everything it produces is a colour correction that
+    # was being thrown away every step. It stays bounded by the hard RMS cap and
+    # confined to the edit mask times the predicted garment support.
+    garment_refiner_remove_velocity_dc: false
     # The VANS-style wordmark block measures about 12x5 latent cells. A 9x9 local-mean
     # subtraction removes exactly that band, so the refiner could never fix a logo's
     # fill colour -- only its outline. Masked per-channel DC removal (always on) is
