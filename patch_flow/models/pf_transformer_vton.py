@@ -128,6 +128,29 @@ def upsample_displacement_grid(coarse_grid, coarse_size, fine_size):
     return output.clamp(-limit, limit).reshape(batch, heads, fine_height * fine_width, 2)
 
 
+def oracle_reachable_fraction(teacher, base_grid, mask, radius, width, height):
+    """Fraction of masked queries whose teacher target lies within local_radius cells.
+
+    Diagnostic only, never a training signal (call under ``torch.no_grad()``). A low
+    value means the coarse-to-fine upsampled anchor places the true location outside
+    the local search window regardless of how well the local attention scores its
+    candidates, i.e. ``local_radius`` itself -- not routing/scoring capability -- is
+    the ceiling on how often the fine grid can be correct. A high value means the
+    window already contains the answer and the bottleneck is scoring among reachable
+    candidates instead.
+
+    ``teacher`` and ``base_grid`` are ``(batch, 1-or-heads, queries, 2)`` normalised
+    (u, v) coordinates in [-1, 1]; ``mask`` is ``(batch, queries)``.
+    """
+    cell = base_grid.new_tensor((2.0 / width, 2.0 / height))
+    cells_away = (teacher - base_grid).abs() / cell
+    reachable = (cells_away <= radius + 0.5).all(-1)
+    selected = mask[:, None, :].bool().expand_as(reachable)
+    if not bool(selected.any()):
+        return base_grid.new_zeros(())
+    return reachable[selected].float().mean()
+
+
 def local_attention_sampling_grid(
     query, key, valid, base_grid, height, width, radius, shared_heads=False
 ):
@@ -523,6 +546,7 @@ class GarmentLatentRefiner(nn.Module):
         )
         sampling_grid = predicted_sampling_grid
         teacher_fraction = q.new_zeros((), dtype=torch.float32)
+        oracle_within_radius_fraction = q.new_zeros((), dtype=torch.float32)
         if sampling_grid_target is not None:
             if sampling_grid_mask is None:
                 raise ValueError("A teacher sampling grid requires a sampling-grid mask")
@@ -532,6 +556,10 @@ class GarmentLatentRefiner(nn.Module):
                 raise ValueError("Teacher sampling-grid mask must have shape (B,H*W)")
             teacher = sampling_grid_target[:, None].to(sampling_grid.dtype)
             teacher_mask = sampling_grid_mask[:, None, :, None].bool()
+            with torch.no_grad():
+                oracle_within_radius_fraction = oracle_reachable_fraction(
+                    teacher, base_grid, sampling_grid_mask, self.local_radius, width, height
+                )
             sampling_grid = torch.where(teacher_mask, teacher, sampling_grid)
             teacher_fraction = sampling_grid_mask.float().mean()
 
@@ -561,6 +589,7 @@ class GarmentLatentRefiner(nn.Module):
             "output": transported, "sampling_grid": predicted_sampling_grid,
             "transport_sampling_grid": sampling_grid,
             "teacher_forcing_fraction": teacher_fraction,
+            "oracle_within_radius_fraction": oracle_within_radius_fraction,
             "warped_garment_latent": warped_latent,
             "garment_support_logits": support_logits,
             "garment_support": support_probability,

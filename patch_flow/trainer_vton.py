@@ -2501,6 +2501,16 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             if garment_sampling_mask is not None
             else loss.new_zeros(())
         )
+        # Diagnostic: among teacher-forced queries, how often does the coarse-to-fine
+        # upsampled anchor even place the true location inside local_radius, regardless
+        # of whether local attention then scores it correctly. Low and flat over
+        # training would mean local_radius itself is the ceiling on fine_top1_accuracy,
+        # not routing capability; high would mean scoring, not reach, is the bottleneck.
+        metrics["fine_oracle_within_radius_fraction"] = (
+            fine_entries[0]["oracle_within_radius_fraction"].detach()
+            if fine_entries
+            else loss.new_zeros(())
+        )
         if supervise_fine_velocity:
             if len(fine_entries) != 1:
                 raise RuntimeError("Fine-velocity regularization requires one refiner entry")

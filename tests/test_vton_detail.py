@@ -13,6 +13,7 @@ from patch_flow.models.pf_transformer_vton import (
     attention_sampling_grid,
     hard_attention_sampling_grid,
     local_attention_sampling_grid,
+    oracle_reachable_fraction,
     sample_attention_heads,
     upsample_displacement_grid,
 )
@@ -640,6 +641,52 @@ def test_identity_coarse_displacement_upsamples_to_identity_fine_flow():
     torch.testing.assert_close(centre_x, expected[None, :].expand(fine, fine))
     # Never leaves the key grid, so the caller's clamp is never load-bearing here.
     assert int(centre_y.min()) == 0 and int(centre_y.max()) == fine - 1
+
+
+def test_oracle_reachable_fraction_measures_whether_teacher_is_within_local_radius():
+    """Guards the diagnostic that tells local_radius-too-small apart from bad scoring."""
+    height, width, radius = 8, 6, 1
+    cell_x, cell_y = 2.0 / width, 2.0 / height
+    base_grid = torch.zeros(1, 1, 4, 2)
+    teacher = torch.zeros(1, 1, 4, 2)
+    teacher[0, 0, 0, 0] = 0.0  # exactly at the anchor: reachable
+    teacher[0, 0, 1, 0] = radius * cell_x  # exactly radius cells away: still reachable
+    teacher[0, 0, 2, 0] = (radius + 1) * cell_x  # one cell past the window: not reachable
+    teacher[0, 0, 3, 0] = 100 * cell_x  # far away, but masked out below
+    mask = torch.tensor([[True, True, True, False]])
+    fraction = oracle_reachable_fraction(teacher, base_grid, mask, radius, width, height)
+    torch.testing.assert_close(fraction, torch.tensor(2 / 3))
+
+    # A y-axis offset is checked independently of x, using the same cell scale.
+    teacher_y = torch.zeros(1, 1, 1, 2)
+    teacher_y[0, 0, 0, 1] = (radius + 1) * cell_y
+    unreachable = oracle_reachable_fraction(
+        teacher_y, torch.zeros(1, 1, 1, 2), torch.tensor([[True]]), radius, width, height
+    )
+    torch.testing.assert_close(unreachable, torch.tensor(0.0))
+
+    # No masked query at all: a safe zero, never NaN from an empty mean.
+    empty_mask = torch.zeros(1, 4, dtype=torch.bool)
+    zero = oracle_reachable_fraction(teacher, base_grid, empty_mask, radius, width, height)
+    torch.testing.assert_close(zero, torch.tensor(0.0))
+
+
+def test_route_reports_oracle_within_radius_fraction_only_when_teacher_forced():
+    refiner = GarmentLatentRefiner(32, width=32, heads=4)
+    args = (
+        torch.randn(1, 12, 32), torch.randn(1, 4, 8, 6), torch.randn(1, 4, 8, 6),
+        torch.randn(1, 48, 32), torch.randn(1, 48, 32), torch.randn(1, 48, 32),
+        torch.ones(1, 1, 64, 48),
+    )
+    _, entry, _ = refiner.route(*args)
+    assert entry["oracle_within_radius_fraction"].item() == 0.0
+
+    target = torch.zeros(1, 48, 2)
+    mask = torch.ones(1, 48, dtype=torch.bool)
+    _, entry, _ = refiner.route(*args, sampling_grid_target=target, sampling_grid_mask=mask)
+    fraction = entry["oracle_within_radius_fraction"]
+    assert fraction.shape == ()
+    assert 0.0 <= fraction.item() <= 1.0
 
 
 def test_qk_normalization_bounds_scores_and_matches_inference_transport():
