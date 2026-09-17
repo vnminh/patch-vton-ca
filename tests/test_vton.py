@@ -323,6 +323,33 @@ class VTONTests(unittest.TestCase):
         self.assertAlmostEqual(importance.min().item(), 1.0, places=6)
         self.assertAlmostEqual(importance.max().item(), 6.0, places=6)
 
+    def test_garment_edge_importance_upweights_queries_landing_on_garment_edges(self):
+        garment = torch.zeros(1, 3, 8, 8)
+        garment[:, :, :, 4:] = 1.0  # a sharp vertical edge at the garment's mid-column
+        # query 0 lands exactly on the edge; query 1 lands in a flat region far from it.
+        target = torch.tensor([[[0.5, 0.5], [0.05, 0.5]]])
+        importance = LatentVTONPatchForcingTrainer._garment_edge_importance(
+            garment, target, edge_weight=5.0
+        )
+        self.assertEqual(tuple(importance.shape), (1, 2))
+        self.assertTrue(bool((importance >= 1.0).all()))
+        self.assertGreater(importance[0, 0].item(), importance[0, 1].item())
+
+        disabled = LatentVTONPatchForcingTrainer._garment_edge_importance(
+            garment, target, edge_weight=0.0
+        )
+        self.assertIsNone(disabled)
+
+    def test_garment_edge_importance_ignores_variance_outside_the_garment_mask(self):
+        garment = torch.zeros(1, 3, 8, 8)
+        garment[:, :, :, 4:] = 1.0
+        mask = torch.zeros(1, 1, 8, 8)  # nothing is garment: no edge signal survives
+        target = torch.tensor([[[0.5, 0.5]]])
+        importance = LatentVTONPatchForcingTrainer._garment_edge_importance(
+            garment, target, mask, edge_weight=5.0
+        )
+        self.assertAlmostEqual(importance[0, 0].item(), 1.0, places=5)
+
     def test_value_target_ema_stays_frozen_and_tracks_the_student(self):
         source = torch.nn.Linear(3, 2)
         target = torch.nn.Linear(3, 2)

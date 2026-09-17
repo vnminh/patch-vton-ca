@@ -157,6 +157,15 @@ trainer:
     # attention going diffuse (i.e. averaging many candidate locations = mean colour)
     # instead of committing to one location the way inference-time hard routing needs.
     correspondence_entropy_weight: 0.05
+    # fine_oracle_within_radius_fraction measured the true match already inside the
+    # local search window 60-73% of the time, while fine_top1_accuracy stayed at
+    # 27-38%: the bottleneck is scoring among reachable candidates, not window size.
+    # A garment is mostly flat colour except at logo/text edges, so every candidate in
+    # a local window looks nearly identical almost everywhere -- exactly where this
+    # loss (spread uniformly today) has the least signal to push on, and exactly where
+    # getting it wrong is visible. Upweight supervision at each query's ground-truth
+    # garment location by how much local gradient is actually there.
+    correspondence_edge_importance_weight: 5.0
 
     # Decode the joint RGB+HF refiner estimate. RGB keeps ink colour, opponent chroma
     # keeps colour blocks, and edge keeps letter boundaries. One sample caps frozen-VAE

@@ -165,6 +165,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         correspondence_propagation_decay=0.9,
         correspondence_propagated_weight=0.25,
         correspondence_weight_by_similarity=False,
+        correspondence_edge_importance_weight=0.0,
         correspondence_scales=None,
         correspondence_warmup_steps=0,
         train_adapters_only=False,
@@ -410,6 +411,9 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         if not 0 <= self.correspondence_propagated_weight <= 1:
             raise ValueError("correspondence_propagated_weight must be in [0, 1]")
         self.correspondence_weight_by_similarity = bool(correspondence_weight_by_similarity)
+        self.correspondence_edge_importance_weight = float(correspondence_edge_importance_weight)
+        if self.correspondence_edge_importance_weight < 0:
+            raise ValueError("correspondence_edge_importance_weight must be non-negative")
         self.correspondence_scales = None if correspondence_scales is None else list(correspondence_scales)
         self.correspondence_value_target_ema = float(correspondence_value_target_ema)
         if not 0 <= self.correspondence_value_target_ema < 1:
@@ -1339,6 +1343,12 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             weight_by_similarity=self.correspondence_weight_by_similarity,
         )
         weight = weight * supervision
+        importance = self._garment_edge_importance(
+            batch["garment"], target, batch.get("garment_mask"),
+            edge_weight=self.correspondence_edge_importance_weight,
+        )
+        if importance is not None:
+            weight = weight * importance
         return target, weight, similarity
 
     def _person_token_grid(self, target_latent):
@@ -1405,6 +1415,41 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         mean_edge = edge.sum((2, 3), keepdim=True) / mask.sum((2, 3), keepdim=True).clamp_min(1.0)
         strength = (edge / mean_edge.clamp_min(1e-6)).clamp(0, 1)
         return 1.0 + float(edge_weight) * strength
+
+    @staticmethod
+    def _garment_edge_importance(garment, target, garment_mask=None, edge_weight=0.0):
+        """Upweight correspondence supervision at the garment's own textured regions.
+
+        Reachability is measured (see ``fine_oracle_within_radius_fraction``) to
+        already put the true match inside the local search window most of the time,
+        yet fine_top1_accuracy stays far below that ceiling: the bottleneck is scoring
+        among candidates, not window size. A garment is mostly flat colour except at
+        logo/text edges, where every local candidate looks nearly identical -- exactly
+        where the correspondence loss (spread uniformly today) has the least signal to
+        push on, and exactly where getting it wrong is visible. Sample this same
+        gradient-based edge strength at each query's *ground-truth* garment location
+        (not the person's), and scale that query's correspondence weight by it, so
+        supervision concentrates where the routing decision actually matters.
+        """
+        if edge_weight <= 0:
+            return None
+        horizontal = (garment[:, :, :, 1:] - garment[:, :, :, :-1]).abs().mean(1, keepdim=True)
+        vertical = (garment[:, :, 1:, :] - garment[:, :, :-1, :]).abs().mean(1, keepdim=True)
+        edge = F.pad(horizontal, (0, 1, 0, 0)) + F.pad(vertical, (0, 0, 0, 1))
+        edge = edge.detach().float()
+        mask = (
+            torch.ones_like(edge)
+            if garment_mask is None
+            else F.interpolate(garment_mask.float(), edge.shape[-2:], mode="nearest")
+        )
+        edge = edge * mask
+        mean_edge = edge.sum((2, 3), keepdim=True) / mask.sum((2, 3), keepdim=True).clamp_min(1.0)
+        strength = (edge / mean_edge.clamp_min(1e-6)).clamp(0, 1)
+        grid = target.float().mul(2).sub(1)[:, None]
+        sampled = F.grid_sample(
+            strength, grid, mode="bilinear", padding_mode="zeros", align_corners=False
+        )
+        return (1.0 + float(edge_weight) * sampled.reshape(target.shape[0], -1)).to(target.dtype)
 
     @staticmethod
     def _pure_noise_samples(timesteps, edit_tokens):
