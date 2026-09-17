@@ -937,7 +937,8 @@ def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
     assert cfg.trainer.params.decoded_edge_weight == .5
     assert cfg.trainer.params.hf_decoded_edge_weight == .5
     assert cfg.trainer.params.fine_support_weight == .25
-    assert cfg.trainer.params.fine_teacher_forcing_start == .75
+    assert cfg.trainer.params.fine_teacher_forcing_start == 0.0
+    assert cfg.trainer.params.correspondence_entropy_weight == .05
     assert cfg.trainer.params.fine_teacher_forcing_steps == 8000
     assert cfg.trainer.params.fine_velocity_regularization_weight == .25
     assert cfg.trainer.params.fine_velocity_max_backbone_ratio == .3
