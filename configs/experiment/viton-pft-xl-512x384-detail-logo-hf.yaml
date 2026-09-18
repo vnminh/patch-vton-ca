@@ -78,6 +78,13 @@ model:
     # already enough to stop a garment-wide brightness field, so the local high-pass is
     # off. Re-enable it only with a kernel well below the smallest structure to keep.
     garment_refiner_highpass_kernel: 0
+    # rgb_dog_gradient's two 3-channel groups (signed RGB DoG + luma/chroma/RGB
+    # gradient) each go through the trainable 128-channel VAE-half-encoder stem,
+    # concatenated to 256. Canny instead reuses encode_vae_pyramid's frozen "detail"
+    # (first VAE downsample) level directly -- verified empirically at 128 channels,
+    # not 256. This must match data.garment_high_frequency_mode below or the model
+    # raises a hard shape mismatch at the first batch.
+    garment_high_frequency_channels: 128
 
 trainer:
   params:
@@ -157,6 +164,15 @@ trainer:
     # attention going diffuse (i.e. averaging many candidate locations = mean colour)
     # instead of committing to one location the way inference-time hard routing needs.
     correspondence_entropy_weight: 0.05
+    # Var[X] = E[X^2] - E[X]^2 of the retrieved garment appearance under the same
+    # attention distribution correspondence_photometric_weight already uses. Matching
+    # the mean alone lets a sharp bimodal map straddle the target and still retrieve a
+    # blend -- documented in correspondence.py's own module docstring as exactly how a
+    # navy-and-lavender garment renders as uniform violet, and explicitly NOT caught by
+    # entropy (which penalises geometric spread, not whether that spread lands on
+    # similar or very different colours). This is automatically near-zero over flat
+    # colour regions, where any nearby candidate gives the same right answer.
+    correspondence_photometric_variance_weight: 1.0
     # fine_oracle_within_radius_fraction measured the true match already inside the
     # local search window 60-73% of the time, while fine_top1_accuracy stayed at
     # 27-38%: the bottleneck is scoring among reachable candidates, not window size.
@@ -241,6 +257,22 @@ data:
     # Higher-resolution teacher features plus two checkpointed VAE decodes need the
     # smaller micro-batch. Accumulation below keeps effective batch size at 32.
     batch_size: 4
+    train:
+      params:
+        # Back to Canny. rgb_dog_gradient was chosen over it for two independent
+        # reasons: (1) Canny's sparse binary edges gave a large uninformative global
+        # mean once encoded (measured 0.5591), which GarmentHighFrequencyControl now
+        # masked-DC-removes on every forward pass regardless of input source -- that
+        # problem is architecturally handled now, not still open. (2) grayscale Canny
+        # aliases together same-luminance, different-colour boundaries (isoluminant
+        # red/green text on green cloth, for instance) -- DC removal does NOT fix this;
+        # it is a real representational gap rgb_dog_gradient's signed-per-channel and
+        # opponent-colour gradient design was built to close. Keep this in mind if
+        # colour-only logo boundaries specifically regress.
+        garment_high_frequency_mode: canny
+    validation:
+      params:
+        garment_high_frequency_mode: canny
 
 lr_scheduler:
   params:

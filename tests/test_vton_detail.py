@@ -959,6 +959,12 @@ def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
     # the only one that can correct that blend's colour, so it must keep its DC.
     assert cfg.model.params.garment_refiner_remove_velocity_dc is False
     assert cfg.model.params.garment_refiner_highpass_kernel == 0
+    # Canny's encode_vae_pyramid "detail" level is 128 channels, not the 256
+    # rgb_dog_gradient's two 128-channel half-encoder streams produce -- these two
+    # must always move together or the model raises a hard shape mismatch.
+    assert cfg.model.params.garment_high_frequency_channels == 128
+    assert cfg.data.params.train.params.garment_high_frequency_mode == 'canny'
+    assert cfg.data.params.validation.params.garment_high_frequency_mode == 'canny'
     assert cfg.model.params.garment_value_preserve_magnitude
     assert cfg.model.params.garment_value_minimum_mix == 1.0
     assert cfg.trainer.params.ema_rate == 0
@@ -994,6 +1000,7 @@ def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
     assert cfg.trainer.params.fine_support_weight == .25
     assert cfg.trainer.params.fine_teacher_forcing_start == .75
     assert cfg.trainer.params.correspondence_entropy_weight == .05
+    assert cfg.trainer.params.correspondence_photometric_variance_weight == 1.0
     assert cfg.trainer.params.correspondence_edge_importance_weight == 5.0
     assert cfg.trainer.params.fine_teacher_forcing_steps == 8000
     assert cfg.trainer.params.fine_velocity_regularization_weight == .25

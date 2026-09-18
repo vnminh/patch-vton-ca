@@ -610,6 +610,49 @@ class VTONTests(unittest.TestCase):
         # baseline and the 0.119 oracle straight off tensorboard.
         self.assertAlmostEqual(got["mean"][1], got["mean"][0] ** 0.5, places=5)
 
+    def test_photometric_variance_penalises_blended_attention_content_aware(self):
+        """Var[X] = E[X^2] - E[X]^2 under the routing distribution: zero for a one-hot
+        pick regardless of colour, near-zero for spreading across SIMILAR colours (a
+        flat region, harmless), and large for spreading across a navy/lavender split --
+        exactly the bimodal-blend failure entropy does not catch (it only sees that
+        attention is spread, not that the spread lands on very different colours)."""
+        garment = torch.zeros(1, 3, 1, 2)
+        garment[0, :, 0, 0] = torch.tensor([-0.60, -0.71, -0.55])  # navy
+        garment[0, :, 0, 1] = torch.tensor([0.51, 0.40, 0.65])     # lavender
+        query = torch.stack([garment[0, :, 0, 0], garment[0, :, 0, 1]])[None]
+        appearance = {"garment": garment, "query": query}
+        grid = (1, 2)
+        loss_fn = CorrespondenceAttentionLoss(
+            center_weight=0.0, entropy_weight=0.0, nll_weight=0.0, photometric_weight=0.0,
+            photometric_variance_weight=1.0,
+        )
+        w = torch.ones(1, 2)
+        one_hot = torch.tensor([[[1.0, 0.0], [0.0, 1.0]]])
+        blended = torch.tensor([[[0.5, 0.5], [0.5, 0.5]]])
+        one_hot_loss, one_hot_metrics = loss_fn(self._map(one_hot, grid), appearance=appearance, appearance_weight=w)
+        blended_loss, _ = loss_fn(self._map(blended, grid), appearance=appearance, appearance_weight=w)
+        self.assertAlmostEqual(one_hot_loss.item(), 0.0, places=6)
+        self.assertGreater(blended_loss.item(), 0.1)
+        self.assertIn("correspondence_photometric_variance", one_hot_metrics)
+
+        similar_garment = torch.zeros(1, 3, 1, 2)
+        similar_garment[0, :, 0, 0] = torch.tensor([0.50, 0.40, 0.64])
+        similar_garment[0, :, 0, 1] = torch.tensor([0.52, 0.40, 0.66])
+        similar_query = torch.stack(
+            [similar_garment[0, :, 0, 0], similar_garment[0, :, 0, 1]]
+        )[None]
+        similar_appearance = {"garment": similar_garment, "query": similar_query}
+        similar_loss, _ = loss_fn(
+            self._map(blended, grid), appearance=similar_appearance, appearance_weight=w
+        )
+        self.assertLess(similar_loss.item(), blended_loss.item())
+
+    def test_photometric_variance_disabled_by_default_and_configurable(self):
+        loss_fn = CorrespondenceAttentionLoss(photometric_weight=1.0)
+        self.assertEqual(loss_fn.photometric_variance_weight, 0.0)
+        with self.assertRaises(ValueError):
+            CorrespondenceAttentionLoss(photometric_variance_weight=-1.0)
+
     def test_photometric_term_needs_no_teacher(self):
         loss_fn = CorrespondenceAttentionLoss(
             center_weight=0.0, nll_weight=0.0, entropy_weight=0.0, photometric_weight=1.0)
