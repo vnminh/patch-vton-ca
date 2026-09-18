@@ -969,7 +969,10 @@ def test_logo_hf_experiment_uses_sparse_decoded_supervision_and_dense_teacher():
     assert cfg.model.params.garment_value_minimum_mix == 1.0
     assert cfg.trainer.params.ema_rate == 0
     assert cfg.trainer.params.hf_detail_loss_weight == 0
-    assert cfg.trainer.params.hf_source_sparse_weight > 0
+    # Disabled for Canny: _hf_source_consistency_loss's signed/gradient channel split
+    # has no honest single-channel analog and would hard-crash if reactivated here.
+    assert cfg.trainer.params.hf_source_consistency_weight == 0
+    assert cfg.trainer.params.hf_source_sparse_weight == 0
     assert cfg.trainer.params.hf_decoded_rgb_weight > 0
     assert cfg.trainer.params.hf_decoded_contrast_weight > 0
     assert cfg.trainer.params.hf_decoded_chroma_weight > 0

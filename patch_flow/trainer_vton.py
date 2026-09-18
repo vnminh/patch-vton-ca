@@ -1742,8 +1742,18 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
     @staticmethod
     def _hf_activity_map(high_frequency):
         """Return a channel-agnostic map of meaningful RGB detail activity."""
-        if high_frequency.ndim != 4 or high_frequency.shape[1] != 6:
-            raise ValueError("HF activity requires six-channel RGB DoG/gradient maps")
+        if high_frequency.ndim != 4:
+            raise ValueError("HF activity requires a four-dimensional map")
+        if high_frequency.shape[1] == 1:
+            # Canny edges are already exactly an activity map: 0/1 (post-normalisation,
+            # continuous after interpolation) edge presence, no signed/gradient split
+            # to combine.
+            return high_frequency.float().clamp(0, 1).detach()
+        if high_frequency.shape[1] != 6:
+            raise ValueError(
+                "HF activity requires a one-channel Canny map or a six-channel "
+                "RGB DoG/gradient map"
+            )
         # Signed RGB DoG is stored in [0, 1] with 0.5 meaning no response; the
         # luma/chroma/RGB gradient channels already use zero as their baseline.
         signed = ((high_frequency[:, :3].float() - 0.5) * 2).abs().amax(1, keepdim=True)

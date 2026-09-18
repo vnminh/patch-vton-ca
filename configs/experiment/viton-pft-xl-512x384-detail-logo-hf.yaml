@@ -93,10 +93,13 @@ trainer:
     correspondence_teacher_input_size: [768, 576]
     correspondence_garment_grid: [48, 36]
 
-    # Preserve the existing broad routing objective, but normalize an additional loss
-    # over active RGB-DoG/gradient pixels so a small logo cannot vanish inside a shirt.
-    hf_source_consistency_weight: 0.25
-    hf_source_sparse_weight: 0.25
+    # Disabled for Canny. _hf_source_consistency_loss splits its own error term into
+    # independent "signed detail" [:3] and "gradient magnitude" [3:] channel groups --
+    # unlike _hf_activity_map (now channel-agnostic), that split has no honest single-
+    # channel analog for a binary Canny edge, and code.py's own shape check would
+    # correctly raise ValueError("...six-channel...") if this were left nonzero.
+    hf_source_consistency_weight: 0.0
+    hf_source_sparse_weight: 0.0
     hf_sparse_activity_threshold: 0.04
     hf_sparse_support_radius: 3
 

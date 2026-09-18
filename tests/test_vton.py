@@ -323,6 +323,28 @@ class VTONTests(unittest.TestCase):
         self.assertAlmostEqual(importance.min().item(), 1.0, places=6)
         self.assertAlmostEqual(importance.max().item(), 6.0, places=6)
 
+    def test_hf_activity_map_accepts_one_channel_canny(self):
+        """Guards the crash restoring Canny hit: _hf_activity_map's six-channel-only
+        assumption broke the moment garment_high_frequency_mode went back to canny,
+        since _hf_decoded_loss calls it unconditionally whenever any hf_decoded_*
+        weight is active."""
+        canny = torch.tensor([[[[0.0, 1.0], [0.3, 0.8]]]])
+        activity = LatentVTONPatchForcingTrainer._hf_activity_map(canny)
+        torch.testing.assert_close(activity, canny)
+
+    def test_hf_activity_map_still_accepts_six_channel_rgb_dog_gradient(self):
+        high_frequency = torch.full((1, 6, 2, 2), 0.5)
+        high_frequency[:, 0, 0, 0] = 1.0  # signed detail, maximal response
+        high_frequency[:, 3, 1, 1] = 0.9  # gradient channel
+        activity = LatentVTONPatchForcingTrainer._hf_activity_map(high_frequency)
+        self.assertEqual(tuple(activity.shape), (1, 1, 2, 2))
+        self.assertAlmostEqual(activity[0, 0, 0, 0].item(), 1.0, places=6)
+        self.assertAlmostEqual(activity[0, 0, 1, 1].item(), 0.9, places=6)
+
+    def test_hf_activity_map_rejects_other_channel_counts(self):
+        with self.assertRaises(ValueError):
+            LatentVTONPatchForcingTrainer._hf_activity_map(torch.zeros(1, 3, 2, 2))
+
     def test_garment_edge_importance_upweights_queries_landing_on_garment_edges(self):
         garment = torch.zeros(1, 3, 8, 8)
         garment[:, :, :, 4:] = 1.0  # a sharp vertical edge at the garment's mid-column
