@@ -1008,6 +1008,22 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                 f"Warm-start: appended {appended} zero-initialized DensePose channel(s) "
                 f"to {key}. Use load_weights with a fresh optimizer.", UserWarning,
             )
+        # Switching garment_attention_mode to "self_concat" deletes the fourteen separate
+        # nn.MultiheadAttention modules (74.4M parameters) in favour of the pretrained
+        # self-attention. Their trained weights have no counterpart in the new path and
+        # are exactly what the mode change is discarding, so drop them rather than
+        # refusing the load.
+        if getattr(self.model, "garment_attention_mode", "cross") == "self_concat":
+            stale_cross = [k for k in state_dict if ".garment_cross_attention." in k]
+            if stale_cross:
+                for key in stale_cross:
+                    state_dict.pop(key)
+                warnings.warn(
+                    f"Warm-start: discarded {len(stale_cross)} garment cross-attention "
+                    "tensor(s). self_concat routes the garment through the pretrained "
+                    "self-attention instead; these parameters have no counterpart.",
+                    UserWarning,
+                )
         target_prefixes = (
             "value_target_embedders.", "value_target_norms.",
             "fine_value_target_projector.",
@@ -1161,6 +1177,18 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                         "load_weights with a fresh optimizer.",
                         UserWarning,
                     )
+            bias_keys = {
+                key for key in expected_state if key.endswith(".garment_logit_bias")
+            }
+            absent_bias = [key for key in missing if key in bias_keys]
+            if absent_bias:
+                missing = [key for key in missing if key not in bias_keys]
+                warnings.warn(
+                    f"Warm-start: {len(absent_bias)} garment_logit_bias scalar(s) are new "
+                    "and start at their configured value, capping how much softmax mass "
+                    "the appended garment keys may take from the pretrained person keys.",
+                    UserWarning,
+                )
             for prefix in (
                 "model.garment_refiner.position_gain",
                 "ema_model.garment_refiner.position_gain",
@@ -2865,6 +2893,38 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
                     "has_ground_truth": True if has_ground_truth is None else bool(has_ground_truth[index]),
                 })
 
+    @staticmethod
+    def _masked_gradient_alignment(prediction, target, mask):
+        """Cosine similarity between predicted and true spatial gradients.
+
+        ``_detail_loss`` (L1 on first differences) cannot measure detail: differencing
+        amplifies uncorrelated error by sqrt(2) while attenuating smooth agreement, so a
+        reconstruction's edge score is set by its RGB error, not by its structure.
+        Measured on the 16 test_paired samples: a VAE roundtrip -- pixel-perfect on the
+        logo -- scores 0.0606, and filling the region with ONE FLAT COLOUR scores 0.0608.
+        The metric could not separate a perfect reconstruction from a blank fill, which
+        is what six days of logo/text work was steered by.
+
+        A cosine has real range: 1 is perfect structure, 0 is a flat fill or noise, and
+        negative means the predicted edges actively disagree with the real ones.
+        """
+        horizontal_mask = mask[:, :, :, 1:] * mask[:, :, :, :-1]
+        vertical_mask = mask[:, :, 1:, :] * mask[:, :, :-1, :]
+        total = None
+        for predicted_difference, target_difference, weight in (
+            (prediction[:, :, :, 1:] - prediction[:, :, :, :-1],
+             target[:, :, :, 1:] - target[:, :, :, :-1], horizontal_mask),
+            (prediction[:, :, 1:, :] - prediction[:, :, :-1, :],
+             target[:, :, 1:, :] - target[:, :, :-1, :], vertical_mask),
+        ):
+            weight = weight.to(predicted_difference.dtype)
+            dot = (predicted_difference * target_difference * weight).sum()
+            predicted_norm = (predicted_difference.square() * weight).sum().sqrt()
+            target_norm = (target_difference.square() * weight).sum().sqrt()
+            value = dot / (predicted_norm * target_norm).clamp_min(1e-8)
+            total = value if total is None else total + value
+        return total / 2
+
     def _record_garment_validation(self, batch, generated, target):
         if "person_garment_mask" not in batch:
             raise ValueError("Garment validation metrics require person_garment_mask")
@@ -2882,7 +2942,23 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             expected = (target[index:index + 1].float() + 1) / 2
             rgb = masked_mean((predicted - expected).abs(), mask)
             edge = self._detail_loss(predicted, expected, mask)
-            values = torch.stack((rgb, edge, rgb.new_ones(()))).detach()
+            alignment = self._masked_gradient_alignment(predicted, expected, mask)
+            # Permanent reference line: the in-shop garment's mean colour painted flat
+            # over the whole region, using only inference-available inputs. Any model
+            # score worse than this is worse than drawing nothing at all, and that was
+            # true on test_paired for the entire run that produced these metrics.
+            flat = rgb.new_zeros(())
+            garment_mask = batch.get("garment_mask")
+            if garment_mask is not None and batch.get("garment") is not None:
+                garment = (batch["garment"][index:index + 1].float() + 1) / 2
+                garment_weight = garment_mask[index:index + 1].float()
+                flat_colour = (garment * garment_weight).sum(
+                    (0, 2, 3), keepdim=True
+                ) / garment_weight.sum().clamp_min(1)
+                flat = masked_mean(
+                    (flat_colour.expand_as(expected) - expected).abs(), mask
+                )
+            values = torch.stack((rgb, edge, alignment, flat, rgb.new_ones(()))).detach()
             group = groups[index]
             if group not in ("train_paired", "test_paired", "paired"):
                 raise ValueError(f"Unknown paired validation group: {group}")
@@ -2898,13 +2974,18 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             self._validation_rows = []
         if self.compute_garment_validation_metrics:
             for group in ("train_paired", "test_paired", "paired"):
-                values = self._garment_validation_totals.get(group, torch.zeros(3, device=self.device)).clone()
+                values = self._garment_validation_totals.get(group, torch.zeros(5, device=self.device)).clone()
                 if torch.distributed.is_available() and torch.distributed.is_initialized():
                     torch.distributed.all_reduce(values)
-                if values[2] > 0:
-                    self.log(f"val/{group}/garment_rgb_mae", values[0] / values[2])
-                    self.log(f"val/{group}/garment_edge_mae", values[1] / values[2])
-                    self.log(f"val/{group}/samples", values[2])
+                if values[4] > 0:
+                    count = values[4]
+                    self.log(f"val/{group}/garment_rgb_mae", values[0] / count)
+                    # Retained for continuity with earlier runs, but it cannot separate a
+                    # perfect reconstruction from a flat fill; read the alignment instead.
+                    self.log(f"val/{group}/garment_edge_mae", values[1] / count)
+                    self.log(f"val/{group}/garment_edge_alignment", values[2] / count)
+                    self.log(f"val/{group}/garment_rgb_mae_flat_baseline", values[3] / count)
+                    self.log(f"val/{group}/samples", count)
             self._garment_validation_totals.clear()
         if self.compute_validation_metrics:
             metrics = self.metric_tracker.aggregate()

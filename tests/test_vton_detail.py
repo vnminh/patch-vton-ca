@@ -1336,3 +1336,192 @@ def test_a_sharper_local_stage_does_not_change_the_coarse_anchor():
                                rtol=0, atol=0)
     assert not torch.equal(a['sampling_grid'], b['sampling_grid'])
     assert b['local_effective_candidates'] < a['local_effective_candidates']
+
+
+def _alignment(pred, tgt, mask):
+    return LatentVTONPatchForcingTrainer._masked_gradient_alignment(pred, tgt, mask)
+
+
+def test_gradient_alignment_separates_perfect_from_flat_where_edge_mae_cannot():
+    """_detail_loss scores a VAE roundtrip (0.0606) and a flat fill (0.0608) the same.
+
+    Differencing amplifies uncorrelated error by sqrt(2) and attenuates smooth
+    agreement, so its value is set by RGB error rather than by structure. A cosine on
+    the gradients has real range: 1 perfect, 0 flat, negative for disagreement.
+    """
+    torch.manual_seed(0)
+    target = torch.rand(1, 3, 16, 16)
+    mask = torch.ones(1, 1, 16, 16)
+    flat = torch.full_like(target, target.mean().item())
+    noise = torch.rand_like(target)
+    assert _alignment(target, target, mask) == pytest.approx(1., abs=1e-4)
+    assert _alignment(flat, target, mask) == pytest.approx(0., abs=1e-4)
+    assert _alignment(-target, target, mask) == pytest.approx(-1., abs=1e-4)
+    assert abs(_alignment(noise, target, mask)) < .3
+    # Scale invariance: structure, not contrast, is what this measures.
+    assert _alignment(target * 0.3, target, mask) == pytest.approx(1., abs=1e-4)
+    # And the ordering the old metric got wrong: a slightly noisy copy beats a flat fill.
+    nearly = target + 0.02 * torch.randn_like(target)
+    assert _alignment(nearly, target, mask) > _alignment(flat, target, mask)
+
+
+def test_gradient_alignment_respects_the_mask():
+    torch.manual_seed(0)
+    target = torch.rand(1, 3, 16, 16)
+    mask = torch.zeros(1, 1, 16, 16)
+    mask[:, :, :, :8] = 1.
+    pred = target.clone()
+    pred[:, :, :, 8:] = torch.rand_like(pred[:, :, :, 8:])   # garbage outside the mask
+    assert _alignment(pred, target, mask) == pytest.approx(1., abs=1e-4)
+
+
+def _concat_model(mode, **kw):
+    return VTONPatchForcingDiT(
+        input_size=8, in_channels=4, hidden_size=32, depth=2, num_heads=4,
+        num_classes=10, cross_attention_every=1, garment_middle_channels=8,
+        garment_detail_channels=8, garment_scale_routes=['coarse', 'coarse'],
+        garment_match_query_grid=True, garment_attention_mode=mode, **kw)
+
+
+def _live(model, seed=1):
+    """DiT zero-initialises final_layer and every adaLN gate, so a freshly constructed
+    model emits zeros and its self-attention residual is gated to nothing. self_concat
+    puts the garment inside that gated residual (a pretrained checkpoint supplies real
+    gates), so these tests have to open them to observe anything at all."""
+    torch.manual_seed(seed)
+    nn.init.normal_(model.final_layer.linear.weight, std=.1)
+    for block in model.blocks:
+        nn.init.normal_(block.adaLN_modulation[-1].weight, std=.05)
+        nn.init.normal_(block.adaLN_modulation[-1].bias, std=.5)
+    return model.eval()
+
+
+def _concat_inputs(seed=0):
+    torch.manual_seed(seed)       # otherwise these depend on RNG left by earlier tests
+    return dict(x=torch.randn(2, 4, 8, 6), t=torch.rand(2, 12),
+                y=torch.randint(0, 10, (2,)), person_agnostic=torch.randn(2, 4, 8, 6),
+                person_mask=torch.ones(2, 1, 8, 6), edit_mask=torch.ones(2, 1, 8, 6),
+                garment=torch.randn(2, 4, 8, 6), garment_middle=torch.randn(2, 8, 16, 12),
+                garment_detail=torch.randn(2, 8, 32, 24),
+                garment_mask=torch.ones(2, 1, 8, 6))
+
+
+def test_self_concat_removes_the_fresh_cross_attention_parameters():
+    """74.4M randomly-initialised parameters at full scale, replaced by one scalar."""
+    cross, concat = _concat_model('cross'), _concat_model('self_concat')
+    cross_params = sum(p.numel() for n, p in cross.named_parameters()
+                       if '.garment_cross_attention.' in n)
+    assert cross_params > 0
+    assert not any('.garment_cross_attention.' in n for n, _ in concat.named_parameters())
+    biases = [n for n, _ in concat.named_parameters() if n.endswith('.garment_logit_bias')]
+    assert len(biases) == 2                      # one per routed block
+    assert sum(p.numel() for p in concat.parameters()) < sum(p.numel() for p in cross.parameters())
+    # The pretrained self-attention is what now carries the garment; it is untouched.
+    for name in ('blocks.0.attn.qkv.weight', 'blocks.0.attn.proj.weight'):
+        assert name in dict(concat.named_parameters())
+
+
+def test_self_concat_reads_the_garment_through_the_pretrained_attention():
+    model = _live(_concat_model('self_concat'))
+    data = _concat_inputs()
+    with torch.no_grad():
+        a = model(**data)
+        swapped = dict(data); swapped['garment'] = torch.randn(2, 4, 8, 6)
+        b = model(**swapped)
+    # Changing the garment must change the prediction, through attn.qkv alone.
+    assert (a - b).abs().max() > 1e-4
+
+
+def test_self_concat_honours_the_edit_mask_and_the_garment_padding_mask():
+    model = _live(_concat_model('self_concat'))
+    data = _concat_inputs()
+    data['edit_mask'] = torch.zeros(2, 1, 8, 6)     # nothing editable -> garment unreadable
+    with torch.no_grad():
+        a = model(**data)
+        swapped = dict(data); swapped['garment'] = torch.randn(2, 4, 8, 6)
+        b = model(**swapped)
+    torch.testing.assert_close(a, b, rtol=0, atol=0)
+    # An all-background garment mask is reduced to the single sentinel key that
+    # _garment_padding_masks keeps so no softmax row can be entirely -inf, exactly as the
+    # cross path does. Assert that directly on the weights rather than on a downstream
+    # magnitude: every background key must receive exactly zero mass.
+    data['edit_mask'] = torch.ones(2, 1, 8, 6)
+    empty = dict(data, garment_mask=torch.zeros(2, 1, 8, 6))
+    with torch.no_grad():
+        _, maps = model(**empty, return_garment_attention=True)
+    weights = maps[0]['weights']
+    assert weights[..., 1:].abs().max() == 0        # only the sentinel key survives
+    assert weights[..., 0].max() > 0
+    # And with a real mask, every key is readable again.
+    with torch.no_grad():
+        _, maps = model(**data, return_garment_attention=True)
+    assert (maps[0]['weights'] > 0).all()
+
+
+def test_self_concat_fused_and_unfused_paths_agree():
+    """return_attention switches to the manual softmax; it must be the same function."""
+    model = _live(_concat_model('self_concat'))
+    data = _concat_inputs()
+    with torch.no_grad():
+        fused = model(**data)
+        unfused, maps = model(**data, return_garment_attention=True)
+    torch.testing.assert_close(unfused, fused, rtol=1e-4, atol=1e-5)
+    weights = maps[0]['weights']
+    assert weights.shape[:2] == (2, 4)               # batch, heads kept separate
+    assert weights.shape[-1] == 12                   # garment keys only
+    assert (weights >= 0).all()
+    # Garment mass is capped by the logit bias, so it must not saturate at one.
+    assert weights.sum(-1).max() < 1.0
+
+
+def test_self_concat_logit_bias_controls_how_much_mass_the_garment_takes():
+    low = _concat_model('self_concat', garment_logit_bias=-8.0).eval()
+    high = _concat_model('self_concat', garment_logit_bias=2.0).eval()
+    state = {k: v for k, v in low.state_dict().items()
+             if not k.endswith('.garment_logit_bias')}    # the parameter under test
+    high.load_state_dict(state, strict=False)
+    assert high.blocks[0].garment_logit_bias.item() == 2.
+    _live(low); _live(high)
+    high.load_state_dict({k: v for k, v in low.state_dict().items()
+                          if not k.endswith('.garment_logit_bias')}, strict=False)
+    data = _concat_inputs()
+    with torch.no_grad():
+        _, low_maps = low(**data, return_garment_attention=True)
+        _, high_maps = high(**data, return_garment_attention=True)
+    assert low_maps[0]['weights'].sum(-1).mean() < high_maps[0]['weights'].sum(-1).mean()
+    assert low_maps[0]['weights'].sum(-1).mean() < .05
+
+
+def test_switching_to_self_concat_discards_the_old_cross_attention_weights():
+    def wrap(mode):
+        return LatentVTONPatchForcingTrainer(
+            model=_concat_model(mode), first_stage=torch.nn.Identity(), ema_rate=0,
+            flow={'target': 'patch_flow.flow_vton.VTONPatchFlowForcing',
+                  'params': {'patch_size': 2}},
+            compute_validation_metrics=False, correspondence_center_weight=0,
+            correspondence_nll_weight=0, correspondence_entropy_weight=0,
+            correspondence_photometric_weight=0, allow_new_garment_refiner=True)
+    old, new = wrap('cross'), wrap('self_concat')
+    with pytest.warns(UserWarning, match='garment cross-attention tensor'):
+        new.load_state_dict(old.state_dict(), strict=True)
+
+
+def test_concat_experiment_drops_the_fresh_cross_attention_and_keeps_the_rest():
+    with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
+        cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-512x384-concat'])
+    assert cfg.model.params.garment_attention_mode == 'self_concat'
+    # Bounded start: the appended keys must not immediately dominate the pretrained
+    # person-to-person softmax they are being inserted into.
+    assert -6 <= cfg.model.params.garment_logit_bias <= 0
+    # The garment now travels through attn.qkv/attn.proj, which are backbone parameters,
+    # so this multiplier -- not adapter_lr_multiplier -- sets how fast garment reading
+    # is learned. It must stay a real, non-zero fine-tuning rate.
+    assert 0 < cfg.trainer.params.backbone_lr_multiplier <= 0.5
+    # Correspondence supervision forces the unfused path, which now materialises
+    # (B, heads, N, N+G) rather than (B, heads, N, G).
+    assert len(cfg.trainer.params.correspondence_scales) == 1
+    # Everything the logo experiment established is inherited, not re-litigated.
+    assert cfg.model.params.garment_refiner_remove_velocity_dc is False
+    assert cfg.model.params.garment_refiner_local_cosine_scale == 50.
+    assert cfg.trainer.params.decoded_clean_time_floor > 0
+    assert cfg.name.endswith('512x384-concat')

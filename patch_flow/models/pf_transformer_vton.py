@@ -965,7 +965,28 @@ class GarmentHighFrequencyControl(nn.Module):
         return (residual - mean) * support
 
 
+GARMENT_ATTENTION_MODES = ("cross", "self_concat")
+
+
 class VTONPatchForcingBlock(nn.Module):
+    """A PFT block that can read the garment two ways.
+
+    ``cross`` adds a separate ``nn.MultiheadAttention`` per routed block: 5.3M freshly
+    initialised parameters each, 74.4M across the fourteen routed blocks, whose entire
+    job is to learn image-patch correspondence from scratch.
+
+    ``self_concat`` instead appends the garment tokens to the *existing* self-attention's
+    keys and values, so the pretrained ``attn.qkv`` and ``attn.proj`` -- which already
+    know how to match and copy image patches -- do the work from the first step, and the
+    block gains one scalar instead of 5.3M parameters. This is what CatVTON,
+    OOTDiffusion, IDM-VTON and StableVITON all do; none of them learns a separate garment
+    attention. Measured motivation: after ~9k steps the ``cross`` model reproduced garment
+    colour well (swapping the garment moved 41% of the velocity, mean RGB within 0.016 of
+    target) but scored worse on unseen pairs than filling the garment region with a single
+    flat colour -- 0.1028 vs 0.0931 RGB and 0.0779 vs 0.0608 edge. Low-frequency colour is
+    learnable in a few epochs; pixel correspondence from a random initialisation is not.
+    """
+
     def __init__(
         self,
         hidden_size,
@@ -973,6 +994,8 @@ class VTONPatchForcingBlock(nn.Module):
         mlp_ratio=4.0,
         garment_scale=None,
         garment_attention_output_init_std=1e-3,
+        garment_attention_mode="cross",
+        garment_logit_bias=-2.0,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
@@ -990,11 +1013,20 @@ class VTONPatchForcingBlock(nn.Module):
             nn.Linear(hidden_size, 6 * hidden_size, bias=True),
         )
         self.garment_scale = garment_scale
-        self.use_garment_cross_attention = garment_scale is not None
+        if garment_attention_mode not in GARMENT_ATTENTION_MODES:
+            raise ValueError(
+                f"garment_attention_mode must be one of {GARMENT_ATTENTION_MODES}"
+            )
+        self.garment_attention_mode = garment_attention_mode
+        self.use_garment_attention = garment_scale is not None
+        self.use_garment_cross_attention = (
+            self.use_garment_attention and garment_attention_mode == "cross"
+        )
+        if self.use_garment_attention:
+            self.garment_norm = nn.LayerNorm(hidden_size, eps=1e-6)
         if self.use_garment_cross_attention:
             if garment_attention_output_init_std <= 0:
                 raise ValueError("garment_attention_output_init_std must be positive")
-            self.garment_norm = nn.LayerNorm(hidden_size, eps=1e-6)
             self.garment_cross_attention = nn.MultiheadAttention(
                 hidden_size,
                 num_heads,
@@ -1008,6 +1040,86 @@ class VTONPatchForcingBlock(nn.Module):
                 std=float(garment_attention_output_init_std),
             )
             nn.init.zeros_(self.garment_cross_attention.out_proj.bias)
+        elif self.use_garment_attention:
+            # Appending keys dilutes the pretrained person-to-person softmax from the
+            # first step. One learnable scalar added to every garment logit controls how
+            # much mass the garment may take: at -2 it starts near 12% with an equal
+            # number of garment and person keys, which is enough gradient to learn from
+            # and small enough not to wreck the loaded backbone. Logged as
+            # train/garment_logit_bias.
+            self.garment_logit_bias = nn.Parameter(
+                torch.full((), float(garment_logit_bias))
+            )
+
+    def _self_attend_with_garment(
+        self, h, garment_tokens, garment_padding_mask, edit_token_mask, return_attention
+    ):
+        """Run the PRETRAINED self-attention over [person ; garment] keys and values.
+
+        The garment tokens are projected by the same ``attn.qkv`` as the person tokens,
+        so matching and copying reuse weights that already do exactly that, instead of
+        5.3M randomly initialised parameters per block. Queries stay person-only: the
+        garment is read, never written.
+
+        Returns ``(output, garment_attention, garment_contribution)``. The last two are
+        produced only when requested, because they force the unfused attention path.
+        """
+        attn = self.attn
+        batch, tokens, width = h.shape
+        heads, head_dim = attn.num_heads, attn.head_dim
+        qkv = attn.qkv(h).reshape(batch, tokens, 3, heads, head_dim).permute(2, 0, 3, 1, 4)
+        query, key, value = qkv.unbind(0)
+        query, key = attn.q_norm(query), attn.k_norm(key)
+        garment_value = bias = None
+        garment_keys = 0
+        if garment_tokens is not None:
+            garment = self.garment_norm(garment_tokens)
+            garment_keys = garment.shape[1]
+            garment_kv = attn.qkv(garment)[..., width:].reshape(
+                batch, garment_keys, 2, heads, head_dim
+            ).permute(2, 0, 3, 1, 4)
+            garment_key, garment_value = garment_kv.unbind(0)
+            key = torch.cat((key, attn.k_norm(garment_key)), dim=2)
+            value = torch.cat((value, garment_value), dim=2)
+            bias = h.new_zeros((batch, 1, tokens, tokens + garment_keys))
+            garment_bias = self.garment_logit_bias.to(bias.dtype).expand(
+                batch, 1, tokens, garment_keys
+            ).clone()
+            if garment_padding_mask is not None:
+                # Garment background keys are excluded, never merely down-weighted.
+                garment_bias = garment_bias.masked_fill(
+                    garment_padding_mask[:, None, None, :], MASKED_LOGIT
+                )
+            if edit_token_mask is not None:
+                # A person token outside the edit region may not read the garment at all.
+                # The old path achieved this by zeroing the cross-attention residual;
+                # here it must be a key mask, or the softmax would still spend mass on
+                # the garment and starve the person keys it is supposed to use.
+                garment_bias = garment_bias.masked_fill(
+                    ~edit_token_mask[:, None, :, None], MASKED_LOGIT
+                )
+            bias[..., tokens:] = garment_bias
+        if not return_attention:
+            context = F.scaled_dot_product_attention(query, key, value, attn_mask=bias)
+            out = context.transpose(1, 2).reshape(batch, tokens, width)
+            return attn.proj(attn.norm(out)), None, None
+        logits = (query * attn.scale) @ key.transpose(-2, -1)
+        if bias is not None:
+            logits = logits + bias
+        probability = logits.softmax(-1)
+        out = (probability @ value).transpose(1, 2).reshape(batch, tokens, width)
+        out = attn.proj(attn.norm(out))
+        if not garment_keys:
+            return out, None, None
+        garment_probability = probability[..., tokens:]
+        # The additive garment part of the attention output, so the correspondence value
+        # loss keeps supervising what the garment actually writes. ``attn.norm`` is
+        # Identity here and ``proj`` is affine, so dropping its bias isolates the term.
+        contribution = (garment_probability @ garment_value).transpose(1, 2).reshape(
+            batch, tokens, width
+        )
+        contribution = F.linear(attn.norm(contribution), attn.proj.weight)
+        return out, garment_probability, contribution
 
     def forward(
         self,
@@ -1020,8 +1132,23 @@ class VTONPatchForcingBlock(nn.Module):
         return_attention=False,
     ):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=-1)
-        x = x + gate_msa * self.attn(pf_modulate(self.norm1(x), shift_msa, scale_msa))
+        modulated = pf_modulate(self.norm1(x), shift_msa, scale_msa)
         attention = None
+        if self.garment_attention_mode == "self_concat" and self.use_garment_attention:
+            attended, attention, contribution = self._self_attend_with_garment(
+                modulated, garment_tokens, garment_padding_mask,
+                edit_token_mask, return_attention,
+            )
+            x = x + gate_msa * attended
+            x = x + gate_mlp * self.mlp(pf_modulate(self.norm2(x), shift_mlp, scale_mlp))
+            if return_attention:
+                if attention is None:
+                    raise RuntimeError(
+                        "Attention weights were requested from a block without garment tokens"
+                    )
+                return x, attention, gate_msa * contribution
+            return x
+        x = x + gate_msa * self.attn(modulated)
         if self.use_garment_cross_attention and garment_tokens is not None:
             # Position belongs in K, where it helps routing, but not in V: transporting
             # source coordinates together with garment appearance conflicts with the
@@ -1094,6 +1221,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         garment_scale_routes=None,
         garment_embed_gain=1.0,
         garment_attention_output_init_std=1e-3,
+        garment_attention_mode="cross",
+        garment_logit_bias=-2.0,
         cross_attention_every=4,
         gradient_checkpointing=False,
         garment_match_query_grid=False,
@@ -1152,6 +1281,12 @@ class VTONPatchForcingDiT(PatchForcingDiT):
         self.garment_detail_channels = None if garment_detail_channels is None else int(garment_detail_channels)
         self.garment_embed_gain = float(garment_embed_gain)
         self.garment_attention_output_init_std = float(garment_attention_output_init_std)
+        if garment_attention_mode not in GARMENT_ATTENTION_MODES:
+            raise ValueError(
+                f"garment_attention_mode must be one of {GARMENT_ATTENTION_MODES}"
+            )
+        self.garment_attention_mode = garment_attention_mode
+        self.garment_logit_bias = float(garment_logit_bias)
         self.cross_attention_every = cross_attention_every
         self.gradient_checkpointing = bool(gradient_checkpointing)
         self.x_embedder = PatchEmbed(
@@ -1236,6 +1371,8 @@ class VTONPatchForcingDiT(PatchForcingDiT):
                 self.num_heads,
                 garment_scale=garment_scale,
                 garment_attention_output_init_std=self.garment_attention_output_init_std,
+                garment_attention_mode=self.garment_attention_mode,
+                garment_logit_bias=self.garment_logit_bias,
             )
             block.load_state_dict(old_block.state_dict(), strict=False)
             self.blocks.append(block)

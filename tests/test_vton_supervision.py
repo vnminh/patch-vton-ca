@@ -115,7 +115,13 @@ def test_validation_metrics_ignore_swaps_empty_masks_and_non_garment_errors():
     generated = torch.ones_like(target)
     generated[0,:,:8] = 0
     module._record_garment_validation(data, generated, target)
-    torch.testing.assert_close(module._garment_validation_totals['test_paired'], torch.tensor([0.,0.,1.]))
+    # rgb, edge, gradient alignment, flat-fill baseline, count. The prediction matches
+    # the target exactly inside the mask, so rgb/edge are 0; alignment is 0 because two
+    # constant regions have no gradient to align, and the batch carries no in-shop
+    # garment so the flat-fill reference is not computed.
+    totals = module._garment_validation_totals['test_paired']
+    assert totals.shape == (5,)
+    torch.testing.assert_close(totals, torch.tensor([0., 0., 0., 0., 1.]))
     assert 'test_unpaired' not in module._garment_validation_totals
 
 
@@ -305,7 +311,7 @@ def test_multiscale_bfloat16_backward_and_validation_with_vae_pyramid(fine_detai
         module.validation_step(data,0)
     assert len(module.val_images['tryon']) == 2
     assert len(module._validation_rows) == 2
-    assert module._garment_validation_totals['test_paired'][2] == 1
+    assert module._garment_validation_totals['test_paired'][4] == 1
     assert 'test_unpaired' not in module._garment_validation_totals
     with TemporaryDirectory() as folder, patch.object(
         type(module), 'logger', property(lambda self: SimpleNamespace(log_dir=folder))

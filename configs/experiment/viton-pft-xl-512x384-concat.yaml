@@ -1,0 +1,56 @@
+# @package _global_
+#
+# The garment is read by the PRETRAINED self-attention instead of by fourteen freshly
+# initialised cross-attention modules.
+#
+# Why: after ~9k steps across six days and nine architectural interventions, the `cross`
+# model scored WORSE on unseen pairs than filling the garment region with a single flat
+# colour -- 0.1028 vs 0.0931 rgb_mae, 0.0779 vs 0.0608 edge_mae -- while beating it on
+# the four memorised train samples (0.0530). It reproduced colour well (swapping the
+# garment moved 41% of the velocity; decoded mean RGB within 0.016 of target) and
+# reproduced no structure at all. Every internal metric improved over that period and
+# no output metric moved, which is the signature of a bottleneck none of them touch.
+#
+# The bottleneck: 85.5M randomly-initialised garment-specific parameters, 74.4M of them
+# fresh nn.MultiheadAttention, whose entire job is to learn image-patch correspondence
+# from scratch on 11,647 pairs -- and no configuration ever ran longer than ~2,000
+# optimizer steps (~5.5 epochs). Low-frequency colour is learnable in a few epochs;
+# pixel correspondence is not. CatVTON, OOTDiffusion, IDM-VTON and StableVITON all avoid
+# this by concatenating garment tokens into the existing self-attention, so the
+# pretrained weights that already match and copy image patches do the work from step one.
+defaults:
+  - viton-pft-xl-512x384-detail-logo-hf
+  - _self_
+
+name: vton/pft-xl-512x384-concat
+
+model:
+  params:
+    # Garment tokens are appended to the self-attention keys/values and projected by the
+    # same attn.qkv as the person tokens. Removes the 74.4M fresh parameters and adds one
+    # scalar per routed block.
+    garment_attention_mode: self_concat
+    # Appending keys dilutes the pretrained person-to-person softmax immediately. At -2,
+    # with an equal number of garment and person keys, the garment starts with ~12% of
+    # the mass: enough gradient to learn from, small enough not to wreck the backbone.
+    # It is learnable and logged as train/garment_logit_bias.
+    garment_logit_bias: -2.0
+
+trainer:
+  params:
+    # The garment now travels through attn.qkv/attn.proj, which live in the BACKBONE
+    # parameter group -- backbone_lr_multiplier, not adapter_lr_multiplier, is what now
+    # sets how fast the model learns to read the garment. 1e-5 is the rate CatVTON-style
+    # fine-tunes use and the rate this backbone has been stable at.
+    backbone_lr_multiplier: 0.1
+    # Correspondence supervision forces the unfused attention path, which in self_concat
+    # materialises (B, heads, N, N + G) instead of (B, heads, N, G) -- about twice the
+    # activation memory per supervised block. Supervise only `coarse` (4 of 14 routed
+    # blocks) until peak memory is measured on the 24 GB card.
+    correspondence_scales: [coarse]
+
+train_params:
+  # Not a resume: the parameter set changed, so the optimizer state cannot carry over.
+  # Start from the last `cross` checkpoint with load_weights -- everything except the
+  # discarded cross-attention (x_embedder, DensePose, embedders, refiner, HF) is kept.
+  val_check_interval: 250
