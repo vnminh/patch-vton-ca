@@ -377,7 +377,6 @@ class CorrespondenceAttentionLoss(nn.Module):
         nll_weight=0.3,
         nll_radius=0.05,
         photometric_weight=1.0,
-        photometric_variance_weight=0.0,
         value_weight=0.0,
         value_cosine_mix=0.5,
         entropy_eps=1e-8,
@@ -393,9 +392,6 @@ class CorrespondenceAttentionLoss(nn.Module):
         else:
             self.nll_radius = float(nll_radius)
         self.photometric_weight = float(photometric_weight)
-        self.photometric_variance_weight = float(photometric_variance_weight)
-        if self.photometric_variance_weight < 0:
-            raise ValueError("photometric_variance_weight must be non-negative")
         self.value_weight = float(value_weight)
         self.value_cosine_mix = float(value_cosine_mix)
         self.entropy_eps = float(entropy_eps)
@@ -430,7 +426,6 @@ class CorrespondenceAttentionLoss(nn.Module):
             self.needs_target
             or self.entropy_weight > 0
             or self.photometric_weight > 0
-            or self.photometric_variance_weight > 0
             or self.value_weight > 0
         )
 
@@ -461,8 +456,7 @@ class CorrespondenceAttentionLoss(nn.Module):
         appearance_weight = None if appearance_weight is None else appearance_weight.float()
         spread_weight = weight if weight is not None else appearance_weight
         use_photometric = (
-            appearance is not None and appearance_weight is not None
-            and (self.photometric_weight > 0 or self.photometric_variance_weight > 0)
+            appearance is not None and appearance_weight is not None and self.photometric_weight > 0
         )
         use_value = value_targets is not None and appearance_weight is not None and self.value_weight > 0
         prepared_value_targets = (
@@ -476,7 +470,6 @@ class CorrespondenceAttentionLoss(nn.Module):
             "entropy": zero,
             "nll": zero,
             "photometric": zero,
-            "photometric_variance": zero,
             "value": zero,
             "value_cosine": zero,
             "value_huber": zero,
@@ -498,7 +491,6 @@ class CorrespondenceAttentionLoss(nn.Module):
                     "entropy": zero,
                     "nll": zero,
                     "photometric": zero,
-                    "photometric_variance": zero,
                     "value": zero,
                     "value_cosine": zero,
                     "value_huber": zero,
@@ -599,35 +591,17 @@ class CorrespondenceAttentionLoss(nn.Module):
                     keys_appearance = F.adaptive_avg_pool2d(keys_appearance, grid)
                 keys_appearance = keys_appearance.flatten(2).transpose(1, 2)
                 retrieved = routing_attention @ keys_appearance
-                error = (retrieved - appearance["query"].float()).square().sum(-1)
+                # L1, not squared error: a still-uncertain routing grid retrieves a
+                # wrong-location colour sometimes, and a quadratic penalty punishes
+                # that far harder than a merely-inaccurate-but-plausible retrieval,
+                # fighting the same soft-attention gradient this term needs to explore.
+                error = (retrieved - appearance["query"].float()).abs().sum(-1)
                 photometric_loss = (error * appearance_weight).sum() / photometric_denominator
                 totals["photometric"] = totals["photometric"] + photometric_loss
                 scale_totals[scale]["photometric"] = (
                     scale_totals[scale]["photometric"] + photometric_loss
                 )
                 metrics[f"{prefix}/photometric"] = photometric_loss.detach()
-
-                if self.photometric_variance_weight > 0:
-                    # Var[X] = E[X^2] - E[X]^2 under the same attention distribution
-                    # that produced ``retrieved`` = E[X]. Matching the mean alone lets a
-                    # bimodal map straddle the target and still score well on the mean
-                    # while retrieving a blend -- exactly the "navy-and-lavender renders
-                    # as uniform violet" failure this module's docstring describes, and
-                    # exactly what entropy (geometric, not content-aware) does not catch:
-                    # attention spread over two SIMILAR-appearance keys has the same
-                    # entropy as spread over two very DIFFERENT ones, but only the
-                    # second is actually a colour-blend problem. Penalising the retrieved
-                    # value's variance targets that directly, and is automatically
-                    # near-zero (i.e. free) over flat-colour regions where any of several
-                    # candidate keys gives the same right answer.
-                    second_moment = routing_attention @ keys_appearance.square()
-                    variance = (second_moment - retrieved.square()).clamp_min(0).sum(-1)
-                    variance_loss = (variance * appearance_weight).sum() / photometric_denominator
-                    totals["photometric_variance"] = totals["photometric_variance"] + variance_loss
-                    scale_totals[scale]["photometric_variance"] = (
-                        scale_totals[scale]["photometric_variance"] + variance_loss
-                    )
-                    metrics[f"{prefix}/photometric_variance"] = variance_loss.detach()
 
             if use_value:
                 transported = entry.get("output")
@@ -682,34 +656,29 @@ class CorrespondenceAttentionLoss(nn.Module):
             metrics[f"correspondence/{scale}/center"] = averaged["center"].detach()
             metrics[f"correspondence/{scale}/entropy"] = averaged["entropy"].detach()
             metrics[f"correspondence/{scale}/photometric"] = averaged["photometric"].detach()
-            metrics[f"correspondence/{scale}/photometric_variance"] = (
-                averaged["photometric_variance"].detach()
-            )
             metrics[f"correspondence/{scale}/value"] = averaged["value"].detach()
             metrics[f"correspondence/{scale}/value_cosine"] = averaged["value_cosine"].detach()
             metrics[f"correspondence/{scale}/value_huber"] = averaged["value_huber"].detach()
             metrics[f"correspondence/{scale}/target_mass"] = averaged["mass"].detach()
-            metrics[f"correspondence/{scale}/appearance_error"] = (
-                averaged["photometric"].detach().clamp_min(0).sqrt()
-            )
+            # photometric is now L1 (summed over channels), already directly in RGB
+            # units -- no sqrt transform needed the way sqrt(MSE) gave RMSE before.
+            metrics[f"correspondence/{scale}/appearance_error"] = averaged["photometric"].detach()
         loss = (
             self.nll_weight * totals["nll"]
             + self.center_weight * totals["center"]
             + self.entropy_weight * totals["entropy"]
             + self.photometric_weight * totals["photometric"]
-            + self.photometric_variance_weight * totals["photometric_variance"]
             + self.value_weight * totals["value"]
         )
         metrics["correspondence_nll"] = totals["nll"].detach()
         metrics["correspondence_center_loss"] = totals["center"].detach()
         metrics["correspondence_entropy"] = totals["entropy"].detach()
         metrics["correspondence_photometric"] = totals["photometric"].detach()
-        metrics["correspondence_photometric_variance"] = totals["photometric_variance"].detach()
         metrics["correspondence_value"] = totals["value"].detach()
         metrics["correspondence_value_cosine"] = totals["value_cosine"].detach()
         metrics["correspondence_value_huber"] = totals["value_huber"].detach()
         # Directly interpretable: mass actually landing on the target, and the retrieved
         # appearance error in the same RGB units the diagnostics report.
         metrics["correspondence_target_mass"] = totals["mass"].detach()
-        metrics["correspondence_appearance_error"] = totals["photometric"].detach().clamp_min(0).sqrt()
+        metrics["correspondence_appearance_error"] = totals["photometric"].detach()
         return loss, metrics

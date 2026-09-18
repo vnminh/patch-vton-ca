@@ -167,15 +167,6 @@ trainer:
     # attention going diffuse (i.e. averaging many candidate locations = mean colour)
     # instead of committing to one location the way inference-time hard routing needs.
     correspondence_entropy_weight: 0.05
-    # Var[X] = E[X^2] - E[X]^2 of the retrieved garment appearance under the same
-    # attention distribution correspondence_photometric_weight already uses. Matching
-    # the mean alone lets a sharp bimodal map straddle the target and still retrieve a
-    # blend -- documented in correspondence.py's own module docstring as exactly how a
-    # navy-and-lavender garment renders as uniform violet, and explicitly NOT caught by
-    # entropy (which penalises geometric spread, not whether that spread lands on
-    # similar or very different colours). This is automatically near-zero over flat
-    # colour regions, where any nearby candidate gives the same right answer.
-    correspondence_photometric_variance_weight: 1.0
     # fine_oracle_within_radius_fraction measured the true match already inside the
     # local search window 60-73% of the time, while fine_top1_accuracy stayed at
     # 27-38%: the bottleneck is scoring among reachable candidates, not window size.

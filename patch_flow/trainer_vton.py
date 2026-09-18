@@ -149,7 +149,6 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         correspondence_nll_weight=0.3,
         correspondence_nll_radius=0.05,
         correspondence_photometric_weight=1.0,
-        correspondence_photometric_variance_weight=0.0,
         correspondence_value_weight=0.0,
         correspondence_value_cosine_mix=0.5,
         correspondence_value_target_ema=0.999,
@@ -386,7 +385,6 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             nll_weight=correspondence_nll_weight,
             nll_radius=correspondence_nll_radius,
             photometric_weight=correspondence_photometric_weight,
-            photometric_variance_weight=correspondence_photometric_variance_weight,
             value_weight=correspondence_value_weight,
             value_cosine_mix=correspondence_value_cosine_mix,
         )
