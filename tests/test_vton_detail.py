@@ -1159,6 +1159,59 @@ def test_strict_legacy_warmstart_only_allows_wholly_new_refiner():
         new_opt.load_state_dict(old_opt.state_dict())
 
 
+def test_garment_logit_bias_gets_its_own_optimizer_group():
+    """Guards the bug found after 2000 real training steps: garment_logit_bias
+    contains "garment_" and was falling into the generic adapter group instead of a
+    dedicated one, so it inherited adapter_lr_multiplier and every one of 14 per-block
+    scalars had moved <0.5% from its -2.0 init -- the self_concat garment-attention gate
+    had not opened at all."""
+    module = trainer()
+    module.model = VTONPatchForcingDiT(
+        input_size=8, in_channels=4, hidden_size=32, depth=2, num_heads=4,
+        num_classes=10, cross_attention_every=1, garment_scale_routes=['coarse'] * 2,
+        garment_attention_mode='self_concat', garment_logit_bias=-2.0,
+    )
+    module.adapter_lr_multiplier = 0.25
+    module.garment_logit_bias_lr_multiplier = 1.0
+    optimizer = module.configure_optimizers()['optimizer']
+    bias_params = {
+        id(p) for n, p in module.named_parameters() if n.endswith('.garment_logit_bias')
+    }
+    assert bias_params
+    matched = [g for g in optimizer.param_groups if {id(p) for p in g['params']} & bias_params]
+    assert len(matched) == 1
+    group = matched[0]
+    assert {id(p) for p in group['params']} == bias_params
+    assert group['lr'] == pytest.approx(module.lr * module.garment_logit_bias_lr_multiplier)
+    assert group['lr'] != pytest.approx(module.lr * module.adapter_lr_multiplier)
+
+
+def test_garment_logit_bias_metrics_report_mean_min_max_and_catch_a_stuck_block():
+    module = trainer()
+    module.model = VTONPatchForcingDiT(
+        input_size=8, in_channels=4, hidden_size=32, depth=4, num_heads=4,
+        num_classes=10, cross_attention_every=1,
+        garment_scale_routes=['coarse'] * 4,
+        garment_attention_mode='self_concat', garment_logit_bias=-2.0,
+    )
+    routed = [b for b in module.model.blocks if getattr(b, 'use_garment_attention', False)]
+    assert len(routed) >= 2
+    with torch.no_grad():
+        routed[0].garment_logit_bias.fill_(-1.5)
+    metrics = module._garment_logit_bias_metrics()
+    assert metrics['garment_logit_bias_max'].item() == pytest.approx(-1.5)
+    assert metrics['garment_logit_bias_min'].item() == pytest.approx(-2.0)
+    assert metrics['garment_logit_bias'].item() == pytest.approx(
+        (-1.5 + -2.0 * (len(routed) - 1)) / len(routed)
+    )
+
+
+def test_garment_logit_bias_metrics_empty_for_cross_attention_mode():
+    module = trainer()
+    module.model = model()
+    assert module._garment_logit_bias_metrics() == {}
+
+
 def test_detail_config_keeps_both_images_512x384_and_global_batch_32():
     with initialize_config_dir(config_dir=str(Path(__file__).resolve().parents[1]/'configs'),version_base=None):
         cfg = compose(config_name='config',overrides=['experiment=viton-pft-xl-512x384-detail'])

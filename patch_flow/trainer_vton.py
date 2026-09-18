@@ -108,6 +108,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         garment_value_mix_lr_multiplier=1.0,
         garment_latent_fusion_lr_multiplier=1.0,
         garment_support_lr_multiplier=1.0,
+        garment_logit_bias_lr_multiplier=1.0,
         adapter_lr_multiplier=1.0,
         decoded_rgb_weight=0.0,
         decoded_edge_weight=0.0,
@@ -214,6 +215,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             garment_latent_fusion_lr_multiplier
         )
         self.garment_support_lr_multiplier = float(garment_support_lr_multiplier)
+        self.garment_logit_bias_lr_multiplier = float(garment_logit_bias_lr_multiplier)
         self.adapter_lr_multiplier = float(adapter_lr_multiplier)
         if min(
             self.hf_source_consistency_weight,
@@ -513,11 +515,21 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         support_parameters = []
         refiner_parameters = []
         hf_control_parameters = []
+        logit_bias_parameters = []
         for name, parameter in self.named_parameters():
             if not parameter.requires_grad:
                 continue
             if name.startswith("hf_condition_encoder."):
                 hf_encoder_parameters.append(parameter)
+            elif name.endswith(".garment_logit_bias"):
+                # self_concat's per-block scalar gate on how much softmax mass the
+                # appended garment keys may take. Matched before the generic "garment_"
+                # substring check below, which would otherwise route it into the
+                # adapter group (2.5e-5 here) -- checked directly against a checkpoint
+                # after 2000 steps: every one of the 14 blocks had moved <0.5% from its
+                # -2.0 init at that rate. A single bounded scalar with no pretrained
+                # value to protect has no reason to share the adapter group's caution.
+                logit_bias_parameters.append(parameter)
             elif ".garment_value_mix." in name:
                 value_mix_parameters.append(parameter)
             elif ".garment_refiner.latent_fusion." in name:
@@ -537,6 +549,11 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             groups.append({
                 "params": adapter_parameters,
                 "lr": self.lr * self.adapter_lr_multiplier,
+            })
+        if logit_bias_parameters:
+            groups.append({
+                "params": logit_bias_parameters,
+                "lr": self.lr * self.garment_logit_bias_lr_multiplier,
             })
         if value_mix_parameters:
             groups.append({
@@ -1478,6 +1495,30 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
             strength, grid, mode="bilinear", padding_mode="zeros", align_corners=False
         )
         return (1.0 + float(edge_weight) * sampled.reshape(target.shape[0], -1)).to(target.dtype)
+
+    def _garment_logit_bias_metrics(self):
+        """Mean/min/max of self_concat's per-block garment attention-mass gate.
+
+        Promised by the self_concat experiment config's own comment ("logged as
+        train/garment_logit_bias") but never actually wired up -- checked directly
+        against a checkpoint after 2000 steps and found stuck within 0.5% of its -2.0
+        init at every one of 14 blocks. min/max catch a single stuck block the mean
+        would hide once (or if) the rest start moving.
+        """
+        logit_biases = [
+            block.garment_logit_bias.detach()
+            for block in getattr(self.model, "blocks", [])
+            if getattr(block, "garment_attention_mode", None) == "self_concat"
+            and getattr(block, "use_garment_attention", False)
+        ]
+        if not logit_biases:
+            return {}
+        stacked = torch.stack(logit_biases)
+        return {
+            "garment_logit_bias": stacked.mean(),
+            "garment_logit_bias_min": stacked.min(),
+            "garment_logit_bias_max": stacked.max(),
+        }
 
     @staticmethod
     def _pure_noise_samples(timesteps, edit_tokens):
@@ -2564,6 +2605,7 @@ class LatentVTONPatchForcingTrainer(LatentFlowTrainer):
         ).items():
             metrics[f"garment_value_mix_{scale}"] = value_mix.detach().clamp(0, 1)
             metrics[f"garment_value_mix_raw_{scale}"] = value_mix.detach()
+        metrics.update(self._garment_logit_bias_metrics())
         use_decoded = max(
             self.decoded_rgb_weight,
             self.decoded_edge_weight,

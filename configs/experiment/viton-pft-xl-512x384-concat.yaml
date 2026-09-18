@@ -38,11 +38,20 @@ model:
 
 trainer:
   params:
-    # The garment now travels through attn.qkv/attn.proj, which live in the BACKBONE
-    # parameter group -- backbone_lr_multiplier, not adapter_lr_multiplier, is what now
-    # sets how fast the model learns to read the garment. 1e-5 is the rate CatVTON-style
-    # fine-tunes use and the rate this backbone has been stable at.
+    # attn.qkv/attn.proj are pretrained weight matrices, shared between person and
+    # garment tokens now -- backbone_lr_multiplier, not adapter_lr_multiplier, is what
+    # sets how fast the model learns to read the garment through them. 1e-5 is the rate
+    # CatVTON-style fine-tunes use and the rate this backbone has been stable at.
     backbone_lr_multiplier: 0.1
+    # garment_logit_bias is a DIFFERENT parameter with no pretrained value to protect,
+    # despite the name previously implying it shared the rate above: it contains
+    # "garment_" and was falling into the generic adapter group (2.5e-5) instead, not
+    # even the backbone rate. Checked directly against a checkpoint after 2000 steps:
+    # every one of the 14 per-block scalars had moved <0.5% from its -2.0 init at that
+    # rate -- the mechanism specifically meant to let the model progressively open up
+    # how much it reads the garment had not engaged at all. One bounded scalar per
+    # block is safe at the full base rate, same reasoning as garment_value_mix.
+    garment_logit_bias_lr_multiplier: 1.0
     # Correspondence supervision forces the unfused attention path, which in self_concat
     # materialises (B, heads, N, N + G) instead of (B, heads, N, G) -- about twice the
     # activation memory per supervised block. Supervise only `coarse` (4 of 14 routed
